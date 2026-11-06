@@ -599,3 +599,57 @@ func readFile(t *testing.T, path string) string {
 	}
 	return string(data)
 }
+
+// A prompt above Linux's 131071-byte argument limit is refused on create
+// and update with a field error on the prompt, and no file is written.
+func TestTasksCreateAndUpdateRefuseAPromptAboveTheArgumentLimit(t *testing.T) {
+	p := setupUTC(t)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	big := strings.Repeat("a", 131072)
+	def := newTaskDef()
+	err := c.Call(context.Background(), api.MethodTasksCreate, api.TaskWriteParams{Task: def, Prompt: big}, nil)
+	if f := fieldErrors(t, rpcErr(t, err, api.CodeValidation)); len(f["prompt"]) != 1 || !strings.Contains(f["prompt"][0], "131071") {
+		t.Errorf("create: field errors = %v, want one prompt error naming the limit", f)
+	}
+	if _, err := os.Stat(filepath.Join(p.TasksDir(), def.ID+".yaml")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("task file written for a refused create: %v", err)
+	}
+
+	var created api.TaskDetail
+	if err := c.Call(context.Background(), api.MethodTasksCreate, api.TaskWriteParams{Task: def, Prompt: strings.Repeat("a", 131071)}, &created); err != nil {
+		t.Fatalf("create with a 131071-byte prompt: %v", err)
+	}
+	err = c.Call(context.Background(), api.MethodTasksUpdate,
+		api.TaskWriteParams{ID: def.ID, Version: created.Version, Task: def, Prompt: big}, nil)
+	if f := fieldErrors(t, rpcErr(t, err, api.CodeValidation)); len(f["prompt"]) != 1 || !strings.Contains(f["prompt"][0], "131071") {
+		t.Errorf("update: field errors = %v, want one prompt error naming the limit", f)
+	}
+	promptPath := filepath.Join(p.ConfigDir, "prompts", def.ID+".md")
+	if data, _ := os.ReadFile(promptPath); len(data) != 131071 {
+		t.Errorf("refused update changed the prompt file to %d bytes", len(data))
+	}
+
+	// A hand edit made the prompt too big: an update with a short prompt
+	// fixes it, rather than failing on the file it replaces.
+	write(t, promptPath, big)
+	var detail api.TaskDetail
+	for i := 0; detail.Summary.Error == ""; i++ {
+		if i > 300 {
+			t.Fatal("hand-edited oversized prompt never made the task invalid")
+		}
+		time.Sleep(10 * time.Millisecond)
+		detail = call[api.TaskDetail](t, c, api.MethodTasksGet, api.TaskIDParams{ID: def.ID})
+	}
+	var updated api.TaskDetail
+	if err := c.Call(context.Background(), api.MethodTasksUpdate,
+		api.TaskWriteParams{ID: def.ID, Version: detail.Version, Task: def, Prompt: "short"}, &updated); err != nil {
+		t.Fatalf("update with a short prompt over an oversized prompt file: %v", err)
+	}
+	if updated.Prompt != "short" || updated.Summary.Error != "" || updated.Summary.State == api.StateInvalid {
+		t.Errorf("after replacing the oversized prompt: prompt %q state %s error %q",
+			updated.Prompt, updated.Summary.State, updated.Summary.Error)
+	}
+	if got := readFile(t, promptPath); got != "short" {
+		t.Errorf("prompt file = %q, want the short replacement", got)
+	}
+}
