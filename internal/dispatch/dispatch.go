@@ -154,15 +154,46 @@ func (d *Dispatcher) Submit(ctx context.Context, t config.Task, trigger string, 
 	return Outcome{Run: run}, err
 }
 
-// RunEnded is called by the runner after a run's end is stored. It hands the
-// task's pending overlap fire to the target and starts waiting fires while
-// the target has capacity.
+// RunEnded is called by the runner after a run's end is stored. The ended
+// run is already gone from ActiveRuns. The task's pending overlap fire
+// starts only once nothing else of that task is in flight: a forced
+// parallel run ending must not start it while the run it queued behind is
+// still active, and that run ending must not start it while the forced
+// run is still active. Waiting fires then start while the target has
+// capacity.
 func (d *Dispatcher) RunEnded(ctx context.Context, run store.Run) {
 	d.mu.Lock()
 	d.gen++
-	d.releasePendingLocked(run.TaskID)
 	d.mu.Unlock()
+	d.releasePendingIfIdle(run.TaskID)
 	d.drain(ctx, run.Target)
+}
+
+// releasePendingIfIdle moves the task's pending overlap fire onto its
+// target queue when the task has no run launching and no run still active.
+// A pending fire stays put while any run of the task is in flight, so
+// queue mode keeps its one waiting fire until the task is actually idle.
+func (d *Dispatcher) releasePendingIfIdle(taskID string) {
+	active := d.lockWithActive()
+	if !d.taskInFlightLocked(taskID, active) {
+		d.releasePendingLocked(taskID)
+	}
+	d.mu.Unlock()
+}
+
+// taskInFlightLocked reports whether a run of the task is being launched
+// or is still active. It does not count the pending overlap fire or a
+// fire waiting in a target queue.
+func (d *Dispatcher) taskInFlightLocked(taskID string, active []store.Run) bool {
+	if d.launchingTask[taskID] > 0 {
+		return true
+	}
+	for _, r := range active {
+		if r.TaskID == taskID && r.EndedAt.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // releasePendingLocked moves the task's pending overlap fire, if any, to the
@@ -178,7 +209,10 @@ func (d *Dispatcher) releasePendingLocked(taskID string) {
 
 // launch calls Runs.Start for a fire already counted in launching, then
 // uncounts it. The caller must not hold d.mu and must drain the target
-// afterwards.
+// afterwards. A launch that fails before the run exists never gets
+// RunEnded; one that fails inside Start gets RunEnded before this count
+// drops, so the pending fire is released here, after the decrement, and
+// only when the task is idle.
 func (d *Dispatcher) launch(ctx context.Context, f fire) (store.Run, error) {
 	run, err := d.runs.Start(ctx, f.task, f.trigger, f.scheduledAt)
 	d.mu.Lock()
@@ -188,12 +222,8 @@ func (d *Dispatcher) launch(ctx context.Context, f fire) (store.Run, error) {
 	if d.launchingTask[f.task.ID] == 0 {
 		delete(d.launchingTask, f.task.ID)
 	}
-	if err != nil && run.ID == "" {
-		// No run exists, so no RunEnded will come for it: let the
-		// pending fire go now instead.
-		d.releasePendingLocked(f.task.ID)
-	}
 	d.mu.Unlock()
+	d.releasePendingIfIdle(f.task.ID)
 	return run, err
 }
 
@@ -282,16 +312,11 @@ func (d *Dispatcher) lockWithActive() []store.Run {
 // ActiveRuns before it calls RunEnded, which releases the pending fire:
 // in between, the task must not look idle.
 func (d *Dispatcher) busyLocked(taskID string, active []store.Run) bool {
-	if d.launchingTask[taskID] > 0 {
+	if d.taskInFlightLocked(taskID, active) {
 		return true
 	}
 	if _, ok := d.pending[taskID]; ok {
 		return true
-	}
-	for _, r := range active {
-		if r.TaskID == taskID && r.EndedAt.IsZero() {
-			return true
-		}
 	}
 	for _, q := range d.queue {
 		for _, f := range q {

@@ -563,3 +563,135 @@ func TestQueuedFiresDoNotInheritTheSubmittersCancellation(t *testing.T) {
 		t.Fatalf("task state for b = %+v ok=%v err=%v, want its fire recorded", ts, ok, err)
 	}
 }
+
+// A forced parallel run is overlap parallel on top of a queue task. The
+// one pending fire waits until neither that run nor the original is active.
+func TestForceParallelEndDoesNotStartTheQueuedFire(t *testing.T) {
+	h := newHarness(t, config.Config{}, nil)
+	tk := task("nightly", "local", "queue")
+	first := submit(t, h, tk, store.TriggerSchedule, t0, false)
+	if out := submit(t, h, tk, store.TriggerSchedule, t0.Add(time.Hour), false); !out.Queued {
+		t.Fatalf("second fire = %+v, want Queued", out)
+	}
+	forced := submit(t, h, tk, store.TriggerManual, time.Time{}, true)
+
+	h.runs.end(t, forced.Run.ID)
+
+	if n := len(h.runs.startCalls()); n != 2 {
+		t.Fatalf("Start called %d times, want 2: ending the forced run must leave the queued fire waiting", n)
+	}
+	third := submit(t, h, tk, store.TriggerSchedule, t0.Add(2*time.Hour), false)
+	if !third.Skipped || third.Run.ID != "" {
+		t.Fatalf("third fire = %+v, want dropped: the one pending slot is still held", third)
+	}
+
+	h.runs.end(t, first.Run.ID)
+
+	starts := h.runs.startCalls()
+	if len(starts) != 3 || !starts[2].ScheduledAt.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("starts = %+v, want the original pending fire started once the task is idle", starts)
+	}
+}
+
+func TestOriginalEndWhileForceParallelIsActiveDoesNotStartTheQueuedFire(t *testing.T) {
+	h := newHarness(t, config.Config{}, nil)
+	tk := task("nightly", "local", "queue")
+	first := submit(t, h, tk, store.TriggerSchedule, t0, false)
+	if out := submit(t, h, tk, store.TriggerSchedule, t0.Add(time.Hour), false); !out.Queued {
+		t.Fatalf("second fire = %+v, want Queued", out)
+	}
+	forced := submit(t, h, tk, store.TriggerManual, time.Time{}, true)
+
+	h.runs.end(t, first.Run.ID)
+
+	if n := len(h.runs.startCalls()); n != 2 {
+		t.Fatalf("Start called %d times, want 2: the queued fire waits for the forced run too", n)
+	}
+	third := submit(t, h, tk, store.TriggerSchedule, t0.Add(2*time.Hour), false)
+	if !third.Skipped {
+		t.Fatalf("third fire = %+v, want dropped while the forced run is active", third)
+	}
+
+	h.runs.end(t, forced.Run.ID)
+
+	starts := h.runs.startCalls()
+	if len(starts) != 3 || !starts[2].ScheduledAt.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("starts = %+v, want the original pending fire once the forced run ends", starts)
+	}
+}
+
+func TestFailedForceParallelDoesNotStartTheQueuedFire(t *testing.T) {
+	h := newHarness(t, config.Config{}, nil)
+	tk := task("nightly", "local", "queue")
+	first := submit(t, h, tk, store.TriggerSchedule, t0, false)
+	if out := submit(t, h, tk, store.TriggerSchedule, t0.Add(time.Hour), false); !out.Queued {
+		t.Fatalf("second fire = %+v, want Queued", out)
+	}
+	h.runs.failLaunch = true
+
+	out := submit(t, h, tk, store.TriggerManual, time.Time{}, true)
+
+	if out.Run.Status != store.StatusFailed {
+		t.Fatalf("forced run = %+v, want failed", out.Run)
+	}
+	if n := len(h.runs.startCalls()); n != 2 {
+		t.Fatalf("Start called %d times, want 2: the failed forced run must not start the queued fire", n)
+	}
+
+	h.runs.failLaunch = false
+	h.runs.end(t, first.Run.ID)
+	starts := h.runs.startCalls()
+	if len(starts) != 3 || !starts[2].ScheduledAt.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("starts = %+v, want the pending fire once the original run ends", starts)
+	}
+}
+
+func TestQueueFireDuringLaunchStaysPendingUntilThatRunEnds(t *testing.T) {
+	h := newHarness(t, config.Config{}, nil)
+	tk := task("nightly", "local", "queue")
+	var queued dispatch.Outcome
+	h.runs.duringStart = func() {
+		queued = submit(t, h, tk, store.TriggerSchedule, t0.Add(time.Hour), false)
+	}
+
+	submit(t, h, tk, store.TriggerSchedule, t0, false)
+
+	if !queued.Queued || queued.Run.ID != "" {
+		t.Fatalf("fire during launch = %+v, want Queued", queued)
+	}
+	if n := len(h.runs.startCalls()); n != 1 {
+		t.Fatalf("Start called %d times, want 1: the fire during launch stays pending", n)
+	}
+
+	h.runs.end(t, h.runs.startCalls()[0].ID)
+	starts := h.runs.startCalls()
+	if len(starts) != 2 || !starts[1].ScheduledAt.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("starts = %+v, want the pending fire after the launching run ends", starts)
+	}
+}
+
+func TestQueueFireDuringAFailedLaunchStartsOnceTheTaskIsIdle(t *testing.T) {
+	h := newHarness(t, config.Config{}, nil)
+	tk := task("nightly", "local", "queue")
+	h.runs.failLaunch = true
+	var queued dispatch.Outcome
+	h.runs.duringStart = func() {
+		h.runs.mu.Lock()
+		h.runs.failLaunch = false
+		h.runs.mu.Unlock()
+		queued = submit(t, h, tk, store.TriggerSchedule, t0.Add(time.Hour), false)
+	}
+
+	out := submit(t, h, tk, store.TriggerSchedule, t0, false)
+
+	if out.Run.Status != store.StatusFailed {
+		t.Fatalf("first run = %+v, want failed", out.Run)
+	}
+	if !queued.Queued {
+		t.Fatalf("fire during launch = %+v, want Queued", queued)
+	}
+	starts := h.runs.startCalls()
+	if len(starts) != 2 || !starts[1].ScheduledAt.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("starts = %+v, want the pending fire started once the failed launch left the task idle", starts)
+	}
+}
