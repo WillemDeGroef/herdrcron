@@ -14,7 +14,7 @@
   timeout       2h
   overlap       skip
   missed        run_once
-  on done       keep_tab
+  on done       close_tab
   on blocked    notify
   env           FOO=bar
   prompt        "Update the dependencies." (3 lines)  enter edits it in the editor
