@@ -27,7 +27,7 @@ Results of the spike for issue #1. Every herdr call in herdrcron is built on thi
 Finding things by label (`hc-` prefix):
 
 - Workspaces and tabs always have a `label` (a fresh tab without `--label` is labelled with its number, e.g. `"1"`). Filter `workspace list` / `tab list --workspace` on `label`.
-- Panes have a `label` only after `pane rename`. `tab create --label` labels the tab, not its pane. herdrcron does not need pane labels: it stores the root pane id from `tab_created.root_pane.pane_id`, and can find a run's panes by `tab_id` in `pane list --workspace <wid>`.
+- Panes have a `label` only after `pane rename`. `tab create --label` labels the tab, not its pane. To find a pane by an `hc-` label anyway: `herdr pane list [--workspace <wid>]` and match `.result.panes[].label` (there is no label filter flag; `label` is null until `herdr pane rename <pane_id> <label>`). herdrcron does not need pane labels: it stores the root pane id from `tab_created.root_pane.pane_id`, and finds a run's panes by `tab_id` in `pane list --workspace <wid>`.
 - `WorkspaceInfo` has no `cwd` field. It only has `worktree.repo_root` for workspaces herdr opened as git worktrees (`herdr worktree ...`), which `workspace create` does not set, and pane `cwd` follows the shell's `cd`, so neither is a reliable workspace cwd. Decision (a deliberate change from the spec's "same cwd" check): find the workspace by label `hc-<repo-basename>` alone, and pass `--cwd` on every `tab create`, so the workspace cwd does not matter. Two repos with the same basename share one workspace; that is harmless, since each tab gets its own cwd.
 
 Two behaviours the run logic must handle:
@@ -53,7 +53,7 @@ Rules for the tracker:
 
 - Count `idle`/`done` towards completion only when `agent` is present. During startup the status is `unknown`, not `idle`, so a run does not finish before the agent starts.
 - Pane missing from `pane list` → `lost`.
-- `agent` absent gives `unknown`: before the agent starts, after it exits back to the shell, and for the whole run of a plain command such as the integration test's `bash -c 'echo hi; sleep 5'`. To tell whether the launched command has ended, use `herdr pane process-info --pane <id>`: when both `.result.process_info.shell_pid` and `foreground_process_group_id` are non-null and equal, the shell is back at its prompt. While the command runs, the foreground group is the command's (`sleep`, `claude`, ...). Call it only for panes whose `agent` is absent, so the normal poll stays one `pane list` call per target, and only once the launch has had a poll to start (the first sample after `pane run` can still show the shell).
+- `agent` absent gives `unknown`: before the agent starts, after it exits back to the shell, and for the whole run of a plain command such as the integration test's `bash -c 'echo hi; sleep 5'`. To tell whether the launched command has ended, use `herdr pane process-info --pane <id>`: when both `.result.process_info.shell_pid` and `foreground_process_group_id` are non-null and equal, the shell's own process group is in the foreground. After a command has run, that is the prompt (verified: `sleep` takes the foreground group; when it exits the two ids are equal again and `foreground_processes` is just the shell). The same equality is also true while startup files still run in the shell's group, before the command starts (observed: `conda` still listed in `foreground_processes`, ids already equal). The first sample after `pane run` must not by itself end the run. A later equal sample may: with a 15 s poll a short command can finish without a sample ever seeing the other process group. Call process-info only for panes whose `agent` is absent, so the normal poll stays one `pane list` call per target.
 - Shell back at its prompt, not during a stop:
   - no agent was ever detected in the run (plain command) → `done`;
   - an agent was detected earlier and is now gone without herdrcron stopping it (crash, or the user typed `/exit`) → `failed` with reason `agent exited`.
@@ -90,11 +90,21 @@ Stop sequence for step 10: `send-keys <pane> esc`, then `send-keys <pane> ctrl+c
 
 ## Headless herdr server
 
-- API commands never start a server. With none running they fail with `server_not_running`, exit 1.
-- `herdr server` starts a headless server and **detaches by itself**: the command prints the socket and log paths and returns at once, the server keeps running (capability `detached_server_daemon`). A second `herdr server` while one runs exits 1 immediately and changes nothing. Workspaces, tabs and `pane run` work in a headless server; the user can later attach with plain `herdr` (or `herdr --remote <alias>`).
-- Tested with an isolated session (`herdr --session hc-issue1 server`, then `herdr --session hc-issue1 server stop` and `herdr session delete hc-issue1`), not the user's default server.
+- API commands never start a server. With none running they fail with `server_not_running`, exit 1, JSON on stderr.
+- `herdr server` **is** the headless server. It prints the socket and log paths to stderr and stays in the foreground until the process is stopped. It does not fork and exit. Verified on 0.9.1 with stdio redirected (`herdr --session <name> server </dev/null >/dev/null 2>&1` does not return) and on a pty. Workspaces, tabs and `pane run` work in that server; the user can later attach with plain `herdr` (or `herdr --remote <alias>`).
+- `herdr status` reports capability `detached_server_daemon: true` only when that process is already its own session (the long-running user server). A foreground `herdr server` reports `false`. The flag does not mean the CLI daemonizes.
+- A second `herdr server` while one is running exits 1 immediately and changes nothing. Its stderr is plain text, `error: herdr server is already running`, not the JSON error envelope.
+- The process exits on SIGHUP, including when started under `nohup` (it installs its own handler). `setsid` still matters: a new session has no controlling terminal, so an SSH session closing does not deliver hangup. A signal sent to the pid does stop it.
+- Tested on isolated sessions (`--session hc-issue1-review` and other `hc-issue1-*` names), then `herdr --session <name> server stop` and `herdr session delete <name>`. Not the user's default server.
 
-**Decision: preflight starts the server.** When a herdr call fails with `server_not_running`, preflight runs `herdr server </dev/null >/dev/null 2>&1` once (over SSH: through the target `shell`; the redirects stop the detached server from holding the SSH session open), then retries `herdr pane list`. If that still fails, the run is `failed` with the reason. Reason: the always-on host loses its herdr server on every reboot, and failing every run until the user opens a terminal defeats the scheduler. Starting a server is safe: it is the same server the user's `herdr` would start, and nothing else runs in it.
+**Decision: preflight starts the server, once, and does not wait for it.** When a herdr call fails with `server_not_running`:
+
+- Local: the daemon spawns `herdr server` in a new session (Go `SysProcAttr.Setsid`), with stdin, stdout and stderr discarded, and does not wait.
+- Remote, through the target shell (verified on Linux): `setsid herdr server </dev/null >/dev/null 2>&1 &`. `setsid` is what keeps the server out of the SSH session. Redirects alone do not; without the `&` the SSH command never returns.
+
+Then retry `herdr pane list` until it succeeds or a few seconds have passed. If it still fails, the run is `failed` with the reason. Do not treat the starter's exit status as the result: the process is not supposed to exit, and a second start that races one already running exits 1 with the plain-text error above.
+
+Reason: the always-on host loses its herdr server on every reboot, and failing every run until the user opens a terminal defeats the scheduler. This is the same server the user's `herdr` would start. The systemd unit that runs the daemon must not kill that process when the daemon stops (`KillMode=process`, or an equivalent). A server started in the daemon's cgroup dies with it, and takes the panes with it.
 
 ## Attach
 

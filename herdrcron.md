@@ -41,7 +41,7 @@ Rules:
 
 - The daemon talks to herdr only through the `herdr` CLI with JSON output. Do not implement the raw socket protocol in v1. The socket is local to each machine, and the CLI is the more stable contract.
 - The TUI talks to the daemon only through the daemon API (see Daemon API). The TUI never reads or writes task files directly.
-- All herdr workspaces, tabs and panes that herdrcron creates carry a `hc-` label prefix, so herdrcron can find them again and the user can tell them apart.
+- All herdr workspaces, tabs and panes that herdrcron creates carry a `hc-` label prefix, so herdrcron can find them again and the user can tell them apart. (For herdr 0.9.1, `docs/herdr-findings.md` labels workspaces and tabs only. Panes are found by the stored pane id and by `tab_id`: `tab create --label` does not label the pane.)
 - Language: Go 1.23+. Suggested libraries: Bubble Tea, Bubbles and Lip Gloss (TUI), Huh (forms), robfig/cron v3 (cron parsing), golang.org/x/crypto/ssh or the system `ssh` binary (see Run execution), modernc.org/sqlite (pure Go, no cgo).
 
 ## Data model
@@ -158,9 +158,9 @@ A `herdr` package on top of `Target` wraps the herdr CLI commands and parses JSO
 ### Run steps
 
 1. Reserve: insert the run row (`starting`). Create the run id.
-2. Preflight (cached per target for 10 min): the herdr server answers (`herdr pane list` succeeds); the agent command is on PATH; `cwd` exists. On failure: run `failed` with the reason.
-3. Workspace: find a workspace labelled `hc-<repo-basename>` with the same cwd; if none, `herdr workspace create --cwd <cwd> --label hc-<repo-basename>`.
-4. Tab: create a tab in that workspace labelled `hc-<task-id>-<HHMM>`. Store workspace, tab and root pane ids in the run row.
+2. Preflight (cached per target for 10 min): the herdr server answers (`herdr pane list` succeeds); the agent command is on PATH; `cwd` exists. On failure: run `failed` with the reason. (For herdr 0.9.1, `docs/herdr-findings.md` starts `herdr server` once, in a new session and without waiting, when the error is `server_not_running`, then retries `pane list`.)
+3. Workspace: find a workspace labelled `hc-<repo-basename>` with the same cwd; if none, `herdr workspace create --cwd <cwd> --label hc-<repo-basename>`. (For herdr 0.9.1, `docs/herdr-findings.md` matches the label only. `WorkspaceInfo` has no cwd. Pass `--cwd` on every `tab create`.)
+4. Tab: create a tab in that workspace labelled `hc-<task-id>-<HHMM>`. Store workspace, tab and root pane ids in the run row. (For herdr 0.9.1, `docs/herdr-findings.md` reuses the first tab `workspace create` already made, via `tab rename`, and looks the workspace up by label on every run: closing the last tab closes the workspace. The run row still stores the ids for that run.)
 5. Prompt: `PutFile` the prompt to `~/.cache/herdrcron/runs/<run-id>.md` on the target (for SSH: `ssh <alias> 'mkdir -p … && cat > …'` with the prompt on stdin).
 6. Launch: `herdr pane run <pane> "cd <cwd> && env HERDRCRON_RUN_ID=<id> <ENV…> <command> <args…> \"$(cat <prompt-path>)\""`. The prompt goes in as the first argument, so there is no need to wait for the agent's input prompt. Set the run to `running`. (For herdr 0.9.1, `docs/herdr-findings.md` moves `cd` and `env` into `tab create --cwd/--env`.)
 7. Track: poll every 15 s (`poll_interval`) with one call that returns the pane list and agent status for all active runs on that target. Map status:
@@ -168,9 +168,9 @@ A `herdr` package on top of `Target` wraps the herdr CLI commands and parses JSO
    - `blocked` → `blocked`; on the first change, notify (see Configuration). With `on_blocked: stop`, stop the run.
    - `done` or `idle` for 2 polls in a row (debounce) → `done`.
    - Pane gone → `lost`.
-   - Unknown or no status (no herdr agent integration) → stay `running`; the timeout still applies.
+   - Unknown or no status (no herdr agent integration) → stay `running`; the timeout still applies. (For herdr 0.9.1, `docs/herdr-findings.md` ends a run whose `agent` is absent when a later `pane process-info` sample shows the shell back in the foreground.)
 8. Timeout: when `started_at + timeout` passes, stop the run (step 10) with status `timeout`.
-9. Finish: read the last 200 lines (`herdr pane read <pane> --source recent --lines 200`) into `output_tail`. Set `ended_at`. With `on_done: close_tab`, close the tab; else keep it for the user to read. Delete the remote prompt file.
+9. Finish: read the last 200 lines (`herdr pane read <pane> --source recent --lines 200`) into `output_tail`. Set `ended_at`. With `on_done: close_tab`, close the tab; else keep it for the user to read. Delete the remote prompt file. (For herdr 0.9.1, `docs/herdr-findings.md` uses `--source recent-unwrapped` so soft wraps are joined. `--source recent --lines N` does work and keeps the wraps.)
 10. Stop (timeout, user stop, or `on_blocked: stop`): send Ctrl-C to the pane twice, 2 s apart; wait 10 s; then close the tab. Status `stopped` or `timeout`. (For herdr 0.9.1, `docs/herdr-findings.md` replaces this with `esc`, then `ctrl+c ctrl+c` in one call: two calls 2 s apart do not exit Claude Code.)
 
 ### Recovery and failures
