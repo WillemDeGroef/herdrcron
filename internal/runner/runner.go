@@ -68,6 +68,11 @@ type Options struct {
 	// path (done, lost, failed, stopped, timeout, failed to start), with no
 	// runner lock held.
 	OnEnd func(ctx context.Context, run store.Run)
+	// OnChange, if set, is called after every successful write of a run
+	// row (the run reserved, its herdr ids stored, a status change, its
+	// end), with the run as stored and no runner lock held. It must not
+	// block: it may run inside a poll or a stop.
+	OnChange func(run store.Run)
 }
 
 // Runner starts and tracks runs. Its methods are safe for concurrent use.
@@ -80,6 +85,7 @@ type Runner struct {
 	waitStart time.Duration
 	targets   map[string]*targetState
 	onEnd     func(context.Context, store.Run)
+	onChange  func(store.Run)
 
 	// stopCtx is the context of stop sequences: Run cancels it when it
 	// returns, and waits for the stops to give up (the runs stay open for
@@ -90,7 +96,10 @@ type Runner struct {
 
 	mu     sync.Mutex
 	active map[string]*activeRun // by run id
-	closed bool                  // Run has returned; no new stops
+	// starting holds the runs between their insert and the end of their
+	// launch, by run id; they are not in active yet.
+	starting map[string]*activeRun
+	closed   bool // Run has returned; no new stops
 }
 
 // targetState is a target with its herdr client and preflight cache.
@@ -141,9 +150,10 @@ type activeRun struct {
 func New(o Options) *Runner {
 	r := &Runner{
 		clock: o.Clock, store: o.Store, cfg: o.Config, configDir: o.ConfigDir, log: o.Log,
-		waitStart: o.ServerStartWait, onEnd: o.OnEnd,
-		targets: make(map[string]*targetState, len(o.Targets)),
-		active:  map[string]*activeRun{},
+		waitStart: o.ServerStartWait, onEnd: o.OnEnd, onChange: o.OnChange,
+		targets:  make(map[string]*targetState, len(o.Targets)),
+		active:   map[string]*activeRun{},
+		starting: map[string]*activeRun{},
 	}
 	r.stopCtx, r.cancelStop = context.WithCancel(context.Background())
 	if r.waitStart <= 0 {
@@ -176,15 +186,23 @@ func (r *Runner) Start(ctx context.Context, t config.Task, trigger string, sched
 		return store.Run{}, err
 	}
 	a := &activeRun{run: run, task: t, log: logging.ForRun(r.log, run.ID, t.ID, t.Target)}
+	r.mu.Lock()
+	r.starting[run.ID] = a
+	r.mu.Unlock()
+	r.changed(run)
 	a.log.Info("run starting", "trigger", trigger, "scheduled_at", scheduledAt)
 
-	if err := r.launch(ctx, a); err != nil {
+	err := r.launch(ctx, a)
+	r.mu.Lock()
+	delete(r.starting, run.ID)
+	if err == nil {
+		r.active[run.ID] = a
+	}
+	r.mu.Unlock()
+	if err != nil {
 		a.log.Warn("run failed to start", "err", err)
 		return r.end(context.WithoutCancel(ctx), a, store.StatusFailed, err.Error())
 	}
-	r.mu.Lock()
-	r.active[run.ID] = a
-	r.mu.Unlock()
 	return a.run, nil
 }
 
@@ -227,6 +245,7 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 	if err := r.store.UpdateRun(ctx, a.run); err != nil {
 		return err
 	}
+	r.changed(a.run)
 
 	promptPath := promptPath(a.run.ID)
 	if err := ts.t.PutFile(ctx, promptPath, data); err != nil {
@@ -244,7 +263,10 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 	if err := r.store.UpdateRun(ctx, running); err != nil {
 		return err
 	}
+	r.mu.Lock()
 	a.run = running
+	r.mu.Unlock()
+	r.changed(running)
 	launchOK = true
 	a.log.Info("run launched", "herdr_workspace", a.run.HerdrWorkspace, "herdr_tab", a.run.HerdrTab,
 		"herdr_pane", a.run.HerdrPane, "agent", t.Agent.Command, "env_keys", envKeys(t.Env))
@@ -280,14 +302,14 @@ func (r *Runner) openTab(ctx context.Context, ts *targetState, a *activeRun, cwd
 		if err != nil {
 			return fmt.Errorf("create tab: %w", err)
 		}
-		a.run.HerdrWorkspace, a.run.HerdrTab, a.run.HerdrPane = res.Tab.WorkspaceID, res.Tab.TabID, res.RootPane.PaneID
+		r.setHerdrIDs(a, res.Tab.WorkspaceID, res.Tab.TabID, res.RootPane.PaneID)
 		return nil
 	}
 	res, err := ts.herdr.WorkspaceCreate(ctx, cwd, wsLabel, env)
 	if err != nil {
 		return fmt.Errorf("create workspace: %w", err)
 	}
-	a.run.HerdrWorkspace, a.run.HerdrTab, a.run.HerdrPane = res.Workspace.WorkspaceID, res.Tab.TabID, res.RootPane.PaneID
+	r.setHerdrIDs(a, res.Workspace.WorkspaceID, res.Tab.TabID, res.RootPane.PaneID)
 	if err := ts.herdr.TabRename(ctx, res.Tab.TabID, label); err != nil {
 		return fmt.Errorf("rename tab: %w", err)
 	}
@@ -295,6 +317,14 @@ func (r *Runner) openTab(ctx context.Context, ts *targetState, a *activeRun, cwd
 }
 
 // tabLabel is hc-<task-id>-<HHMM>, in the task's time zone.
+// setHerdrIDs stores a starting run's herdr ids under r.mu, which LiveRuns
+// reads it with.
+func (r *Runner) setHerdrIDs(a *activeRun, workspace, tab, pane string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a.run.HerdrWorkspace, a.run.HerdrTab, a.run.HerdrPane = workspace, tab, pane
+}
+
 func (r *Runner) tabLabel(t config.Task) (string, error) {
 	loc, err := r.cfg.Location(t)
 	if err != nil {
@@ -603,6 +633,8 @@ func (r *Runner) track(ctx context.Context, ts *targetState, a *activeRun, p her
 		r.mu.Unlock()
 		if err := r.store.UpdateRun(ctx, a.run); err != nil {
 			a.log.Error("cannot store run status", "err", err)
+		} else {
+			r.changed(a.run)
 		}
 	}
 	// On every blocked sample, not only on the change: a run recovered as
@@ -658,6 +690,9 @@ func (r *Runner) end(ctx context.Context, a *activeRun, status, reason string) (
 	failedToStart := a.run.Status == store.StatusStarting
 	a.run.Status, a.run.ExitReason, a.run.EndedAt = status, reason, r.clock.Now()
 	err := r.store.UpdateRun(ctx, a.run)
+	if err == nil {
+		r.changed(a.run)
+	}
 	a.log.Info("run ended", "status", status, "exit_reason", reason)
 	if r.onEnd != nil {
 		defer r.onEnd(ctx, a.run)
@@ -803,6 +838,30 @@ func (r *Runner) sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// changed calls OnChange for a stored run.
+func (r *Runner) changed(run store.Run) {
+	if r.onChange != nil {
+		r.onChange(run)
+	}
+}
+
+// LiveRuns is ActiveRuns plus the runs still starting (reserved, launch
+// not finished), oldest first. It is the view for display; dispatch counts
+// starting runs itself and uses ActiveRuns.
+func (r *Runner) LiveRuns() []store.Run {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]store.Run, 0, len(r.active)+len(r.starting))
+	for _, a := range r.active {
+		out = append(out, a.run)
+	}
+	for _, a := range r.starting {
+		out = append(out, a.run)
+	}
+	sortRuns(out)
+	return out
+}
+
 // ActiveRuns returns a snapshot of every tracked run, on any target,
 // including runs being stopped, oldest first.
 func (r *Runner) ActiveRuns() []store.Run {
@@ -812,13 +871,18 @@ func (r *Runner) ActiveRuns() []store.Run {
 	for _, a := range r.active {
 		out = append(out, a.run)
 	}
-	slices.SortFunc(out, func(a, b store.Run) int {
+	sortRuns(out)
+	return out
+}
+
+// sortRuns sorts runs oldest first, by start time then id.
+func sortRuns(runs []store.Run) {
+	slices.SortFunc(runs, func(a, b store.Run) int {
 		if c := a.StartedAt.Compare(b.StartedAt); c != 0 {
 			return c
 		}
 		return strings.Compare(a.ID, b.ID)
 	})
-	return out
 }
 
 // Run polls every target with active runs each poll_interval until ctx is

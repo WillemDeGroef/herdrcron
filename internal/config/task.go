@@ -55,7 +55,10 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 	}
 	v, err := time.ParseDuration(s)
 	if err != nil {
-		return fmt.Errorf("timeout: %q is not a Go duration (for example 2h or 30m)", s)
+		// A TypeError lets the decoder go on with the other fields.
+		return &yaml.TypeError{Errors: []string{
+			fmt.Sprintf("line %d: timeout: %q is not a Go duration (for example 2h or 30m)", n.Line, s),
+		}}
 	}
 	d.Duration = v
 	return nil
@@ -71,10 +74,32 @@ type TaskEntry struct {
 	Err  error
 }
 
-// ValidationError lists every problem found in one task file.
-type ValidationError struct{ Problems []string }
+// ValidationError lists every problem found in one task file. Fields holds
+// the same problems as Problems, in the same order, each with its key.
+type ValidationError struct {
+	Problems []string
+	Fields   []FieldError
+}
+
+// FieldError is one problem with one field. Field is the YAML key, with
+// nested keys joined by a dot ("agent.command").
+type FieldError struct{ Field, Message string }
 
 func (e *ValidationError) Error() string { return strings.Join(e.Problems, "; ") }
+
+// ByField groups the problems by field.
+func (e *ValidationError) ByField() map[string][]string {
+	m := make(map[string][]string, len(e.Fields))
+	for _, f := range e.Fields {
+		m[f.Field] = append(m[f.Field], f.Message)
+	}
+	return m
+}
+
+func (e *ValidationError) add(field, msg string) {
+	e.Problems = append(e.Problems, msg)
+	e.Fields = append(e.Fields, FieldError{Field: field, Message: msg})
+}
 
 // quotedValue matches the values yaml.v3 quotes in its errors.
 var quotedValue = regexp.MustCompile("`[^`]*`")
@@ -120,73 +145,121 @@ func LoadTasks(configDir string, cfg Config) ([]TaskEntry, error) {
 	return entries, nil
 }
 
+// DefaultTask is a task with the spec's defaults for every optional field
+// and the default prompt file, prompts/<id>.md.
+func DefaultTask(id string) Task {
+	return Task{
+		ID: id, Enabled: true, Overlap: "skip", Missed: "run_once", OnDone: "keep_tab", OnBlocked: "notify",
+		PromptFile: defaultPromptFile(id),
+	}
+}
+
+func defaultPromptFile(fileID string) string { return filepath.Join("prompts", fileID+".md") }
+
 func loadTask(path, fileID, configDir string, cfg Config) (Task, error) {
+	t, err := readTask(path, fileID, true)
+	if err != nil {
+		return Task{}, err
+	}
+	return t, Validate(t, fileID, configDir, cfg)
+}
+
+// ReadTaskLenient reads the task file at path without validating it and
+// without rejecting unknown keys, applying the same defaults as LoadTask
+// (the file name gives the default prompt file). It lets an invalid task's
+// fields be shown. On a type error (a field of the wrong type) the other
+// fields are still returned, with the error.
+func ReadTaskLenient(path string) (Task, error) {
+	return readTask(path, strings.TrimSuffix(filepath.Base(path), ".yaml"), false)
+}
+
+func readTask(path, fileID string, strict bool) (Task, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Task{}, fmt.Errorf("read task file: %w", err)
 	}
-	t := Task{Enabled: true, Overlap: "skip", Missed: "run_once", OnDone: "keep_tab", OnBlocked: "notify"}
+	t := DefaultTask(fileID)
+	t.ID = "" // the id must come from the file
 	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true) // a typo like "enabeld" must not be silently ignored
+	dec.KnownFields(strict) // a typo like "enabeld" must not be silently ignored
 	if err := dec.Decode(&t); err != nil && !errors.Is(err, io.EOF) {
-		return Task{}, parseError(err)
+		var te *yaml.TypeError
+		if strict || !errors.As(err, &te) {
+			return Task{}, parseError(err)
+		}
+		return fillDefaults(t, fileID), parseError(err)
 	}
+	return fillDefaults(t, fileID), nil
+}
+
+// fillDefaults restores the default prompt file when the file sets it empty.
+func fillDefaults(t Task, fileID string) Task {
 	if t.PromptFile == "" {
-		t.PromptFile = filepath.Join("prompts", fileID+".md")
+		t.PromptFile = defaultPromptFile(fileID)
 	}
-	return t, Validate(t, fileID, configDir, cfg)
+	return t
 }
 
 // Validate checks t, loaded from tasks/<fileID>.yaml, against the rules in
 // the spec. It returns a *ValidationError listing every problem, or nil.
 func Validate(t Task, fileID, configDir string, cfg Config) error {
-	var p []string
+	return validate(t, fileID, configDir, cfg, false)
+}
+
+// ValidateDraft checks a task about to be written to tasks/<t.ID>.yaml: the
+// same rules as Validate, except that the prompt file need not exist yet.
+func ValidateDraft(t Task, configDir string, cfg Config) error {
+	return validate(t, t.ID, configDir, cfg, true)
+}
+
+func validate(t Task, fileID, configDir string, cfg Config, draft bool) error {
+	e := &ValidationError{}
 	switch {
 	case t.ID == "":
-		p = append(p, "id is missing")
+		e.add("id", "id is missing")
 	case !idPattern.MatchString(t.ID):
-		p = append(p, fmt.Sprintf("id %q must match %s", t.ID, idPattern))
+		e.add("id", fmt.Sprintf("id %q must match %s", t.ID, idPattern))
 	case t.ID != fileID:
-		p = append(p, fmt.Sprintf("id %q does not match file name %q", t.ID, fileID))
+		e.add("id", fmt.Sprintf("id %q does not match file name %q", t.ID, fileID))
 	}
 	if t.Target == "" {
-		p = append(p, "target is missing")
+		e.add("target", "target is missing")
 	} else if _, ok := cfg.Targets[t.Target]; !ok {
-		p = append(p, fmt.Sprintf("unknown target %q", t.Target))
+		e.add("target", fmt.Sprintf("unknown target %q", t.Target))
 	}
 	if t.Schedule == "" {
-		p = append(p, "schedule is missing")
+		e.add("schedule", "schedule is missing")
 	} else if err := checkSchedule(t.Schedule); err != nil {
-		p = append(p, fmt.Sprintf("schedule %q: %v", t.Schedule, err))
+		e.add("schedule", fmt.Sprintf("schedule %q: %v", t.Schedule, err))
 	}
 	if t.Timezone != "" {
 		if _, err := time.LoadLocation(t.Timezone); err != nil {
-			p = append(p, fmt.Sprintf("timezone %q is unknown", t.Timezone))
+			e.add("timezone", fmt.Sprintf("timezone %q is unknown", t.Timezone))
 		}
 	}
 	if t.Agent.Command == "" {
-		p = append(p, "agent.command is missing")
+		e.add("agent.command", "agent.command is missing")
 	}
-	if problem := checkPromptFile(t.PromptFile, configDir); problem != "" {
-		p = append(p, problem)
+	if problem := checkPromptFile(t.PromptFile, configDir, draft); problem != "" {
+		e.add("prompt_file", problem)
 	}
 	if t.Timeout.Duration <= 0 {
-		p = append(p, "timeout must be > 0")
+		e.add("timeout", "timeout must be > 0")
 	}
 	if err := checkPausedUntil(t.PausedUntil); err != nil {
-		p = append(p, err.Error())
+		e.add("paused_until", err.Error())
 	}
 	for _, f := range []struct{ key, val string }{
 		{"overlap", t.Overlap}, {"missed", t.Missed}, {"on_done", t.OnDone}, {"on_blocked", t.OnBlocked},
 	} {
 		if !slices.Contains(enums[f.key], f.val) {
-			p = append(p, fmt.Sprintf("%s %q must be one of %s", f.key, f.val, strings.Join(enums[f.key], ", ")))
+			e.add(f.key, fmt.Sprintf("%s %q must be one of %s", f.key, f.val, strings.Join(enums[f.key], ", ")))
 		}
 	}
-	if len(p) == 0 {
+	if len(e.Problems) == 0 {
 		return nil
 	}
-	return &ValidationError{Problems: p}
+	return e
 }
 
 // checkSchedule accepts a 5-field cron expression or a descriptor (@every
@@ -239,9 +312,16 @@ func PromptPath(promptFile, configDir string) string {
 	return filepath.Join(configDir, promptFile)
 }
 
-func checkPromptFile(promptFile, configDir string) string {
+// checkPromptFile reports a problem with prompt_file. A draft's prompt file
+// may be missing; it is written with the task.
+func checkPromptFile(promptFile, configDir string, draft bool) string {
+	if promptFile == "" {
+		return "prompt_file is missing"
+	}
 	info, err := os.Stat(PromptPath(promptFile, configDir))
 	switch {
+	case errors.Is(err, fs.ErrNotExist) && draft:
+		return ""
 	case errors.Is(err, fs.ErrNotExist):
 		return fmt.Sprintf("prompt file %s does not exist", promptFile)
 	case err != nil:

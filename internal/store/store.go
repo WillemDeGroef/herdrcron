@@ -478,3 +478,12 @@ func (s *Store) GlobalPause(ctx context.Context) (all bool, targets []string, er
 	}
 	return all, targets, nil
 }
+
+// DeleteTaskState removes the scheduling state of a deleted task. Its runs
+// stay.
+func (s *Store) DeleteTaskState(ctx context.Context, taskID string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM task_state WHERE task_id = ?`, taskID); err != nil {
+		return fmt.Errorf("delete task state %s: %w", taskID, err)
+	}
+	return nil
+}

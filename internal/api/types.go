@@ -13,12 +13,43 @@ const (
 	MethodTasksResume     = "tasks.resume"      // TaskIDParams → TaskSummary
 	MethodPauseAll        = "pause_all"         // TargetParams → GlobalPause
 	MethodResumeAll       = "resume_all"        // TargetParams → GlobalPause
+
+	MethodTasksGet    = "tasks.get"    // TaskIDParams → TaskDetail
+	MethodTasksCreate = "tasks.create" // TaskWriteParams → TaskDetail
+	MethodTasksUpdate = "tasks.update" // TaskWriteParams (ID, Version set) → TaskDetail
+	MethodTasksDelete = "tasks.delete" // DeleteParams → DeleteResult
+	MethodReload      = "reload"       // no params → ReloadResult
+	MethodSubscribe   = "subscribe"    // no params → SubscribeResult, then Event notifications
+)
+
+// Event names: the "method" of the notifications a subscribed connection
+// receives after the "subscribe" result.
+const (
+	EventTaskChanged   = "task.changed"   // params TaskChangedEvent
+	EventRunChanged    = "run.changed"    // params RunChangedEvent
+	EventTargetChanged = "target.changed" // params TargetChangedEvent
 )
 
 // CodeRunActive is the error code of "tasks.run_now" for a task with
 // overlap skip and an active run, when force_parallel is not set. Clients
 // ask the user to confirm a parallel run and call again with it set.
 const CodeRunActive = -32001
+
+// CodeValidation is the error code of "tasks.create" and "tasks.update" for
+// a task that does not validate. Its data is a ValidationErrorData.
+const CodeValidation = -32002
+
+// CodeVersionMismatch is the error code of "tasks.update" when the version
+// in the params is not the task's current version: the task or prompt file
+// changed since the client read it. The client reads the task again.
+const CodeVersionMismatch = -32003
+
+// CodeRunActiveDelete is the error code of "tasks.delete" for a task with an
+// active run, when stop_active is not set.
+const CodeRunActiveDelete = -32004
+
+// TaskRunsLimit is the number of runs "tasks.get" returns.
+const TaskRunsLimit = 20
 
 // DefaultRunsLimit is the runs.list limit when the params give none.
 const DefaultRunsLimit = 50
@@ -66,6 +97,8 @@ const (
 	StateOff     = "off"     // enabled: false
 	StatePaused  = "paused"  // paused_until is indefinite or in the future, or a global pause covers the task
 	StateIdle    = "idle"    // valid, enabled, not paused, no active run
+	StateRunning = "running" // a run of the task is active (starting or running); wins over the states above
+	StateBlocked = "blocked" // an active run waits for the user; wins over running
 )
 
 // StatusResult is the result of "status".
@@ -158,4 +191,119 @@ type RunSummary struct {
 	HerdrWorkspace string `json:"herdr_workspace,omitempty"`
 	HerdrTab       string `json:"herdr_tab,omitempty"`
 	HerdrPane      string `json:"herdr_pane,omitempty"`
+}
+
+// TaskDef is a task definition as the API carries it: the fields of a task
+// file. Timeout is a Go duration string; PausedUntil is empty, an RFC 3339
+// time or "indefinite". In "tasks.create" an empty PromptFile means
+// prompts/<id>.md, and Enabled and the policy fields take their defaults
+// only when the client sends them (the TUI form always sends every field).
+type TaskDef struct {
+	ID          string            `json:"id"`
+	Name        string            `json:"name,omitempty"`
+	Target      string            `json:"target"`
+	Cwd         string            `json:"cwd,omitempty"`
+	Schedule    string            `json:"schedule"`
+	Timezone    string            `json:"timezone,omitempty"`
+	Enabled     bool              `json:"enabled"`
+	PausedUntil string            `json:"paused_until,omitempty"`
+	Agent       AgentDef          `json:"agent"`
+	PromptFile  string            `json:"prompt_file,omitempty"`
+	Timeout     string            `json:"timeout"`
+	Overlap     string            `json:"overlap"`
+	Missed      string            `json:"missed"`
+	OnDone      string            `json:"on_done"`
+	OnBlocked   string            `json:"on_blocked"`
+	Env         map[string]string `json:"env,omitempty"`
+}
+
+// AgentDef is the agent command of a TaskDef.
+type AgentDef struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args,omitempty"`
+}
+
+// TaskDetail is the result of "tasks.get", "tasks.create" and
+// "tasks.update". For an invalid task Task holds what could be read (empty
+// for a file that does not parse) and Summary.Error says why.
+type TaskDetail struct {
+	Summary TaskSummary `json:"summary"`
+	Task    TaskDef     `json:"task"`
+	Prompt  string      `json:"prompt"`
+	// Version identifies the task file and prompt file contents; pass it
+	// back in "tasks.update".
+	Version string `json:"version"`
+	// Runs are the task's last TaskRunsLimit runs, newest first.
+	Runs []RunSummary `json:"runs"`
+}
+
+// TaskWriteParams are the params of "tasks.create" and "tasks.update". In
+// "tasks.update" ID names the task to change and must equal Task.ID (a
+// task cannot be renamed), and Version is the version the client read.
+type TaskWriteParams struct {
+	ID      string  `json:"id,omitempty"`
+	Version string  `json:"version,omitempty"`
+	Task    TaskDef `json:"task"`
+	Prompt  string  `json:"prompt"`
+}
+
+// ValidationErrorData is the data of a CodeValidation error: the problems
+// by task field, keyed by the JSON field name ("schedule", "agent.command",
+// "prompt", ...). A field can have more than one problem.
+type ValidationErrorData struct {
+	Fields map[string][]string `json:"fields"`
+}
+
+// DeleteParams are the params of "tasks.delete". With StopActive set the
+// task's active runs are stopped first; without it a task with an active
+// run is refused with CodeRunActiveDelete.
+type DeleteParams struct {
+	ID         string `json:"id"`
+	StopActive bool   `json:"stop_active,omitempty"`
+}
+
+// DeleteResult is the result of "tasks.delete".
+type DeleteResult struct {
+	ID string `json:"id"`
+	// StoppedRuns are the runs stopped because of stop_active.
+	StoppedRuns []RunSummary `json:"stopped_runs"`
+}
+
+// ReloadResult is the result of "reload".
+type ReloadResult struct {
+	Tasks []TaskSummary `json:"tasks"`
+	// RestartRequired is set when config.yaml differs from the config the
+	// daemon runs with. Tasks are always validated against the running
+	// config; a changed config.yaml takes effect after a daemon restart.
+	RestartRequired bool `json:"restart_required,omitempty"`
+}
+
+// SubscribeResult is the result of "subscribe". After it the connection
+// carries only Event notifications, until the client closes it. A client
+// that falls too far behind is disconnected and should subscribe again
+// and re-read the state.
+type SubscribeResult struct {
+	Subscribed bool `json:"subscribed"`
+}
+
+// TaskChangedEvent is the params of "task.changed": a task was created,
+// edited (through the API or by hand), deleted, or its display state
+// changed with a run. Task is nil when Deleted is set.
+type TaskChangedEvent struct {
+	ID      string       `json:"id"`
+	Deleted bool         `json:"deleted,omitempty"`
+	Task    *TaskSummary `json:"task,omitempty"`
+	// Version is the task's new version; empty when Deleted.
+	Version string `json:"version,omitempty"`
+}
+
+// RunChangedEvent is the params of "run.changed": a run was stored with a
+// new status (started, status change, ended).
+type RunChangedEvent struct {
+	Run RunSummary `json:"run"`
+}
+
+// TargetChangedEvent is the params of "target.changed".
+type TargetChangedEvent struct {
+	Target TargetStatus `json:"target"`
 }

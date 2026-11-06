@@ -38,6 +38,7 @@ type fakeHerdr struct {
 
 	calls      [][]string
 	files      map[string][]byte
+	puts       []string          // contents of every PutFile, in order
 	workspaces map[string]string // label -> id
 	tabs       map[string]string // tab id -> workspace id
 	panes      map[string]*fakePane
@@ -61,7 +62,15 @@ func (f *fakeHerdr) PutFile(_ context.Context, path string, data []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.files[path] = slices.Clone(data)
+	f.puts = append(f.puts, string(data))
 	return nil
+}
+
+// putContents returns the contents of every file written, in order.
+func (f *fakeHerdr) putContents() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.puts)
 }
 
 func (f *fakeHerdr) RemoveFile(_ context.Context, path string) error {

@@ -2,6 +2,11 @@
 // one JSON message per line. Batch requests are not supported: a batch gets a
 // single "invalid request" error. The daemon registers handlers on a Server; the
 // TUI and CLI subcommands use a Client.
+//
+// A stream method (Server.HandleStream, Client.Subscribe) turns its
+// connection into a one-way event stream: after the method's result the
+// server pushes JSON-RPC notifications on the connection until either side
+// closes it.
 package api
 
 import (
@@ -57,7 +62,41 @@ func InvalidParams(err error) *Error {
 
 // HandlerFunc serves one method. params is the raw "params" member (nil
 // when absent). The result is marshalled as the response "result".
+//
+// ctx is the connection's context: it is cancelled when the client closes
+// the connection or the server shuts down.
 type HandlerFunc func(ctx context.Context, params json.RawMessage) (any, error)
+
+// Notification is a JSON-RPC notification the server pushes on a
+// subscribed connection: {"jsonrpc":"2.0","method":...,"params":...},
+// without id. Params is sent as given.
+type Notification struct {
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params,omitempty"`
+}
+
+// StreamFunc serves a stream method. On success the server writes result
+// as the response, then forwards every notification from events to the
+// connection, in order. ctx is the connection's context, cancelled when the
+// client closes the connection or the server shuts down; the handler must
+// stop feeding events (and release whatever feeds it) once ctx is done. The
+// handler may close events to end the stream: the server then closes the
+// connection, which tells the client (for example that it fell too far
+// behind). A nil events channel streams nothing until the connection ends.
+// On error nothing is streamed and the connection stays a plain one.
+type StreamFunc func(ctx context.Context, params json.RawMessage) (result any, events <-chan Notification, err error)
+
+type notificationMsg struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+// handler is one registered method: exactly one of plain and stream is set.
+type handler struct {
+	plain  HandlerFunc
+	stream StreamFunc
+}
 
 type request struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -79,7 +118,7 @@ var nullID = json.RawMessage("null")
 type Server struct {
 	log      *slog.Logger
 	mu       sync.Mutex
-	handlers map[string]HandlerFunc
+	handlers map[string]handler
 	conns    map[net.Conn]struct{}
 }
 
@@ -89,14 +128,25 @@ func NewServer(log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Server{log: log, handlers: map[string]HandlerFunc{}, conns: map[net.Conn]struct{}{}}
+	return &Server{log: log, handlers: map[string]handler{}, conns: map[net.Conn]struct{}{}}
 }
 
 // Handle registers h for method. Register all handlers before Serve.
 func (s *Server) Handle(method string, h HandlerFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.handlers[method] = h
+	s.handlers[method] = handler{plain: h}
+}
+
+// HandleStream registers the stream method h for method. Register all
+// handlers before Serve. A stream request sent as a notification (no id) is
+// ignored without calling h. Once a connection is subscribed, the server
+// reads it only to notice when it closes: further requests on it get a
+// CodeInvalidRequest error and notifications are ignored.
+func (s *Server) HandleStream(method string, h StreamFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.handlers[method] = handler{stream: h}
 }
 
 // maxSocketPath is the longest Unix socket path the kernel accepts
@@ -213,29 +263,70 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
+// connWriter serializes all writes to one connection, so responses and
+// notifications never interleave mid-line.
+type connWriter struct {
+	mu sync.Mutex
+	w  *bufio.Writer
+}
+
+func (cw *connWriter) writeLine(data []byte) error {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	if _, err := cw.w.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return cw.w.Flush()
+}
+
+func (cw *connWriter) writeResponse(resp response) error {
+	data, err := json.Marshal(resp)
+	if err != nil {
+		data, _ = json.Marshal(response{JSONRPC: "2.0", ID: resp.ID,
+			Error: &Error{Code: CodeInternalError, Message: "cannot encode result"}})
+	}
+	return cw.writeLine(data)
+}
+
+// serveConn serves one connection until the client closes it or ctx is
+// done. Handlers get a context that is cancelled when the read loop ends. It
+// returns only after the connection's forwarding goroutine, if any, ended.
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
+	ctx, cancel := context.WithCancel(ctx)
+	var fwd sync.WaitGroup
+	defer fwd.Wait()
+	defer cancel()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64<<10), maxMessage)
-	w := bufio.NewWriter(conn)
+	cw := &connWriter{w: bufio.NewWriter(conn)}
+	subscribed := false
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
 		if len(line) == 0 {
 			continue
 		}
-		resp, ok := s.handleLine(ctx, line)
+		if subscribed {
+			if resp, ok := subscribedReply(line); ok {
+				if err := cw.writeResponse(resp); err != nil {
+					return
+				}
+			}
+			continue
+		}
+		resp, ok, events := s.handleLine(ctx, line)
 		if !ok {
 			continue // notification
 		}
-		data, err := json.Marshal(resp)
-		if err != nil {
-			data, _ = json.Marshal(response{JSONRPC: "2.0", ID: resp.ID,
-				Error: &Error{Code: CodeInternalError, Message: "cannot encode result"}})
-		}
-		if _, err := w.Write(append(data, '\n')); err != nil {
+		if err := cw.writeResponse(resp); err != nil {
 			return
 		}
-		if err := w.Flush(); err != nil {
-			return
+		if events != nil {
+			subscribed = true
+			fwd.Add(1)
+			go func() {
+				defer fwd.Done()
+				s.forward(ctx, cancel, conn, cw, events)
+			}()
 		}
 	}
 	if err := sc.Err(); err != nil && ctx.Err() == nil {
@@ -243,14 +334,56 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
+// forward writes the notifications from events to the connection until
+// events is closed (then it closes the connection) or ctx is done.
+func (s *Server) forward(ctx context.Context, cancel context.CancelFunc, conn net.Conn, cw *connWriter, events <-chan Notification) {
+	end := func() {
+		cancel() // before Close, so the read loop does not log the closed conn
+		_ = conn.Close()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case n, ok := <-events:
+			if !ok {
+				end()
+				return
+			}
+			data, err := json.Marshal(notificationMsg{JSONRPC: "2.0", Method: n.Method, Params: n.Params})
+			if err != nil {
+				s.log.Warn("api notification not encodable", "method", n.Method, "err", err)
+				continue
+			}
+			if err := cw.writeLine(data); err != nil {
+				end()
+				return
+			}
+		}
+	}
+}
+
+// subscribedReply answers a line received on a subscribed connection: an
+// error for a request with an id, nothing otherwise.
+func subscribedReply(line []byte) (response, bool) {
+	var req request
+	if json.Unmarshal(line, &req) != nil || len(req.ID) == 0 || !validID(req.ID) {
+		return response{}, false
+	}
+	return response{JSONRPC: "2.0", ID: req.ID, Error: &Error{Code: CodeInvalidRequest,
+		Message: "invalid request: connection is subscribed; use another connection for calls"}}, true
+}
+
 // handleLine returns the response for one line, and false for a
-// notification (a request without id), which gets no response.
-func (s *Server) handleLine(ctx context.Context, line []byte) (response, bool) {
-	fail := func(id json.RawMessage, code int, msg string) (response, bool) {
+// notification (a request without id), which gets no response. For a
+// successful stream method it also returns the handler's events (nil
+// otherwise).
+func (s *Server) handleLine(ctx context.Context, line []byte) (response, bool, <-chan Notification) {
+	fail := func(id json.RawMessage, code int, msg string) (response, bool, <-chan Notification) {
 		if len(id) == 0 {
 			id = nullID
 		}
-		return response{JSONRPC: "2.0", ID: id, Error: &Error{Code: code, Message: msg}}, true
+		return response{JSONRPC: "2.0", ID: id, Error: &Error{Code: code, Message: msg}}, true, nil
 	}
 	var req request
 	if err := json.Unmarshal(line, &req); err != nil {
@@ -274,15 +407,27 @@ func (s *Server) handleLine(ctx context.Context, line []byte) (response, bool) {
 	notification := len(req.ID) == 0
 	if !found {
 		if notification {
-			return response{}, false
+			return response{}, false, nil
 		}
 		return fail(req.ID, CodeMethodNotFound, "method not found: "+req.Method)
 	}
+	if h.stream != nil && notification {
+		return response{}, false, nil // nobody would read the stream
+	}
 	start := time.Now()
-	result, err := h(ctx, req.Params)
+	var (
+		result any
+		events <-chan Notification
+		err    error
+	)
+	if h.stream != nil {
+		result, events, err = h.stream(ctx, req.Params)
+	} else {
+		result, err = h.plain(ctx, req.Params)
+	}
 	s.log.Debug("api call", "method", req.Method, "duration_ms", time.Since(start).Milliseconds(), "ok", err == nil)
 	if notification {
-		return response{}, false
+		return response{}, false, nil
 	}
 	if err != nil {
 		var rpcErr *Error
@@ -290,13 +435,16 @@ func (s *Server) handleLine(ctx context.Context, line []byte) (response, bool) {
 			s.log.Warn("api handler failed", "method", req.Method, "err", err)
 			rpcErr = &Error{Code: CodeInternalError, Message: err.Error()}
 		}
-		return response{JSONRPC: "2.0", ID: req.ID, Error: rpcErr}, true
+		return response{JSONRPC: "2.0", ID: req.ID, Error: rpcErr}, true, nil
 	}
 	data, err := json.Marshal(result)
 	if err != nil {
 		return fail(req.ID, CodeInternalError, "cannot encode result: "+err.Error())
 	}
-	return response{JSONRPC: "2.0", ID: req.ID, Result: data}, true
+	if h.stream != nil && events == nil {
+		events = make(chan Notification) // streams nothing until the connection ends
+	}
+	return response{JSONRPC: "2.0", ID: req.ID, Result: data}, true, events
 }
 
 // validID reports whether id is absent, a string, a number or null.
@@ -311,11 +459,14 @@ func validID(id json.RawMessage) bool {
 	return false
 }
 
-// Client is a connection to the daemon. It is not safe for concurrent use.
+// Client is a connection to the daemon. It is not safe for concurrent use,
+// except that Close may be called while a subscription is running.
 type Client struct {
-	conn   net.Conn
-	sc     *bufio.Scanner
-	nextID int64
+	conn      net.Conn
+	sc        *bufio.Scanner
+	nextID    int64
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 // Dial connects to the daemon socket at path. If no daemon listens there the
@@ -333,11 +484,14 @@ func Dial(path string) (*Client, error) {
 	}
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64<<10), maxMessage)
-	return &Client{conn: conn, sc: sc}, nil
+	return &Client{conn: conn, sc: sc, closed: make(chan struct{})}, nil
 }
 
-// Close closes the connection.
-func (c *Client) Close() error { return c.conn.Close() }
+// Close closes the connection. It ends a running subscription.
+func (c *Client) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.conn.Close()
+}
 
 // Call sends one request and decodes the result into result (which may be
 // nil). A JSON-RPC error response is returned as *Error. The context
@@ -349,7 +503,57 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 	}
 	stop := context.AfterFunc(ctx, func() { _ = c.conn.SetDeadline(time.Unix(1, 0)) })
 	defer stop()
+	return c.exchange(ctx, method, params, result)
+}
 
+// Subscribe calls the stream method like Call, decoding its result into
+// result, and then delivers the notifications the server pushes on the
+// returned channel, in order. The context deadline, if any, bounds only the
+// call; cancelling ctx ends the subscription and closes the connection. The
+// channel is closed when the subscription ends: ctx done, Close, or the
+// server closed the connection (for example because the client fell too far
+// behind; subscribe again on a new connection). A JSON-RPC error response is
+// returned as *Error, and the client stays usable for Call. After a
+// successful Subscribe the client must not be used for Call; use another
+// connection.
+func (c *Client) Subscribe(ctx context.Context, method string, params, result any) (<-chan Notification, error) {
+	deadline, _ := ctx.Deadline()
+	if err := c.conn.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = c.conn.Close() })
+	if err := c.exchange(ctx, method, params, result); err != nil {
+		stop()
+		return nil, err
+	}
+	if err := c.conn.SetDeadline(time.Time{}); err != nil {
+		stop()
+		return nil, c.wrap(ctx, err)
+	}
+	out := make(chan Notification, 64)
+	go func() {
+		defer close(out)
+		defer stop()
+		for c.sc.Scan() {
+			var msg notificationMsg
+			if json.Unmarshal(c.sc.Bytes(), &msg) != nil || msg.Method == "" {
+				continue // not a notification (an error answer to a stray request)
+			}
+			select {
+			case out <- Notification{Method: msg.Method, Params: msg.Params}:
+			case <-ctx.Done():
+				return
+			case <-c.closed:
+				return
+			}
+		}
+	}()
+	return out, nil
+}
+
+// exchange sends one request and reads its response; the caller sets the
+// connection deadline.
+func (c *Client) exchange(ctx context.Context, method string, params, result any) error {
 	c.nextID++
 	id := json.RawMessage(fmt.Sprint(c.nextID))
 	req := request{JSONRPC: "2.0", ID: id, Method: method}
