@@ -156,6 +156,10 @@ func (s *SSH) run(ctx context.Context, name []string, cmd string, stdin io.Reade
 		return stdout.Bytes(), nil
 	case errors.As(err, &ee) && ee.ExitCode() == sshUnreachableCode:
 		return stdout.Bytes(), &UnreachableError{Target: s.cfg.Name, Stderr: stderr.Bytes()}
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		// ssh over a ControlMaster connection whose network dropped hangs
+		// rather than exiting 255; no answer in time is unreachable too.
+		return stdout.Bytes(), &UnreachableError{Target: s.cfg.Name, Stderr: []byte("ssh: no answer before the deadline\n")}
 	case errors.As(err, &ee) && ee.ExitCode() >= 0:
 		return stdout.Bytes(), &ExitError{Argv: slices.Clone(name), Code: ee.ExitCode(), Stderr: stderr.Bytes()}
 	default:

@@ -46,7 +46,8 @@ type fakeHerdr struct {
 	order      []string // pane ids in creation order
 	nextID     int
 
-	unreachable bool          // pane list fails
+	name        string        // target name; "" means "local"
+	unreachable bool          // every call fails as ssh exit 255 would
 	output      string        // pane read text
 	ansiOutput  string        // pane read --format ansi text
 	bin         string        // the herdr binary it answers to; "" means "herdr"
@@ -62,7 +63,18 @@ func newFakeHerdr() *fakeHerdr {
 	}
 }
 
-func (f *fakeHerdr) Name() string { return "local" }
+func (f *fakeHerdr) Name() string {
+	if f.name == "" {
+		return "local"
+	}
+	return f.name
+}
+
+// unreachableErr is what ssh reports for a host that does not answer;
+// f.mu must be held.
+func (f *fakeHerdr) unreachableErr() error {
+	return &target.UnreachableError{Target: f.Name(), Stderr: []byte("ssh: connect to host: Connection refused\n")}
+}
 
 func (f *fakeHerdr) PutFile(_ context.Context, path string, data []byte) error {
 	f.mu.Lock()
@@ -73,6 +85,9 @@ func (f *fakeHerdr) PutFile(_ context.Context, path string, data []byte) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.unreachable {
+		return f.unreachableErr()
+	}
 	f.files[path] = slices.Clone(data)
 	f.puts = append(f.puts, string(data))
 	return nil
@@ -221,6 +236,9 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, slices.Clone(argv))
+	if f.unreachable {
+		return nil, f.unreachableErr()
+	}
 	bin := f.bin
 	if bin == "" {
 		bin = "herdr"
@@ -230,10 +248,9 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		return []byte(argv[len(argv)-1] + "\n"), nil
 	}
 	switch strings.Join(argv[1:min(3, len(argv))], " ") {
+	case "--version":
+		return []byte("herdr 0.9.1\n"), nil
 	case "pane list":
-		if f.unreachable {
-			return nil, fmt.Errorf("ssh: connect to host: connection refused")
-		}
 		list := []herdr.PaneInfo{}
 		for _, id := range f.order {
 			p := f.panes[id]

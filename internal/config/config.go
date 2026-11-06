@@ -30,9 +30,13 @@ type Config struct {
 	CatchUpWindow Duration `yaml:"catch_up_window"`
 	// AttachMode is how the TUI attaches to a run: AttachPane (default)
 	// or AttachFull.
-	AttachMode string            `yaml:"attach_mode"`
-	Notify     Notify            `yaml:"notify"`
-	Targets    map[string]Target `yaml:"targets"`
+	AttachMode string `yaml:"attach_mode"`
+	// HerdrVersion is the herdr version expected on every target; a
+	// target with another version gets a warning. Default
+	// DefaultHerdrVersion.
+	HerdrVersion string            `yaml:"herdr_version"`
+	Notify       Notify            `yaml:"notify"`
+	Targets      map[string]Target `yaml:"targets"`
 }
 
 // Attach modes, the valid attach_mode values (the same strings as
@@ -69,6 +73,10 @@ const DefaultHistoryDays = 90
 
 // DefaultPollInterval is the poll_interval default.
 const DefaultPollInterval = 15 * time.Second
+
+// DefaultHerdrVersion is the herdr_version default: the herdr release
+// herdrcron is built against (docs/herdr-findings.md).
+const DefaultHerdrVersion = "0.9.1"
 
 // DefaultCatchUpWindow is the catch_up_window default.
 const DefaultCatchUpWindow = 24 * time.Hour
@@ -111,6 +119,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Timezone == "" {
 		cfg.Timezone = "Local"
+	}
+	if cfg.HerdrVersion == "" {
+		cfg.HerdrVersion = DefaultHerdrVersion
 	}
 	switch {
 	case cfg.HistoryDays == 0:

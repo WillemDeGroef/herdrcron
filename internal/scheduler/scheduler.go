@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -387,6 +388,49 @@ func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now t
 	}
 	if err := s.store.SetNextFire(wctx, t.ID, next); err != nil {
 		log.Error("cannot write task state", "err", err)
+	}
+}
+
+// CatchUpTarget applies the missed policy to the fires that found the
+// target unreachable, now that it answers again. A task on the target with
+// missed: run_once whose last run is a host_unreachable fire (trigger
+// schedule or catch_up) inside catch_up_window gets one catch_up run for
+// that fire, however many fires were missed: each one after the first
+// left a newer host_unreachable run, so the last run names the latest.
+// The usual suppression applies (disabled, paused, global pause).
+func (s *Scheduler) CatchUpTarget(ctx context.Context, target string) {
+	now := s.clock.Now()
+	s.mu.Lock()
+	var tasks []config.Task
+	for _, e := range s.tasks {
+		if e.task.Target == target && e.task.Enabled && e.task.Missed == "run_once" {
+			tasks = append(tasks, e.task)
+		}
+	}
+	s.mu.Unlock()
+	slices.SortFunc(tasks, func(a, b config.Task) int { return strings.Compare(a.ID, b.ID) })
+	wctx := context.WithoutCancel(ctx)
+	for _, t := range tasks {
+		log := s.log.With(logging.KeyTaskID, t.ID, logging.KeyTarget, t.Target)
+		last, ok, err := s.store.LastRun(ctx, t.ID)
+		if err != nil {
+			log.Error("cannot read last run for catch-up", "err", err)
+			continue
+		}
+		if !ok || last.Status != store.StatusHostUnreachable || last.Trigger == store.TriggerManual {
+			continue
+		}
+		if now.Sub(last.ScheduledAt) > s.cfg.CatchUpWindow.Duration {
+			log.Info("unreachable fire older than catch_up_window ignored", "scheduled_at", last.ScheduledAt,
+				"catch_up_window", s.cfg.CatchUpWindow.String())
+			continue
+		}
+		if t.PausedAt(now) {
+			log.Info("unreachable fire not caught up: task paused", "scheduled_at", last.ScheduledAt)
+			continue
+		}
+		log.Info("catching up fire the target missed", "scheduled_at", last.ScheduledAt)
+		s.maybeStartCatchUp(ctx, wctx, log, t, last.ScheduledAt)
 	}
 }
 

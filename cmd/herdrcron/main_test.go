@@ -868,3 +868,87 @@ func TestStopNeedsOneRunID(t *testing.T) {
 		}
 	}
 }
+
+func checkStub(t *testing.T, res api.TargetCheck, gotName *string) map[string]api.HandlerFunc {
+	t.Helper()
+	return map[string]api.HandlerFunc{
+		api.MethodTargetsCheck: func(_ context.Context, params json.RawMessage) (any, error) {
+			var p api.TargetCheckParams
+			if err := json.Unmarshal(params, &p); err != nil {
+				t.Errorf("params %s: %v", params, err)
+			}
+			*gotName = p.Name
+			if p.Name == "mars" {
+				return nil, api.InvalidParams(fmt.Errorf("unknown target %q", p.Name))
+			}
+			return res, nil
+		},
+	}
+}
+
+func TestCheckPrintsTheReport(t *testing.T) {
+	p := xdg(t)
+	var name string
+	stubDaemon(t, p, checkStub(t, api.TargetCheck{Target: "vps", OK: false, Items: []api.TargetCheckItem{
+		{Name: "reachable", Result: api.CheckOK},
+		{Name: "herdr server", Result: api.CheckOK},
+		{Name: "herdr version", Result: api.CheckWarn, Detail: "got 0.9.0, want 0.9.1"},
+		{Name: "agent command claude", Result: api.CheckOK, Tasks: []string{"a", "b"}},
+		{Name: "cwd ~/src/x", Result: api.CheckFail, Detail: "does not exist", Tasks: []string{"a", "b"}},
+	}}, &name))
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"check", "vps"}, &out, &errOut); code != 1 {
+		t.Errorf("exit %d, want 1: %s", code, errOut.String())
+	}
+	if name != "vps" {
+		t.Errorf("name = %q, want vps", name)
+	}
+	want := `target vps: FAILED
+  ok    reachable
+  ok    herdr server
+  warn  herdr version  got 0.9.0, want 0.9.1
+  ok    agent command claude  (tasks: a, b)
+  fail  cwd ~/src/x  does not exist  (tasks: a, b)
+`
+	if got := out.String(); got != want {
+		t.Errorf("stdout =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestCheckOKExitsZero(t *testing.T) {
+	p := xdg(t)
+	var name string
+	stubDaemon(t, p, checkStub(t, api.TargetCheck{Target: "local", OK: true, Items: []api.TargetCheckItem{
+		{Name: "reachable", Result: api.CheckOK},
+	}}, &name))
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"check", "local"}, &out, &errOut); code != 0 {
+		t.Errorf("exit %d: %s", code, errOut.String())
+	}
+	if got, want := out.String(), "target local: ok\n  ok    reachable\n"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestCheckUnknownTargetFails(t *testing.T) {
+	p := xdg(t)
+	var name string
+	stubDaemon(t, p, checkStub(t, api.TargetCheck{}, &name))
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"check", "mars"}, &out, &errOut); code != 1 {
+		t.Errorf("exit %d, want 1", code)
+	}
+	if got := errOut.String(); got != "herdrcron check: unknown target \"mars\"\n" {
+		t.Errorf("stderr = %q", got)
+	}
+}
+
+func TestCheckNeedsOneTarget(t *testing.T) {
+	xdg(t)
+	for _, args := range [][]string{{"check"}, {"check", "a", "b"}, {"check", "-x"}} {
+		var out, errOut bytes.Buffer
+		if code := run(context.Background(), args, &out, &errOut); code != 2 {
+			t.Errorf("%q: exit %d, want 2", args, code)
+		}
+	}
+}

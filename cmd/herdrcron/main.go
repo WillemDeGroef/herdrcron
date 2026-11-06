@@ -59,6 +59,8 @@ commands:
                     pause every task, or every task on one target
   resume --all [--target NAME]
                     end a global pause (of every target, or of one target)
+  check <target>    check a target: herdr server, herdr version, and the
+                    agent commands and cwds of its tasks; exits 1 if a check fails
 `
 
 // serviceRunner runs systemctl/launchctl for install-service; tests swap it.
@@ -109,6 +111,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return runPause(ctx, p, args[1:], time.Now(), stdout, stderr)
 	case "resume":
 		return runResume(ctx, p, args[1:], stdout, stderr)
+	case "check":
+		return runCheck(ctx, p, args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -286,6 +290,58 @@ func runStop(ctx context.Context, p paths.Paths, args []string, stdout, stderr i
 	}
 	fmt.Fprintln(stdout, line)
 	return 0
+}
+
+// runCheck prints the preflight report of a target. It exits 1 if a check
+// failed; warnings keep it 0.
+func runCheck(ctx context.Context, p paths.Paths, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
+		fmt.Fprintf(stderr, "usage: herdrcron check <target>\n")
+		return 2
+	}
+	c := dial(p, stderr)
+	if c == nil {
+		return 1
+	}
+	defer func() { _ = c.Close() }()
+	// The daemon bounds a check at 60 s (ssh connect timeouts included).
+	ctx, cancel := context.WithTimeout(ctx, 70*time.Second)
+	defer cancel()
+	var r api.TargetCheck
+	if err := c.Call(ctx, api.MethodTargetsCheck, api.TargetCheckParams{Name: args[0]}, &r); err != nil {
+		var rpcErr *api.Error
+		if errors.As(err, &rpcErr) {
+			fmt.Fprintln(stderr, "herdrcron check:", strings.TrimPrefix(rpcErr.Message, "invalid params: "))
+		} else {
+			fmt.Fprintln(stderr, "herdrcron: targets.check:", err)
+		}
+		return 1
+	}
+	printCheck(stdout, r)
+	if !r.OK {
+		return 1
+	}
+	return 0
+}
+
+// printCheck writes a check report: a header, then one line per item with
+// its result, name, detail and tasks.
+func printCheck(out io.Writer, r api.TargetCheck) {
+	verdict := "ok"
+	if !r.OK {
+		verdict = "FAILED"
+	}
+	fmt.Fprintf(out, "target %s: %s\n", r.Target, verdict)
+	for _, it := range r.Items {
+		line := fmt.Sprintf("  %-4s  %s", it.Result, it.Name)
+		if it.Detail != "" {
+			line += "  " + it.Detail
+		}
+		if len(it.Tasks) > 0 {
+			line += "  (tasks: " + strings.Join(it.Tasks, ", ") + ")"
+		}
+		fmt.Fprintln(out, line)
+	}
 }
 
 // printTasks writes the task table. LAST is the last run's status and age
