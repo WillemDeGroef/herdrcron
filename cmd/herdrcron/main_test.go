@@ -13,7 +13,6 @@ import (
 
 	"github.com/WillemDeGroef/herdrcron/internal/api"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
-	"github.com/WillemDeGroef/herdrcron/internal/service"
 )
 
 func write(t *testing.T, path, content string) {

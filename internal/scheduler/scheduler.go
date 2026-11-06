@@ -12,6 +12,7 @@ import (
 
 	"github.com/WillemDeGroef/herdrcron/internal/clock"
 	"github.com/WillemDeGroef/herdrcron/internal/config"
+	"github.com/WillemDeGroef/herdrcron/internal/logging"
 	"github.com/WillemDeGroef/herdrcron/internal/schedule"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
 	"github.com/WillemDeGroef/herdrcron/internal/target"
@@ -236,7 +237,7 @@ func (s *Scheduler) start(ctx context.Context, t config.Task, trigger string, sc
 	if err := s.store.InsertRun(ctx, run); err != nil {
 		return store.Run{}, err
 	}
-	log := s.log.With("run_id", run.ID, "task_id", t.ID, "target", t.Target)
+	log := logging.ForRun(s.log, run.ID, t.ID, t.Target)
 	log.Info("run starting", "trigger", trigger, "scheduled_at", scheduledAt)
 
 	argv := append([]string{t.Agent.Command}, t.Agent.Args...)
