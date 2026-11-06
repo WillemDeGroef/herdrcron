@@ -76,7 +76,7 @@ prompt_file: prompts/peppol-sh-deps.md
 timeout: 2h                   # Go duration; run is stopped after this
 overlap: skip                 # skip | queue | parallel
 missed: run_once              # skip | run_once
-on_done: keep_tab             # keep_tab | close_tab
+on_done: close_tab            # close_tab (default) | keep_tab
 on_blocked: notify            # notify | stop
 env:                          # optional extra env vars for the agent
   FOO: bar

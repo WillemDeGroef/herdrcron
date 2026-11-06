@@ -80,7 +80,7 @@ func TestValidTaskLoads(t *testing.T) {
 	if e.Task.Timeout.Duration != 2*time.Hour {
 		t.Errorf("timeout = %v", e.Task.Timeout)
 	}
-	if !e.Task.Enabled || e.Task.Overlap != "skip" || e.Task.Missed != "run_once" || e.Task.OnDone != "keep_tab" || e.Task.OnBlocked != "notify" {
+	if !e.Task.Enabled || e.Task.Overlap != "skip" || e.Task.Missed != "run_once" || e.Task.OnDone != "close_tab" || e.Task.OnBlocked != "notify" {
 		t.Errorf("defaults not applied: %+v", e.Task)
 	}
 }
