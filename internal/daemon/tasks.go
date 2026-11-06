@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -118,13 +119,7 @@ func (f fieldErrors) err() error {
 		return nil
 	}
 	var parts []string
-	for _, field := range slices.Sorted(func(yield func(string) bool) {
-		for k := range f {
-			if !yield(k) {
-				return
-			}
-		}
-	}) {
+	for _, field := range slices.Sorted(maps.Keys(f)) {
 		parts = append(parts, field+": "+strings.Join(f[field], ", "))
 	}
 	return &api.Error{Code: api.CodeValidation, Message: "task is invalid: " + strings.Join(parts, "; "),
@@ -152,6 +147,9 @@ func (d *daemon) draft(def api.TaskDef) (config.Task, fieldErrors) {
 	} else if err != nil {
 		fe.add("task", err.Error())
 	}
+	if t.PromptFile != "" && !d.inConfigDir(config.PromptPath(t.PromptFile, d.configDir)) {
+		fe.add("prompt_file", "prompt_file must be inside the config directory")
+	}
 	return t, fe
 }
 
@@ -163,7 +161,7 @@ func (d *daemon) tasksCreate(ctx context.Context, params json.RawMessage) (any, 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	t, fe := d.draft(p.Task)
-	path := filepath.Join(d.tasksDir(), t.ID+".yaml")
+	path := d.taskPath(t.ID)
 	if t.ID != "" && len(fe["id"]) == 0 {
 		if _, err := os.Lstat(path); d.find(t.ID) >= 0 || err == nil {
 			fe.add("id", fmt.Sprintf("task %q already exists", t.ID))
@@ -190,8 +188,7 @@ func (d *daemon) tasksCreate(ctx context.Context, params json.RawMessage) (any, 
 		return nil, fmt.Errorf("write task file: %w", err)
 	}
 	e := config.LoadTask(d.configDir, t.ID, d.cfg)
-	d.tasks = append(d.tasks, e)
-	slices.SortFunc(d.tasks, func(a, b config.TaskEntry) int { return strings.Compare(a.ID, b.ID) })
+	d.insertLocked(e)
 	d.log.Info("task created", logging.KeyTaskID, e.ID)
 	return d.storedLocked(ctx, e)
 }
@@ -242,10 +239,7 @@ func (d *daemon) tasksUpdate(ctx context.Context, params json.RawMessage) (any, 
 func (d *daemon) storedLocked(ctx context.Context, e config.TaskEntry) (api.TaskDetail, error) {
 	logTask(d.log, e)
 	d.versions[e.ID] = d.fileVersion(e)
-	// SetTasks keeps the next fire of an unchanged schedule.
-	if err := d.sched.SetTasks(ctx, d.tasks); err != nil {
-		d.log.Error("cannot reschedule tasks", logging.KeyTaskID, e.ID, "err", err)
-	}
+	d.rescheduleLocked(ctx)
 	d.publishTaskLocked(ctx, d.find(e.ID))
 	return d.detailLocked(ctx, e)
 }
@@ -254,6 +248,9 @@ func (d *daemon) tasksDelete(ctx context.Context, params json.RawMessage) (any, 
 	var p api.DeleteParams
 	if err := decode(params, &p); err != nil {
 		return nil, err
+	}
+	if p.ID == "" {
+		return nil, api.InvalidParams(errors.New("id is required"))
 	}
 	d.mu.Lock()
 	i := d.find(p.ID)
@@ -274,10 +271,7 @@ func (d *daemon) tasksDelete(ctx context.Context, params json.RawMessage) (any, 
 		delete(d.deleting, p.ID)
 		d.mu.Unlock()
 	}()
-	rest := slices.Delete(slices.Clone(d.tasks), i, i+1)
-	if err := d.sched.SetTasks(ctx, rest); err != nil {
-		d.log.Error("cannot unschedule task", logging.KeyTaskID, p.ID, "err", err)
-	}
+	d.rescheduleLocked(ctx)
 	d.mu.Unlock()
 
 	// Stopping takes seconds and ends runs, which calls back into the
@@ -288,7 +282,7 @@ func (d *daemon) tasksDelete(ctx context.Context, params json.RawMessage) (any, 
 		res.StoppedRuns = append(res.StoppedRuns, *runSummary(r))
 	}
 	if err != nil {
-		d.restoreSchedule(ctx)
+		d.restoreSchedule(ctx, p.ID)
 		return nil, fmt.Errorf("stop active runs of %s: %w", p.ID, err)
 	}
 
@@ -301,7 +295,7 @@ func (d *daemon) tasksDelete(ctx context.Context, params json.RawMessage) (any, 
 	e := d.tasks[i]
 	promptPath := d.promptPathOf(e)
 	if err := os.Remove(e.File); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		_ = d.sched.SetTasks(ctx, d.tasks)
+		d.rescheduleLocked(ctx)
 		return nil, fmt.Errorf("remove task file: %w", err)
 	}
 	d.tasks = slices.Delete(d.tasks, i, i+1)
@@ -310,7 +304,7 @@ func (d *daemon) tasksDelete(ctx context.Context, params json.RawMessage) (any, 
 	shared := slices.ContainsFunc(d.tasks, func(o config.TaskEntry) bool {
 		return filepath.Clean(d.promptPathOf(o)) == filepath.Clean(promptPath)
 	})
-	if !shared {
+	if !shared && d.inConfigDir(promptPath) {
 		if err := os.Remove(promptPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			d.log.Warn("cannot remove prompt file", logging.KeyTaskID, p.ID, "err", err)
 		}
@@ -323,13 +317,38 @@ func (d *daemon) tasksDelete(ctx context.Context, params json.RawMessage) (any, 
 	return res, nil
 }
 
-// restoreSchedule schedules d.tasks again after a delete gave up.
-func (d *daemon) restoreSchedule(ctx context.Context) {
+// restoreSchedule schedules a task again after its delete gave up.
+func (d *daemon) restoreSchedule(ctx context.Context, id string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if err := d.sched.SetTasks(ctx, d.tasks); err != nil {
+	delete(d.deleting, id)
+	d.rescheduleLocked(ctx)
+}
+
+// rescheduleLocked hands the scheduler every task but those being deleted.
+// SetTasks keeps the next fire of an unchanged schedule. A failure is
+// logged: the files are written, and the next reload schedules again.
+func (d *daemon) rescheduleLocked(ctx context.Context) {
+	tasks := slices.DeleteFunc(slices.Clone(d.tasks), func(e config.TaskEntry) bool { return d.deleting[e.ID] })
+	if err := d.sched.SetTasks(ctx, tasks); err != nil {
 		d.log.Error("cannot reschedule tasks", "err", err)
 	}
+}
+
+// insertLocked adds a new entry to d.tasks, which stays sorted by id.
+func (d *daemon) insertLocked(e config.TaskEntry) {
+	d.tasks = append(d.tasks, e)
+	slices.SortFunc(d.tasks, func(a, b config.TaskEntry) int { return strings.Compare(a.ID, b.ID) })
+}
+
+// taskPath is the task file of id.
+func (d *daemon) taskPath(id string) string { return filepath.Join(d.tasksDir(), id+".yaml") }
+
+// inConfigDir reports whether path is inside the config directory. The
+// API only writes and removes prompt files there.
+func (d *daemon) inConfigDir(path string) bool {
+	rel, err := filepath.Rel(d.configDir, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // stopRunsOf stops every live run of the task, in parallel, and returns
@@ -407,9 +426,7 @@ func (d *daemon) reload(ctx context.Context, _ json.RawMessage) (any, error) {
 		old[e.ID] = d.versions[e.ID]
 	}
 	d.tasks = entries
-	if err := d.sched.SetTasks(ctx, d.tasks); err != nil {
-		d.log.Error("cannot reschedule tasks", "err", err)
-	}
+	d.rescheduleLocked(ctx)
 	res := api.ReloadResult{Tasks: make([]api.TaskSummary, 0, len(entries)), RestartRequired: !reflect.DeepEqual(cfg, d.cfg)}
 	for i, e := range entries {
 		v := d.fileVersion(e)
@@ -449,16 +466,14 @@ func (d *daemon) reloadOneLocked(ctx context.Context, id string) {
 		return
 	}
 	i := d.find(id)
-	path := filepath.Join(d.tasksDir(), id+".yaml")
+	path := d.taskPath(id)
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		if i < 0 {
 			return
 		}
 		d.tasks = slices.Delete(d.tasks, i, i+1)
 		delete(d.versions, id)
-		if err := d.sched.SetTasks(ctx, d.tasks); err != nil {
-			d.log.Error("cannot reschedule tasks", "err", err)
-		}
+		d.rescheduleLocked(ctx)
 		d.log.Info("task file removed", logging.KeyTaskID, id)
 		d.publishDeleted(id)
 		return
@@ -471,15 +486,12 @@ func (d *daemon) reloadOneLocked(ctx context.Context, id string) {
 	if i >= 0 {
 		d.tasks[i] = e
 	} else {
-		d.tasks = append(d.tasks, e)
-		slices.SortFunc(d.tasks, func(a, b config.TaskEntry) int { return strings.Compare(a.ID, b.ID) })
+		d.insertLocked(e)
 	}
 	d.versions[id] = v
 	d.log.Info("task file changed on disk", logging.KeyTaskID, id)
 	logTask(d.log, e)
-	if err := d.sched.SetTasks(ctx, d.tasks); err != nil {
-		d.log.Error("cannot reschedule tasks", "err", err)
-	}
+	d.rescheduleLocked(ctx)
 	d.publishTaskLocked(ctx, d.find(id))
 }
 
@@ -491,7 +503,7 @@ func (d *daemon) currentTask(t config.Task) (config.Task, error) {
 	defer d.mu.Unlock()
 	i := d.find(t.ID)
 	switch {
-	case i < 0:
+	case i < 0 || d.deleting[t.ID]:
 		return config.Task{}, fmt.Errorf("task %s was deleted", t.ID)
 	case d.tasks[i].Err != nil:
 		return config.Task{}, fmt.Errorf("task %s is invalid: %v", t.ID, d.tasks[i].Err)

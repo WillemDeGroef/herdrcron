@@ -316,7 +316,6 @@ func (r *Runner) openTab(ctx context.Context, ts *targetState, a *activeRun, cwd
 	return nil
 }
 
-// tabLabel is hc-<task-id>-<HHMM>, in the task's time zone.
 // setHerdrIDs stores a starting run's herdr ids under r.mu, which LiveRuns
 // reads it with.
 func (r *Runner) setHerdrIDs(a *activeRun, workspace, tab, pane string) {
@@ -325,6 +324,7 @@ func (r *Runner) setHerdrIDs(a *activeRun, workspace, tab, pane string) {
 	a.run.HerdrWorkspace, a.run.HerdrTab, a.run.HerdrPane = workspace, tab, pane
 }
 
+// tabLabel is hc-<task-id>-<HHMM>, in the task's time zone.
 func (r *Runner) tabLabel(t config.Task) (string, error) {
 	loc, err := r.cfg.Location(t)
 	if err != nil {

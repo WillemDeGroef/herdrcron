@@ -489,3 +489,20 @@ func TestTasksGetDoesNotLoadFilesOutsideTheTasksDirectory(t *testing.T) {
 	err := c.Call(context.Background(), api.MethodTasksGet, api.TaskIDParams{ID: "../outside"}, nil)
 	_ = rpcErr(t, err, api.CodeInvalidParams)
 }
+
+func TestTasksCreateRefusesAPromptFileOutsideTheConfigDirectory(t *testing.T) {
+	p := setupUTC(t)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	outside := filepath.Join(t.TempDir(), "victim.md")
+	for _, pf := range []string{"../escape.md", outside} {
+		def := newTaskDef()
+		def.PromptFile = pf
+		err := c.Call(context.Background(), api.MethodTasksCreate, api.TaskWriteParams{Task: def, Prompt: "x"}, nil)
+		if f := fieldErrors(t, rpcErr(t, err, api.CodeValidation)); len(f["prompt_file"]) == 0 {
+			t.Errorf("prompt_file %q: field errors = %v", pf, f)
+		}
+	}
+	if _, err := os.Stat(outside); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("file outside the config directory written: %v", err)
+	}
+}
