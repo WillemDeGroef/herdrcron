@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 type targetsState struct {
 	selected string          // name of the selected target
 	checking map[string]bool // targets with a targets.check on its way
+	offset   int             // first visible body line
 }
 
 // targetCheckMsg is the answer of targets.check.
@@ -28,6 +30,7 @@ type targetCheckMsg struct {
 // openTargets opens the targets screen.
 func (m Model) openTargets() (Model, tea.Cmd) {
 	m.screen = screenTargets
+	m.targets.offset = 0
 	if m.targets.checking == nil {
 		m.targets.checking = map[string]bool{}
 	}
@@ -63,11 +66,17 @@ func (m Model) targetsKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case "up", "k":
 		if len(ts) > 0 {
 			m.targets.selected = ts[max(m.targetCursor()-1, 0)].Name
+			m.showTargetCursor()
 		}
 	case "down", "j":
 		if len(ts) > 0 {
 			m.targets.selected = ts[min(m.targetCursor()+1, len(ts)-1)].Name
+			m.showTargetCursor()
 		}
+	case "pgup":
+		m.scrollTargets(-max(m.bodyHeight(), 1))
+	case "pgdown":
+		m.scrollTargets(max(m.bodyHeight(), 1))
 	case "c":
 		t, ok := m.currentTarget()
 		if !ok {
@@ -119,9 +128,9 @@ func (m Model) targetsMsg(msg tea.Msg) (Model, tea.Cmd, bool) {
 	// it here shows it even if that event is still on its way. A newer
 	// check (from the CLI, say) that already arrived wins.
 	for i, t := range m.status.Targets {
-		if t.Name == cm.name && (t.LastCheck == nil || !checkTime(t.LastCheck).After(checkTime(&cm.res))) {
+		if t.Name == cm.name {
 			res := cm.res
-			m.status.Targets[i].LastCheck = &res
+			m.status.Targets[i].LastCheck = newerCheck(t.LastCheck, &res)
 		}
 	}
 	if show {
@@ -134,6 +143,63 @@ func (m Model) targetsMsg(msg tea.Msg) (Model, tea.Cmd, bool) {
 func checkTime(c *api.TargetCheck) time.Time {
 	t, _ := time.Parse(time.RFC3339, c.CheckedAt)
 	return t
+}
+
+// newerCheck is whichever of current and incoming ran later. A missing
+// check loses to one that ran: a status read from before c has none, or
+// an older one. Equal times keep incoming.
+func newerCheck(current, incoming *api.TargetCheck) *api.TargetCheck {
+	switch {
+	case incoming == nil:
+		return current
+	case current == nil:
+		return incoming
+	case checkTime(current).After(checkTime(incoming)):
+		return current
+	default:
+		return incoming
+	}
+}
+
+// targetObservedAt is the later of when the target last answered and when
+// it was last seen to be down. Zero when the status never said.
+func targetObservedAt(t api.TargetStatus) time.Time {
+	seen, since := fireTime(t.LastSeenAt), fireTime(t.UnreachableSince)
+	if since.After(seen) {
+		return since
+	}
+	return seen
+}
+
+// mergeStatusTargets keeps a local target observation that is newer than
+// the one in a status snapshot. The snapshot is taken when the read
+// starts, so it can land after target.changed or after c and carry the
+// older reachability or the older check. gen is the rev at which each
+// target last changed; readRev is the rev when this read started.
+func mergeStatusTargets(local, incoming []api.TargetStatus, gen map[string]int, readRev int) []api.TargetStatus {
+	if len(incoming) == 0 || len(local) == 0 {
+		return incoming
+	}
+	prev := make(map[string]api.TargetStatus, len(local))
+	for _, t := range local {
+		prev[t.Name] = t
+	}
+	out := slices.Clone(incoming)
+	for i, t := range out {
+		old, ok := prev[t.Name]
+		if !ok {
+			continue
+		}
+		if gen[t.Name] > readRev || targetObservedAt(old).After(targetObservedAt(t)) {
+			out[i].Reachability = old.Reachability
+			out[i].UnreachableSince = old.UnreachableSince
+			out[i].NextRetryAt = old.NextRetryAt
+			out[i].LastError = old.LastError
+			out[i].LastSeenAt = old.LastSeenAt
+		}
+		out[i].LastCheck = newerCheck(old.LastCheck, t.LastCheck)
+	}
+	return out
 }
 
 // checkVerdict sums up a check: "ok", "ok with warnings" or "failed".
@@ -168,19 +234,50 @@ func versionWarning(c *api.TargetCheck) bool {
 	return false
 }
 
-// targetsView renders the targets screen.
-func (m Model) targetsView() string {
-	var body []string
+// targetsBody is the targets screen between the title and the footer.
+func (m Model) targetsBody() []string {
 	ts := m.status.Targets
 	if len(ts) == 0 {
-		body = append(body, m.st.dim.Render("  no targets"))
-	} else {
-		body = append(body, m.targetsTable()...)
-		body = append(body, "")
-		body = append(body, m.targetDetail(ts[m.targetCursor()])...)
+		return []string{m.st.dim.Render("  no targets")}
 	}
+	body := m.targetsTable()
+	body = append(body, "")
+	return append(body, m.targetDetail(ts[m.targetCursor()])...)
+}
+
+// scrollTargets moves the body by delta lines, clamped to it.
+func (m *Model) scrollTargets(delta int) {
+	n := m.bodyHeight()
+	if n <= 0 {
+		m.targets.offset = 0
+		return
+	}
+	m.targets.offset = min(max(m.targets.offset+delta, 0), max(len(m.targetsBody())-n, 0))
+}
+
+// showTargetCursor scrolls the body just enough to show the selected target.
+func (m *Model) showTargetCursor() {
+	n := m.bodyHeight()
+	if n <= 0 || len(m.status.Targets) == 0 {
+		return
+	}
+	line := 1 + m.targetCursor() // line 0 is the column header
+	if line < m.targets.offset {
+		m.targets.offset = line
+	}
+	if line >= m.targets.offset+n {
+		m.targets.offset = line - n + 1
+	}
+	m.targets.offset = min(max(m.targets.offset, 0), max(len(m.targetsBody())-n, 0))
+}
+
+// targetsView renders the targets screen.
+func (m Model) targetsView() string {
+	body := m.targetsBody()
+	// Title, message and footer stay; the body scrolls between them.
 	if n := m.bodyHeight(); n > 0 && len(body) > n {
-		body = body[:n]
+		from := min(max(m.targets.offset, 0), len(body)-n)
+		body = body[from : from+n]
 	}
 	var b strings.Builder
 	b.WriteString(m.st.title.Render(" herdrcron · targets"))
@@ -194,7 +291,7 @@ func (m Model) targetsView() string {
 	if m.mode == modeConfirm {
 		b.WriteString(m.footer())
 	} else {
-		b.WriteString(m.st.dim.Render(" ↑/↓ select  c check  esc back"))
+		b.WriteString(m.st.dim.Render(" ↑/↓ select  c check  pgup/pgdn scroll  esc back"))
 	}
 	return b.String()
 }

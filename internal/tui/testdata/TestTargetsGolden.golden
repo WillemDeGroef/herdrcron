@@ -12,4 +12,4 @@
   ✓ agent command claude  (factory-coordinator)
   ✗ cwd /srv/factory      no such directory  (factory-coordinator, nightly-e2e)
 
- ↑/↓ select  c check  esc back
+ ↑/↓ select  c check  pgup/pgdn scroll  esc back

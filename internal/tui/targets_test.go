@@ -1,11 +1,13 @@
 package tui
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/exp/golden"
 	"github.com/charmbracelet/x/exp/teatest"
 
@@ -167,23 +169,172 @@ func TestHeaderShowsTargetGoingUnreachable(t *testing.T) {
 	f.push(t, api.EventTargetChanged, api.TargetChangedEvent{Target: api.TargetStatus{
 		Name: "vps", Reachability: api.ReachUnreachable, UnreachableSince: ts(0)}})
 	waitText(t, tm, "vps ○ unreachable")
+
+	// The 30s refresh returns a snapshot that still says vps is reachable
+	// and has no observation time. Uptime changes so the test can see that
+	// the snapshot was applied. The header keeps the later target.changed.
+	f.set(api.MethodStatus, api.StatusResult{
+		Version: "dev", UptimeSeconds: 5 * 24 * 3600,
+		Targets: []api.TargetStatus{
+			{Name: "local", Reachability: api.ReachReachable},
+			{Name: "vps", Reachability: api.ReachReachable},
+			{Name: "buildbox", Reachability: api.ReachUnreachable},
+		},
+		GlobalPause: api.GlobalPause{PausedTargets: []string{}},
+	})
+	tm.Send(refreshMsg{})
+	waitText(t, tm, "daemon up 5d")
 	view := finalView(t, tm)
 	if !strings.Contains(view, "local ●  vps ○ unreachable  buildbox ○ unreachable") {
-		t.Errorf("header:\n%s", view)
-	}
-	if n := len(f.callsOf(api.MethodStatus)); n != 1 {
-		t.Errorf("status read %d times; target.changed must update the header without polling", n)
+		t.Errorf("stale status read restored the old reachability:\n%s", view)
 	}
 }
 
-func TestTargetsEscGoesBack(t *testing.T) {
+func TestInFlightStatusKeepsTargetChanged(t *testing.T) {
+	f := fixture()
+	m := newTestModel(f, plain())
+	msg := m.load()()
+	loaded, ok := msg.(loadedMsg)
+	if !ok {
+		t.Fatalf("load = %T", msg)
+	}
+	m.applyLoad(loaded)
+	// The read starts while buildbox is unreachable and returns that
+	// snapshot. target.changed lands before the snapshot is applied, and
+	// the event carries no observation time.
+	read := m.loadStatus()
+	data, err := json.Marshal(api.TargetChangedEvent{Target: api.TargetStatus{
+		Name: "buildbox", Reachability: api.ReachReachable}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.applyEvent(api.Notification{Method: api.EventTargetChanged, Params: data})
+	updated, _ := m.Update(read())
+	view := updated.View()
+	if !strings.Contains(view, "buildbox ●") {
+		t.Errorf("in-flight status read undid target.changed:\n%s", view)
+	}
+}
+
+func TestHeaderTakesANewerStatusReachability(t *testing.T) {
+	f := fixture()
+	tm := start(t, newTestModel(f, plain()))
+	f.push(t, api.EventTargetChanged, api.TargetChangedEvent{Target: api.TargetStatus{
+		Name: "vps", Reachability: api.ReachUnreachable, UnreachableSince: ts(-time.Minute)}})
+	waitText(t, tm, "vps ○ unreachable")
+	f.set(api.MethodStatus, api.StatusResult{
+		Version: "dev", UptimeSeconds: 5 * 24 * 3600,
+		Targets: []api.TargetStatus{
+			{Name: "local", Reachability: api.ReachReachable},
+			{Name: "vps", Reachability: api.ReachReachable, LastSeenAt: ts(0)},
+			{Name: "buildbox", Reachability: api.ReachUnreachable},
+		},
+		GlobalPause: api.GlobalPause{PausedTargets: []string{}},
+	})
+	tm.Send(refreshMsg{})
+	waitText(t, tm, "daemon up 5d")
+	view := finalView(t, tm)
+	if strings.Contains(view, "vps ○ unreachable") || !strings.Contains(view, "vps ●") {
+		t.Errorf("newer status reachability did not land:\n%s", view)
+	}
+}
+
+func TestTargetsBackKeysReturnToTheList(t *testing.T) {
+	for _, k := range []string{"esc", "q", "t"} {
+		t.Run(k, func(t *testing.T) {
+			f := targetsFixture()
+			tm := openTargets(t, f, newTestModel(f, plain()))
+			tm.Send(key(k))
+			waitText(t, tm, "space on/off")
+			view := finalView(t, tm)
+			if strings.Contains(view, "LAST CHECK") {
+				t.Errorf("still on the targets screen:\n%s", view)
+			}
+			if strings.Contains(view, "targets: reachability") {
+				t.Errorf("help is open; %s should leave the targets screen:\n%s", k, view)
+			}
+		})
+	}
+}
+
+func TestTargetsScrollsCheckItemsOnAShortTerminal(t *testing.T) {
 	f := targetsFixture()
-	tm := openTargets(t, f, newTestModel(f, plain()))
-	tm.Send(key("esc"))
-	waitText(t, tm, "space on/off")
+	tm := teatest.NewTestModel(t, newTestModel(f, plain()), teatest.WithInitialTermSize(80, 10))
+	waitText(t, tm, "factory-coordinator")
+	tm.Send(key("t"))
+	waitText(t, tm, "LAST CHECK")
+	tm.Send(key("down")) // vps, whose check items sit below the fold
+	tm.Send(tea.KeyMsg{Type: tea.KeyPgDown})
+	waitText(t, tm, "cwd /srv/factory")
 	view := finalView(t, tm)
 	if strings.Contains(view, "LAST CHECK") {
-		t.Errorf("still on the targets screen:\n%s", view)
+		t.Errorf("pgdown did not scroll:\n%s", view)
+	}
+	if !strings.Contains(view, "pgup/pgdn scroll") || !strings.Contains(view, "esc back") {
+		t.Errorf("footer scrolled away:\n%s", view)
+	}
+	if n := strings.Count(view, "\n") + 1; n > 10 {
+		t.Errorf("targets screen is %d lines, taller than the terminal:\n%s", n, view)
+	}
+}
+
+func TestStatusRefreshKeepsANewerCheck(t *testing.T) {
+	f := targetsFixture()
+	f.set(api.MethodTargetsCheck, api.TargetCheck{Target: "vps", CheckedAt: ts(0), OK: true,
+		HerdrVersion: "0.9.1", WantHerdrVersion: "0.9.1",
+		Items: []api.TargetCheckItem{
+			{Kind: api.CheckKindHerdrVersion, Name: "herdr version", Result: api.CheckOK},
+		}})
+	tm := openTargets(t, f, newTestModel(f, plain()))
+	tm.Send(key("down"))
+	tm.Send(key("c"))
+	waitText(t, tm, "vps: check ok")
+	// The snapshot still carries the pre-check report. "spare" is only in
+	// this snapshot, so seeing it means the snapshot landed.
+	f.set(api.MethodStatus, api.StatusResult{
+		Version: "dev", UptimeSeconds: 3*24*3600 + 3600,
+		Targets: []api.TargetStatus{
+			{Name: "local", Reachability: api.ReachReachable, LastSeenAt: ts(-time.Minute), LastCheck: localCheck()},
+			{Name: "vps", Reachability: api.ReachReachable, LastSeenAt: ts(-time.Minute), LastCheck: vpsCheck()},
+			{Name: "buildbox", Reachability: api.ReachUnreachable, UnreachableSince: ts(-10 * time.Minute)},
+			{Name: "spare", Reachability: api.ReachReachable},
+		},
+		GlobalPause: api.GlobalPause{PausedTargets: []string{}},
+	})
+	tm.Send(refreshMsg{})
+	waitText(t, tm, "spare")
+	view := finalView(t, tm)
+	if strings.Contains(view, "0.8.0") || !lineWith(view, "vps", "0.9.1", "✓ ok") {
+		t.Errorf("stale status read put the old check back:\n%s", view)
+	}
+}
+
+func TestStatusRefreshAppliesANewerCheck(t *testing.T) {
+	f := targetsFixture()
+	tm := openTargets(t, f, newTestModel(f, plain()))
+	tm.Send(key("down"))
+	waitText(t, tm, "last check Nov 5 09:00")
+	newer := vpsCheck()
+	newer.CheckedAt = ts(0)
+	newer.OK = true
+	newer.HerdrVersion = "0.9.1"
+	newer.Items = []api.TargetCheckItem{
+		{Kind: api.CheckKindHerdrVersion, Name: "herdr version", Result: api.CheckOK, Detail: "0.9.1"},
+	}
+	f.set(api.MethodStatus, api.StatusResult{
+		Version: "dev", UptimeSeconds: 3*24*3600 + 3600,
+		Targets: []api.TargetStatus{
+			{Name: "local", Reachability: api.ReachReachable, LastSeenAt: ts(-time.Minute), LastCheck: localCheck()},
+			{Name: "vps", Reachability: api.ReachReachable, LastSeenAt: ts(-time.Minute), LastCheck: newer},
+			{Name: "buildbox", Reachability: api.ReachUnreachable, UnreachableSince: ts(-10 * time.Minute)},
+		},
+		GlobalPause: api.GlobalPause{PausedTargets: []string{}},
+	})
+	tm.Send(refreshMsg{})
+	waitText(t, tm, "last check Nov 5 10:00")
+	view := finalView(t, tm)
+	if strings.Contains(view, "0.8.0") || !lineWith(view, "vps", "0.9.1", "✓ ok", "just now") {
+		t.Errorf("newer status check did not land:\n%s", view)
 	}
 }
 
