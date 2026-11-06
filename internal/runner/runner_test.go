@@ -485,6 +485,22 @@ func TestPromptReachesAgentUnchanged(t *testing.T) {
 	}
 }
 
+func TestPutFileFailureClosesTheTab(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.failPut = true
+	run := e.start(deps())
+	r := e.get(run.ID)
+	if r.Status != store.StatusFailed || r.EndedAt.IsZero() || !strings.Contains(r.ExitReason, "write prompt file") {
+		t.Fatalf("run = %+v, want failed at prompt write", r)
+	}
+	if r.HerdrTab == "" || e.herdr.tabOpen(r.HerdrTab) {
+		t.Errorf("tab %q left open after PutFile failed", r.HerdrTab)
+	}
+	if len(e.herdr.Files()) != 0 {
+		t.Errorf("unexpected files on target: %v", e.herdr.Files())
+	}
+}
+
 func TestLaunchFailureClosesTheTabAndDeletesThePromptFile(t *testing.T) {
 	e := newEnv(t)
 	e.herdr.failRun = true

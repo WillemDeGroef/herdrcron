@@ -176,6 +176,17 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 		return err
 	}
 	env := runEnv(a.run.ID, t.Env)
+
+	// If openTab succeeds but a later step fails, close the hc- tab so it is
+	// not left behind (step 9 only runs on end for successful launches).
+	launchOK := false
+	defer func() {
+		if launchOK {
+			return
+		}
+		r.cleanupFailedLaunch(context.WithoutCancel(ctx), ts, a)
+	}()
+
 	if err := r.openTab(ctx, ts, a, cwd, label, env); err != nil {
 		return err
 	}
@@ -200,9 +211,21 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 		return err
 	}
 	a.run = running
+	launchOK = true
 	a.log.Info("run launched", "herdr_workspace", a.run.HerdrWorkspace, "herdr_tab", a.run.HerdrTab,
 		"herdr_pane", a.run.HerdrPane, "agent", t.Agent.Command, "env_keys", envKeys(t.Env))
 	return nil
+}
+
+// cleanupFailedLaunch closes the tab opened for a run whose launch did not
+// finish. Prompt removal and a second tab close in end() are harmless.
+func (r *Runner) cleanupFailedLaunch(ctx context.Context, ts *targetState, a *activeRun) {
+	if a.run.HerdrTab == "" {
+		return
+	}
+	if cerr := ts.herdr.TabClose(ctx, a.run.HerdrTab); cerr != nil && !herdr.IsCode(cerr, herdr.CodeTabNotFound) {
+		a.log.Warn("cannot close tab after failed launch", "herdr_tab", a.run.HerdrTab, "err", cerr)
+	}
 }
 
 // openTab runs steps 3 and 4: it finds the workspace labelled

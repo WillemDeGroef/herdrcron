@@ -77,6 +77,7 @@ type fakeHerdr struct {
 	resolvedCwd  string // what the preflight prints; "" = the cwd as given
 	output       string // pane read text
 	failRun      bool   // pane run fails
+	failPut      bool   // PutFile fails
 }
 
 func newFakeHerdr() *fakeHerdr {
@@ -98,6 +99,9 @@ func (f *fakeHerdr) Name() string { return f.name }
 func (f *fakeHerdr) PutFile(_ context.Context, path string, data []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failPut {
+		return fmt.Errorf("put failed")
+	}
 	f.files[path] = slices.Clone(data)
 	return nil
 }
