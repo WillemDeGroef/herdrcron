@@ -26,6 +26,9 @@ type fakeRuns struct {
 	mu    sync.Mutex
 	calls []startCall
 	err   error
+	// beforeInsert runs synchronously at the start of Start, before the run
+	// row is inserted (used to simulate pause/disable mid-tick).
+	beforeInsert func(t config.Task)
 }
 
 type startCall struct {
@@ -35,6 +38,12 @@ type startCall struct {
 }
 
 func (f *fakeRuns) Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
+	f.mu.Lock()
+	hook := f.beforeInsert
+	f.mu.Unlock()
+	if hook != nil {
+		hook(t)
+	}
 	f.mu.Lock()
 	f.calls = append(f.calls, startCall{task: t, trigger: trigger, scheduledAt: scheduledAt})
 	err := f.err
@@ -70,6 +79,16 @@ type env struct {
 	starter *fakeRuns
 	sched   *scheduler.Scheduler
 	config  config.Config
+	// expired records OnPauseExpired calls: task id and clock time.
+	expired []expiry
+	// expireErr is returned by the next OnPauseExpired call, then cleared,
+	// so a test can fail one clear and let the retry succeed.
+	expireErr error
+}
+
+type expiry struct {
+	id string
+	at time.Time
 }
 
 func brussels(t *testing.T) *time.Location {
@@ -103,12 +122,22 @@ func newEnv(t *testing.T, now time.Time) *env {
 // restart replaces the scheduler with a new one on the same store, clock
 // and starter, with e.config: a daemon restart.
 func (e *env) restart() {
-	e.sched = scheduler.New(scheduler.Options{
+	e.sched = e.newScheduler()
+}
+
+func (e *env) newScheduler() *scheduler.Scheduler {
+	return scheduler.New(scheduler.Options{
 		Clock:  e.clock,
 		Store:  e.store,
 		Runs:   e.starter,
 		Config: e.config,
 		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnPauseExpired: func(_ context.Context, id string) error {
+			e.expired = append(e.expired, expiry{id: id, at: e.clock.Now()})
+			err := e.expireErr
+			e.expireErr = nil
+			return err
+		},
 	})
 }
 
@@ -473,9 +502,7 @@ func TestOldRunsArePruned(t *testing.T) {
 	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	e := newEnv(t, now)
 	e.config.HistoryDays = 7
-	e.sched = scheduler.New(scheduler.Options{Clock: e.clock, Store: e.store,
-		Runs: e.starter, Config: e.config,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	e.sched = e.newScheduler()
 	insert := func(id string, started time.Time, ended bool) {
 		r := store.Run{ID: id, TaskID: "t", Target: "local", Trigger: store.TriggerManual,
 			StartedAt: started, Status: store.StatusRunning}
