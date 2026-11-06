@@ -144,6 +144,10 @@ func (t *tailer) run(ctx context.Context, interval time.Duration) error {
 	}
 }
 
+// statPath is how poll looks up the live path. Tests replace it to rotate
+// the file in the window between a drain and the inode check.
+var statPath = os.Stat
+
 // poll reads whatever is new, switching to a fresh file after a rotation and
 // rereading from the start after a truncation.
 func (t *tailer) poll() error {
@@ -159,21 +163,28 @@ func (t *tailer) poll() error {
 	if err != nil {
 		return fmt.Errorf("stat %s: %w", t.path, err)
 	}
-	onDisk, err := os.Stat(t.path)
+	onDisk, err := statPath(t.path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		// Rotated away and the new file is not there yet: keep the old
-		// handle, it may still get a last write.
-		return nil
+		// Renamed or removed, and the new file is not there yet. Bytes
+		// written after the drain above are still on this handle.
+		return t.drain()
 	case err != nil:
 		return fmt.Errorf("stat %s: %w", t.path, err)
 	case !os.SameFile(cur, onDisk):
-		// Rotated: drain was just done; any partial line in the old file
-		// will never be completed, so print it as-is.
+		// The writer closes the live file before renaming it, so once
+		// the path names a different inode the old inode will not grow.
+		// Drain it again: the drain above can have missed bytes written
+		// after it returned and before this stat. A trailing partial
+		// line will never be completed, so print it as-is.
+		if err := t.drain(); err != nil {
+			return err
+		}
 		if len(t.partial) > 0 {
 			if err := t.emit(t.partial); err != nil {
 				return err
 			}
+			t.partial = nil
 		}
 		t.close()
 		if err := t.open(); err != nil || t.f == nil {

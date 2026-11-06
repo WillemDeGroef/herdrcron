@@ -210,6 +210,50 @@ func fakeExecutable(t *testing.T, path string) {
 	t.Cleanup(func() { executable = orig })
 }
 
+func TestInstallServiceHelpDoesNotInstall(t *testing.T) {
+	xdg(t)
+	called := false
+	orig := serviceRunner
+	serviceRunner = func(context.Context, string, ...string) error {
+		called = true
+		return nil
+	}
+	t.Cleanup(func() { serviceRunner = orig })
+
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"install-service", "--help"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d, want 0: %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "install-service") {
+		t.Errorf("stdout = %q, want usage", out.String())
+	}
+	if called {
+		t.Error("service manager was run for --help")
+	}
+}
+
+func TestInstallServiceRejectsArguments(t *testing.T) {
+	xdg(t)
+	called := false
+	orig := serviceRunner
+	serviceRunner = func(context.Context, string, ...string) error {
+		called = true
+		return nil
+	}
+	t.Cleanup(func() { serviceRunner = orig })
+
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"install-service", "now"}, &out, &errOut); code != 2 {
+		t.Fatalf("exit %d, want 2: %s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "unexpected argument") {
+		t.Errorf("stderr = %q", errOut.String())
+	}
+	if called {
+		t.Error("service manager was run for an unexpected argument")
+	}
+}
+
 func TestInstallServiceRefusesTempDirBinary(t *testing.T) {
 	xdg(t)
 	called := false

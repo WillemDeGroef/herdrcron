@@ -161,7 +161,7 @@ func TestLinuxIgnoresRelativeXDGConfigHome(t *testing.T) {
 }
 
 func TestLinuxEscapesEnvironmentAndExecStart(t *testing.T) {
-	o, _, _ := linuxOpts(t, map[string]string{"PATH": `/opt/a b/bin:/x"y\z:/100%`})
+	o, _, _ := linuxOpts(t, map[string]string{"PATH": `/opt/a b/bin:/x"y\z:/100%:$HOME`})
 	o.Binary = "/opt/my apps/herdr$cron%"
 	unit, err := service.Install(context.Background(), o)
 	if err != nil {
@@ -169,12 +169,24 @@ func TestLinuxEscapesEnvironmentAndExecStart(t *testing.T) {
 	}
 	got := readFile(t, unit)
 	for _, line := range []string{
-		`Environment="PATH=/opt/a b/bin:/x\"y\\z:/100%%"`,
+		`Environment="PATH=/opt/a b/bin:/x\"y\\z:/100%%:$$HOME"`,
 		`ExecStart="/opt/my apps/herdr$$cron%%" daemon`,
 	} {
 		if !strings.Contains(got, line+"\n") {
 			t.Errorf("unit lacks line %q:\n%s", line, got)
 		}
+	}
+}
+
+func TestLinuxEscapesDollarInUnquotedExecStart(t *testing.T) {
+	o, _, _ := linuxOpts(t, nil)
+	o.Binary = "/opt/herdr$cron%"
+	unit, err := service.Install(context.Background(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, unit); !strings.Contains(got, "ExecStart=/opt/herdr$$cron%% daemon\n") {
+		t.Fatalf("unit does not escape $ and %% in ExecStart:\n%s", got)
 	}
 }
 

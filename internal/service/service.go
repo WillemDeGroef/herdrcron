@@ -126,20 +126,20 @@ func systemdUnit(o Options) string {
 }
 
 // systemdQuoteBody escapes s for use inside a double-quoted systemd value:
-// backslash and double quote are backslash-escaped, % (specifier) is doubled.
+// backslash and double quote are backslash-escaped, and both $ (variable
+// expansion) and % (specifiers) are doubled so they survive as literals.
 func systemdQuoteBody(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, `%`, `%%`).Replace(s)
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, `%`, `%%`, `$`, `$$`).Replace(s)
 }
 
-// systemdExecArg renders one ExecStart argument: $ (variable expansion) and
-// % (specifiers) are doubled, and the word is quoted if it holds whitespace,
-// quotes or backslashes.
+// systemdExecArg renders one ExecStart argument. $ and % are escaped as in
+// systemdQuoteBody, and the word is quoted if it holds whitespace, quotes
+// or backslashes.
 func systemdExecArg(s string) string {
-	s = strings.ReplaceAll(s, "$", "$$")
 	if strings.ContainsAny(s, " \t\"'\\") {
 		return `"` + systemdQuoteBody(s) + `"`
 	}
-	return strings.ReplaceAll(s, "%", "%%")
+	return strings.NewReplacer(`%`, `%%`, `$`, `$$`).Replace(s)
 }
 
 // installSystemd writes the user unit and runs daemon-reload, enable, and

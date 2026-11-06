@@ -77,7 +77,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case "logs":
 		return runLogs(ctx, p, args[1:], stdout, stderr)
 	case "install-service":
-		return runInstallService(ctx, p, stdout, stderr)
+		return runInstallService(ctx, p, args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -184,7 +184,15 @@ func inTempDir(path string) bool {
 	return false
 }
 
-func runInstallService(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
+func runInstallService(ctx context.Context, p paths.Paths, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help" || args[0] == "-help") {
+		fmt.Fprint(stdout, "usage: herdrcron install-service\n")
+		return 0
+	}
+	if len(args) > 0 {
+		fmt.Fprintf(stderr, "herdrcron install-service: unexpected argument %q\n", args[0])
+		return 2
+	}
 	bin, err := executable()
 	if err != nil {
 		fmt.Fprintln(stderr, "herdrcron: cannot find own executable:", err)
