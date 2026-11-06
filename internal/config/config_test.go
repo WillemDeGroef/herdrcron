@@ -196,3 +196,11 @@ func TestLoadNotifyRejectsUnknownEvent(t *testing.T) {
 		t.Fatal("Load accepted notify.on: done")
 	}
 }
+
+func TestLoadNotifyRejectsEmptyProgram(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, "notify:\n  command: [\"\", x]\n")
+	if _, err := config.Load(path); err == nil {
+		t.Fatal(`Load accepted notify.command: ["", x]`)
+	}
+}

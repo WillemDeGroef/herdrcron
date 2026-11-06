@@ -120,6 +120,9 @@ func Load(path string) (Config, error) {
 	case cfg.CatchUpWindow.Duration < 0:
 		return Config{}, fmt.Errorf("catch_up_window must be > 0, got %s", cfg.CatchUpWindow.Duration)
 	}
+	if len(cfg.Notify.Command) > 0 && cfg.Notify.Command[0] == "" {
+		return Config{}, errors.New("notify.command: the first element (the program) is empty")
+	}
 	if cfg.Notify.On == nil {
 		cfg.Notify.On = slices.Clone(NotifyEvents)
 	}
