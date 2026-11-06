@@ -114,6 +114,56 @@ func TestDaemonClearsPausedUntilWhenItPasses(t *testing.T) {
 	}
 }
 
+func TestDaemonClearsPausedUntilOnADisabledTask(t *testing.T) {
+	p := setupUTC(t)
+	clk := clock.NewFake(noon)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clk})
+	call[api.TaskSummary](t, c, api.MethodTasksPause, api.PauseParams{ID: "parked", Until: "2026-11-06T13:00:00Z"})
+
+	clk.Set(time.Date(2026, 11, 6, 13, 0, 1, 0, time.UTC))
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(taskFile(t, p, "parked"), "paused_until: null") {
+		if time.Now().After(deadline) {
+			t.Fatalf("paused_until not cleared on a disabled task:\n%s", taskFile(t, p, "parked"))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := listByID(t, c)["parked"]; got.State != api.StateOff || got.PausedUntil != "" {
+		t.Errorf("after expiry = %+v, want off with no paused_until", got)
+	}
+	if !strings.Contains(taskFile(t, p, "parked"), "enabled: false") {
+		t.Errorf("clearing the pause enabled the task:\n%s", taskFile(t, p, "parked"))
+	}
+}
+
+func TestDaemonClearsPausedUntilOnAnInvalidTask(t *testing.T) {
+	p := setupUTC(t)
+	write(t, filepath.Join(p.TasksDir(), "stale.yaml"), `id: stale
+target: mars
+schedule: "@daily"
+paused_until: "2026-11-06T13:00:00Z"
+agent: {command: claude}
+timeout: 1h
+`)
+	clk := clock.NewFake(noon)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clk})
+	if got := listByID(t, c)["stale"]; got.State != api.StateInvalid {
+		t.Fatalf("stale = %+v, want invalid", got)
+	}
+
+	clk.Set(time.Date(2026, 11, 6, 13, 0, 1, 0, time.UTC))
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(taskFile(t, p, "stale"), "paused_until: null") {
+		if time.Now().After(deadline) {
+			t.Fatalf("paused_until not cleared on an invalid task:\n%s", taskFile(t, p, "stale"))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := listByID(t, c)["stale"]; got.State != api.StateInvalid {
+		t.Errorf("after expiry = %+v, want still invalid", got)
+	}
+}
+
 func TestPauseAllLivesInDaemonStateNotTaskFiles(t *testing.T) {
 	p := setupUTC(t)
 	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon)})

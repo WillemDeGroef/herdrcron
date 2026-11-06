@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,11 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// ErrReplaced means the task file was renamed into place, but the directory
+// could not be synced afterwards. The new contents are already at the path;
+// callers must reload the file and not treat the write as rolled back.
+var ErrReplaced = errors.New("task file replaced")
 
 // SetEnabled sets `enabled` in the task file at path.
 func SetEnabled(path string, enabled bool) error {
@@ -84,10 +90,11 @@ func setKey(path, key string, value *yaml.Node) error {
 // writeFileAtomic replaces the file at path with data: it writes a temp file
 // in the same directory, syncs it, gives it the original file's mode and
 // renames it over path. The temp file is named .<name>.tmp-*, so LoadTasks
-// never reads it. On failure the temp file is removed and path is untouched.
-// A symlinked path is followed: the link's target is replaced and the link
-// stays. The directory is synced after the rename, so the rename survives a
-// crash.
+// never reads it. On failure before the rename, the temp file is removed and
+// path is untouched. A symlinked path is followed: the link's target is
+// replaced and the link stays. The directory is synced after the rename, so
+// the rename survives a crash. If that sync fails the new file is already
+// in place: the error is ErrReplaced and nothing is removed.
 func writeFileAtomic(path string, data []byte) (err error) {
 	path, err = filepath.EvalSymlinks(path)
 	if err != nil {
@@ -101,8 +108,9 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	if err != nil {
 		return err
 	}
+	replaced := false
 	defer func() {
-		if err != nil {
+		if err != nil && !replaced {
 			_ = tmp.Close()
 			_ = os.Remove(tmp.Name())
 		}
@@ -122,8 +130,16 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	if err = os.Rename(tmp.Name(), path); err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(path))
+	replaced = true
+	if err = syncDirectory(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("%w: sync directory: %w", ErrReplaced, err)
+	}
+	return nil
 }
+
+// syncDirectory fsyncs a directory. Tests replace it to simulate a failure
+// after the rename.
+var syncDirectory = syncDir
 
 // syncDir fsyncs a directory, making a rename in it durable.
 func syncDir(dir string) error {

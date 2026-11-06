@@ -27,6 +27,9 @@ type env struct {
 	config config.Config
 	// expired records OnPauseExpired calls: task id and clock time.
 	expired []expiry
+	// expireErr is returned by the next OnPauseExpired call, then cleared,
+	// so a test can fail one clear and let the retry succeed.
+	expireErr error
 }
 
 type expiry struct {
@@ -69,8 +72,11 @@ func (e *env) newScheduler(targets map[string]target.Target) *scheduler.Schedule
 		Targets: targets,
 		Config:  e.config,
 		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		OnPauseExpired: func(_ context.Context, id string) {
+		OnPauseExpired: func(_ context.Context, id string) error {
 			e.expired = append(e.expired, expiry{id: id, at: e.clock.Now()})
+			err := e.expireErr
+			e.expireErr = nil
+			return err
 		},
 	})
 }

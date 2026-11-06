@@ -65,20 +65,22 @@ func (d *daemon) tasksResume(ctx context.Context, params json.RawMessage) (any, 
 
 // pauseExpired is the scheduler's OnPauseExpired: it clears the task's
 // paused_until in the task file, unless the file no longer holds a pause
-// that has ended (a resume or a new pause came first).
-func (d *daemon) pauseExpired(ctx context.Context, id string) {
+// that has ended (a resume or a new pause came first). A write error is
+// returned so the scheduler tries again. An invalid file is cleared too
+// when its paused_until can be read; a file that cannot be edited fails
+// the write and is retried.
+func (d *daemon) pauseExpired(ctx context.Context, id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	i := d.find(id)
-	if i < 0 || d.tasks[i].Err != nil {
-		return
+	if i < 0 {
+		return nil
 	}
 	if end, ok := d.tasks[i].Task.PauseEnd(); !ok || end.After(d.clk.Now()) {
-		return
+		return nil
 	}
-	if _, err := d.editLocked(ctx, i, "pause ended", func(path string) error { return config.SetPausedUntil(path, "") }); err != nil {
-		d.log.Error("cannot clear paused_until", logging.KeyTaskID, id, "err", err)
-	}
+	_, err := d.editLocked(ctx, i, "pause ended", func(path string) error { return config.SetPausedUntil(path, "") })
+	return err
 }
 
 // editTask applies edit to the task file of a valid task, reloads the file,
@@ -99,8 +101,12 @@ func (d *daemon) editTask(ctx context.Context, id, action string, edit func(path
 // editLocked is editTask for d.tasks[i], with d.mu held.
 func (d *daemon) editLocked(ctx context.Context, i int, action string, edit func(path string) error) (api.TaskSummary, error) {
 	old := d.tasks[i]
-	if err := edit(old.File); err != nil {
+	if err := edit(old.File); err != nil && !errors.Is(err, config.ErrReplaced) {
 		return api.TaskSummary{}, fmt.Errorf("write task file %s: %w", old.File, err)
+	} else if err != nil {
+		// The new bytes are already at the path. Skipping the reload would
+		// leave memory on the old task.
+		d.log.Error("task file replaced but directory sync failed", logging.KeyTaskID, old.ID, "err", err)
 	}
 	// Reload rather than patch the entry, so memory matches the file.
 	e := config.LoadTask(d.configDir, old.ID, d.cfg)

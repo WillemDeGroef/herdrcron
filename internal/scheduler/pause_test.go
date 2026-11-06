@@ -1,7 +1,11 @@
 package scheduler_test
 
 import (
+	"context"
+	"errors"
+	"io"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -107,5 +111,120 @@ func TestSetTaskRecomputesNextFireFromNow(t *testing.T) {
 	}
 	if got := e.state("t").NextFireAt; !got.IsZero() {
 		t.Errorf("task_state next_fire_at after disable = %v, want none", got)
+	}
+}
+
+// A timed pause on a task that is off or invalid still has to be cleared
+// when it passes, and the task must not fire while it waits.
+func TestOffAndInvalidPauseExpiryIsReportedWithoutARun(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
+	off := task("off", "@hourly")
+	off.Enabled = false
+	off.PausedUntil = "2026-11-06T14:30:00Z"
+	bad := task("bad", "@hourly")
+	bad.PausedUntil = "2026-11-06T13:00:00Z"
+	e.setTasks([]config.TaskEntry{
+		{ID: off.ID, Task: off},
+		{ID: bad.ID, Task: bad, Err: errors.New("unknown target")},
+	})
+	for _, id := range []string{"off", "bad"} {
+		if _, ok := e.sched.NextFire(id); ok {
+			t.Errorf("NextFire(%s) set, want none", id)
+		}
+	}
+
+	e.runUntil(time.Date(2026, 11, 6, 16, 0, 0, 0, time.UTC))
+	want := []expiry{
+		{id: "bad", at: time.Date(2026, 11, 6, 13, 0, 0, 0, time.UTC)},
+		{id: "off", at: time.Date(2026, 11, 6, 14, 30, 0, 0, time.UTC)},
+	}
+	if !slices.Equal(e.expired, want) {
+		t.Errorf("expired = %v, want %v", e.expired, want)
+	}
+	if n := len(e.runs("off")) + len(e.runs("bad")); n != 0 {
+		t.Errorf("%d runs, want 0", n)
+	}
+}
+
+func TestPauseClearFailureIsRetriedLater(t *testing.T) {
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	e := newEnv(t, now)
+	e.expireErr = errors.New("disk full")
+	tk := task("t", "@daily")
+	tk.PausedUntil = "2026-11-06T11:00:00Z"
+	e.setTasks(valid(tk))
+
+	wake := e.sched.Tick(e.ctx)
+	if len(e.expired) != 1 {
+		t.Fatalf("expired = %v, want one call", e.expired)
+	}
+	e.sched.Tick(e.ctx)
+	if len(e.expired) != 1 {
+		t.Fatalf("cleared again before the retry: %v", e.expired)
+	}
+	if !wake.After(now) {
+		t.Fatalf("wake = %v, want a future retry so a failed clear does not spin", wake)
+	}
+	e.clock.Set(wake)
+	e.sched.Tick(e.ctx)
+	if len(e.expired) != 2 || !e.expired[1].at.Equal(wake) {
+		t.Fatalf("expired = %v, want a retry at %v", e.expired, wake)
+	}
+}
+
+// execHook runs fn at the start of Exec, then the embedded fake.
+type execHook struct {
+	*target.Fake
+	fn func()
+}
+
+func (h *execHook) Exec(ctx context.Context, argv []string, stdin io.Reader) ([]byte, error) {
+	if h.fn != nil {
+		h.fn()
+	}
+	return h.Fake.Exec(ctx, argv, stdin)
+}
+
+// Two tasks come due in one tick. The first Exec applies a pause or a
+// disable; the fire still queued behind it must not start.
+func TestQueuedFireSeesPauseThatLandsDuringTick(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fn   func(t *testing.T, e *env)
+	}{
+		{"global pause", func(_ *testing.T, e *env) { e.sched.SetGlobalPause(true, nil) }},
+		{"disable", func(t *testing.T, e *env) {
+			for _, id := range []string{"a", "b"} {
+				tk := task(id, "@hourly")
+				tk.Enabled = false
+				if err := e.sched.SetTask(e.ctx, config.TaskEntry{ID: id, Task: tk}); err != nil {
+					t.Errorf("disable %s: %v", id, err)
+				}
+			}
+		}},
+		{"task pause", func(t *testing.T, e *env) {
+			for _, id := range []string{"a", "b"} {
+				tk := task(id, "@hourly")
+				tk.PausedUntil = "indefinite"
+				if err := e.sched.SetTask(e.ctx, config.TaskEntry{ID: id, Task: tk}); err != nil {
+					t.Errorf("pause %s: %v", id, err)
+				}
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
+			var once sync.Once
+			fake := target.NewFake("local")
+			hook := &execHook{Fake: fake, fn: func() { once.Do(func() { tc.fn(t, e) }) }}
+			e.local = fake
+			e.sched = e.newScheduler(map[string]target.Target{"local": hook})
+			e.setTasks(valid(task("a", "@hourly"), task("b", "@hourly")))
+			e.clock.Set(time.Date(2026, 11, 6, 13, 0, 0, 0, time.UTC))
+			e.sched.Tick(e.ctx)
+			if n := len(e.runs("a")) + len(e.runs("b")); n != 1 {
+				t.Fatalf("%d runs, want 1 (the fire already inside Exec; the queued one stays off)", n)
+			}
+		})
 	}
 }
