@@ -129,7 +129,8 @@ func (m Model) savePrompt(det api.TaskDetail, prompt string) tea.Cmd {
 	ctx, b, id := m.ctx, m.backend, det.Task.ID
 	p := api.TaskWriteParams{ID: id, Version: det.Version, Task: det.Task, Prompt: prompt}
 	return func() tea.Msg {
-		err := b.Call(ctx, api.MethodTasksUpdate, p, nil)
+		var updated api.TaskDetail
+		err := b.Call(ctx, api.MethodTasksUpdate, p, &updated)
 		var aerr *api.Error
 		switch {
 		case err == nil:
