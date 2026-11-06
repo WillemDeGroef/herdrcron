@@ -1,0 +1,41 @@
+# GoReleaser config for herdrcron. A pushed tag `v*` runs .github/workflows/release.yml.
+# Check locally: goreleaser check && goreleaser release --snapshot --clean
+version: 2
+
+project_name: herdrcron
+
+builds:
+  - id: herdrcron
+    main: ./cmd/herdrcron
+    binary: herdrcron
+    env:
+      # modernc.org/sqlite is pure Go, so the binary is fully static.
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - darwin_arm64
+
+archives:
+  - id: herdrcron
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

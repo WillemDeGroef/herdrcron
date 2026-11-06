@@ -316,6 +316,19 @@ func PromptPath(promptFile, configDir string) string {
 	return filepath.Join(configDir, promptFile)
 }
 
+// MaxPromptBytes is the largest prompt herdrcron accepts: Linux limits one
+// argument to 131072 bytes including its terminating NUL, and the shell in
+// the pane passes the prompt to the agent as one argument. Bigger prompts
+// are refused, not sent another way (docs/herdr-findings.md, "Prompts above
+// 128 KiB").
+const MaxPromptBytes = 131071
+
+// PromptTooLarge is the problem text for a prompt of n bytes above
+// MaxPromptBytes.
+func PromptTooLarge(n int64) string {
+	return fmt.Sprintf("prompt is %d bytes; the limit is %d (one command-line argument); keep long instructions in a file in the repo and refer to it", n, MaxPromptBytes)
+}
+
 // checkPromptFile reports a problem with prompt_file. A draft's prompt file
 // may be missing; it is written with the task.
 func checkPromptFile(promptFile, configDir string, draft bool) string {
@@ -332,6 +345,8 @@ func checkPromptFile(promptFile, configDir string, draft bool) string {
 		return fmt.Sprintf("prompt file %s: %v", promptFile, err)
 	case info.IsDir():
 		return fmt.Sprintf("prompt file %s is a directory", promptFile)
+	case info.Size() > MaxPromptBytes:
+		return fmt.Sprintf("prompt file %s: %s", promptFile, PromptTooLarge(info.Size()))
 	}
 	return ""
 }

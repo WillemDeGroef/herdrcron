@@ -48,7 +48,7 @@ func TestRealHerdrRunEndsDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	dir := t.TempDir()
 	tricky := `Quotes "a" 'b', $HOME and ` + "`uname`" + `, done`
 	if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o755); err != nil {

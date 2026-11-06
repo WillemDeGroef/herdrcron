@@ -487,3 +487,21 @@ func assertOnlyFile(t *testing.T, dir, name string) {
 		t.Errorf("directory holds %v, want only %s", names, name)
 	}
 }
+
+// Linux passes one argument of at most 131071 bytes, and the prompt reaches
+// the agent as one argument, so a bigger prompt file is refused
+// (docs/herdr-findings.md, "Prompts above 128 KiB").
+func TestValidateRefusesAPromptFileAboveTheArgumentLimit(t *testing.T) {
+	f := newFixture(t)
+	task := fullTask()
+	path := config.PromptPath(task.PromptFile, f.dir)
+	writeFile(t, path, strings.Repeat("a", 131071))
+	if err := config.Validate(task, task.ID, f.dir, f.cfg); err != nil {
+		t.Fatalf("prompt of 131071 bytes refused: %v", err)
+	}
+	writeFile(t, path, strings.Repeat("a", 131072))
+	ve := asValidationError(t, config.Validate(task, task.ID, f.dir, f.cfg))
+	if got := ve.ByField()["prompt_file"]; len(got) != 1 || !strings.Contains(got[0], "131071") {
+		t.Errorf("prompt_file = %v, want one error naming the 131071-byte limit", got)
+	}
+}

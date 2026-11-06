@@ -128,10 +128,13 @@ func (f fieldErrors) err() error {
 		Data: api.ValidationErrorData{Fields: f}}
 }
 
-// draft turns write params into a task and checks it, without the prompt
-// file having to exist. Problems are collected by field.
-func (d *daemon) draft(def api.TaskDef) (config.Task, fieldErrors) {
+// draft turns write params into a task and checks it and its prompt text,
+// without the prompt file having to exist. Problems are collected by field.
+func (d *daemon) draft(def api.TaskDef, prompt string) (config.Task, fieldErrors) {
 	fe := fieldErrors{}
+	if len(prompt) > config.MaxPromptBytes {
+		fe.add("prompt", config.PromptTooLarge(int64(len(prompt))))
+	}
 	t, timeoutErr := taskFromDef(def)
 	if timeoutErr != nil {
 		fe.add("timeout", timeoutErr.Error())
@@ -162,7 +165,7 @@ func (d *daemon) tasksCreate(ctx context.Context, params json.RawMessage) (any, 
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	t, fe := d.draft(p.Task)
+	t, fe := d.draft(p.Task, p.Prompt)
 	path := d.taskPath(t.ID)
 	if t.ID != "" && len(fe["id"]) == 0 {
 		if _, err := os.Lstat(path); d.find(t.ID) >= 0 || err == nil {
@@ -219,7 +222,7 @@ func (d *daemon) tasksUpdate(ctx context.Context, params json.RawMessage) (any, 
 		return nil, &api.Error{Code: api.CodeVersionMismatch,
 			Message: fmt.Sprintf("task %s changed since it was read; read it again", p.ID)}
 	}
-	t, fe := d.draft(p.Task)
+	t, fe := d.draft(p.Task, p.Prompt)
 	if t.ID != p.ID {
 		fe["id"] = []string{fmt.Sprintf("id cannot change (task %q)", p.ID)}
 	}

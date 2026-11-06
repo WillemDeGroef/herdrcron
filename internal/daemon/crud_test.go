@@ -599,3 +599,29 @@ func readFile(t *testing.T, path string) string {
 	}
 	return string(data)
 }
+
+// A prompt above Linux's 131071-byte argument limit is refused on create
+// and update with a field error on the prompt, and no file is written.
+func TestTasksCreateAndUpdateRefuseAPromptAboveTheArgumentLimit(t *testing.T) {
+	p := setupUTC(t)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	big := strings.Repeat("a", 131072)
+	def := newTaskDef()
+	err := c.Call(context.Background(), api.MethodTasksCreate, api.TaskWriteParams{Task: def, Prompt: big}, nil)
+	if f := fieldErrors(t, rpcErr(t, err, api.CodeValidation)); len(f["prompt"]) != 1 || !strings.Contains(f["prompt"][0], "131071") {
+		t.Errorf("create: field errors = %v, want one prompt error naming the limit", f)
+	}
+	if _, err := os.Stat(filepath.Join(p.TasksDir(), def.ID+".yaml")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("task file written for a refused create: %v", err)
+	}
+
+	var created api.TaskDetail
+	if err := c.Call(context.Background(), api.MethodTasksCreate, api.TaskWriteParams{Task: def, Prompt: strings.Repeat("a", 131071)}, &created); err != nil {
+		t.Fatalf("create with a 131071-byte prompt: %v", err)
+	}
+	err = c.Call(context.Background(), api.MethodTasksUpdate,
+		api.TaskWriteParams{ID: def.ID, Version: created.Version, Task: def, Prompt: big}, nil)
+	if f := fieldErrors(t, rpcErr(t, err, api.CodeValidation)); len(f["prompt"]) != 1 {
+		t.Errorf("update: field errors = %v, want one prompt error", f)
+	}
+}
