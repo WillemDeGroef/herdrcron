@@ -79,8 +79,8 @@ The spec says all criteria "must pass on the user's machines", so every item als
 
 - [x] verified-by-test (fake herdr with scripted statuses, notifier argv captured):
   - `internal/runner`: `TestRunGoesFromWorkingToBlockedAndBackToDone`, `TestBlockedNotifiesOncePerChangeToBlocked`, `TestRecoveredBlockedRunDoesNotNotifyAgain`.
-  - `internal/daemon`: `TestBlockedRunShowsTaskAsBlocked`, `TestFailedRunRunsTheNotifyCommand`.
-  - `internal/notify`: `TestCommandGetsMessageAppendedWithoutAShell`.
+  - `internal/daemon`: `TestBlockedRunShowsTaskAsBlocked` (the task shows `blocked`).
+  - `internal/notify`: `TestCommandGetsMessageAppendedWithoutAShell` (one `blocked` notification, message appended as an argument).
 - [ ] needs-user:
   1. Set `notify: {command: ["notify-send", "herdrcron"]}` (or `ntfy publish <topic>`, or `osascript`) in `config.yaml`.
   2. Create a task with `agent: {command: claude}`, no `--permission-mode`, and the prompt `Create the file /tmp/hc-ac6.txt containing hi.`

@@ -19,31 +19,35 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/runner"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
 	"github.com/WillemDeGroef/herdrcron/internal/target"
+	"github.com/WillemDeGroef/herdrcron/internal/testherdr"
 )
 
 // TestRealHerdrRunEndsDone runs a plain command through a real herdr, in
-// an isolated session (never the user's default server): the runner
-// starts the server, opens an hc- workspace and tab, the command prints
-// the prompt, and the run ends done with the prompt in its output tail.
+// a throwaway session under a temporary HOME (never the user's default
+// server or config): the runner starts the server, opens an hc- workspace
+// and tab, the command prints the prompt, and the run ends done with the
+// prompt in its output tail.
 //
 //	go test -tags integration -run RealHerdr ./internal/runner/
 func TestRealHerdrRunEndsDone(t *testing.T) {
-	if _, err := exec.LookPath("herdr"); err != nil {
+	herdrBin, err := exec.LookPath("herdr")
+	if err != nil {
 		t.Skip("herdr not on PATH")
 	}
-	isolateFromUserHerdr(t)
+	testherdr.UnsetUserEnv(t)
+	// herdr keeps named sessions under $XDG_CONFIG_HOME (else ~/.config),
+	// and the local target writes the prompt under $HOME/.cache. Both must
+	// be temporary before the server starts. Cleanup carries that
+	// environment itself, so it cannot dial the user's server.
+	dirs := testherdr.Fresh(t)
 	session := fmt.Sprintf("hc-it-%d", os.Getpid())
 	bin := t.TempDir()
 	wrapper := filepath.Join(bin, "herdr")
-	script := "#!/bin/sh\nexec herdr --session " + session + " \"$@\"\n"
+	script := "#!/bin/sh\nexec " + herdrBin + " --session " + session + " \"$@\"\n"
 	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = exec.Command("herdr", "--session", session, "server", "stop").Run()
-		time.Sleep(500 * time.Millisecond)
-		_ = exec.Command("herdr", "session", "delete", session).Run()
-	})
+	t.Cleanup(func() { dirs.RemoveSession(t, herdrBin, session) })
 
 	st, err := store.Open(filepath.Join(t.TempDir(), "herdrcron.db"))
 	if err != nil {
@@ -101,27 +105,11 @@ func TestRealHerdrRunEndsDone(t *testing.T) {
 	if !strings.Contains(got.OutputTail, "PROMPT<"+tricky+">") {
 		t.Errorf("output tail does not hold the prompt unchanged:\n%s", got.OutputTail)
 	}
-	home, _ := os.UserHomeDir()
-	if _, err := os.Stat(filepath.Join(home, ".cache/herdrcron/runs", run.ID+".md")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dirs.Home, ".cache/herdrcron/runs", run.ID+".md")); !os.IsNotExist(err) {
 		t.Errorf("prompt file still on the target: %v", err)
 	}
 	out, _ := exec.Command(wrapper, "tab", "get", got.HerdrTab).CombinedOutput()
 	if !strings.Contains(string(out), "not_found") {
 		t.Errorf("on_done close_tab left tab %s: %s", got.HerdrTab, out)
-	}
-}
-
-// isolateFromUserHerdr unsets every HERDR_* variable for the test, so that
-// no herdr command it runs can reach the user's server through
-// HERDR_SOCKET_PATH (set when the tests run inside a herdr pane).
-func isolateFromUserHerdr(t *testing.T) {
-	t.Helper()
-	for _, kv := range os.Environ() {
-		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "HERDR_") {
-			t.Setenv(k, "") // restores the value after the test
-			if err := os.Unsetenv(k); err != nil {
-				t.Fatal(err)
-			}
-		}
 	}
 }

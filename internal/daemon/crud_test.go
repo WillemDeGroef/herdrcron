@@ -640,8 +640,16 @@ func TestTasksCreateAndUpdateRefuseAPromptAboveTheArgumentLimit(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		detail = call[api.TaskDetail](t, c, api.MethodTasksGet, api.TaskIDParams{ID: def.ID})
 	}
+	var updated api.TaskDetail
 	if err := c.Call(context.Background(), api.MethodTasksUpdate,
-		api.TaskWriteParams{ID: def.ID, Version: detail.Version, Task: def, Prompt: "short"}, nil); err != nil {
-		t.Errorf("update with a short prompt over an oversized prompt file: %v", err)
+		api.TaskWriteParams{ID: def.ID, Version: detail.Version, Task: def, Prompt: "short"}, &updated); err != nil {
+		t.Fatalf("update with a short prompt over an oversized prompt file: %v", err)
+	}
+	if updated.Prompt != "short" || updated.Summary.Error != "" || updated.Summary.State == api.StateInvalid {
+		t.Errorf("after replacing the oversized prompt: prompt %q state %s error %q",
+			updated.Prompt, updated.Summary.State, updated.Summary.Error)
+	}
+	if got := readFile(t, promptPath); got != "short" {
+		t.Errorf("prompt file = %q, want the short replacement", got)
 	}
 }

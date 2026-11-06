@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/api"
+	"github.com/WillemDeGroef/herdrcron/internal/testherdr"
 )
 
 // TestRealHerdrDaemonRunsTask is the spec's integration test: the real
@@ -31,21 +32,27 @@ func TestRealHerdrDaemonRunsTask(t *testing.T) {
 	if err != nil {
 		t.Skip("herdr not on PATH")
 	}
-	isolateFromUserHerdr(t)
-	p := xdg(t) // temporary HOME and XDG dirs
+	testherdr.UnsetUserEnv(t)
+	p := xdg(t) // temporary HOME and XDG dirs, shared with the daemon
+	// The daemon's config lives in xdg's tree. herdr sessions go there too
+	// ($XDG_CONFIG_HOME/herdr/sessions), not into the user's config.
+	dirs := testherdr.Dirs{
+		Home:       os.Getenv("HOME"),
+		ConfigHome: os.Getenv("XDG_CONFIG_HOME"),
+		StateHome:  os.Getenv("XDG_STATE_HOME"),
+		CacheHome:  filepath.Join(os.Getenv("HOME"), "cache"),
+	}
+	dirs.Apply(t)
 	session := fmt.Sprintf("hc-it-daemon-%d", os.Getpid())
 	wrapper := filepath.Join(t.TempDir(), "herdr")
 	write(t, wrapper, "#!/bin/sh\nexec "+herdr+" --session "+session+" \"$@\"\n")
 	if err := os.Chmod(wrapper, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Registered after xdg's Setenv, so it runs first, with the temporary
-	// HOME still set.
-	t.Cleanup(func() {
-		_ = exec.Command(herdr, "--session", session, "server", "stop").Run()
-		time.Sleep(500 * time.Millisecond)
-		_ = exec.Command(herdr, "session", "delete", session).Run()
-	})
+	// The daemon cleanup is registered later, so it runs before this one;
+	// both run before HOME and HERDR_* are restored. RemoveSession also
+	// pins the temp dirs and strips HERDR_* on the herdr commands themselves.
+	t.Cleanup(func() { dirs.RemoveSession(t, herdr, session) })
 
 	repo := filepath.Join(t.TempDir(), "hc-it-repo")
 	if err := os.Mkdir(repo, 0o755); err != nil {
@@ -137,20 +144,5 @@ on_done: close_tab
 	tabOut, _ := exec.Command(wrapper, "tab", "get", runRow.HerdrTab).CombinedOutput()
 	if !strings.Contains(string(tabOut), "not_found") {
 		t.Errorf("on_done close_tab left tab %s: %s", runRow.HerdrTab, tabOut)
-	}
-}
-
-// isolateFromUserHerdr unsets every HERDR_* variable for the test, so that
-// no herdr command it runs can reach the user's server through
-// HERDR_SOCKET_PATH (set when the tests run inside a herdr pane).
-func isolateFromUserHerdr(t *testing.T) {
-	t.Helper()
-	for _, kv := range os.Environ() {
-		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "HERDR_") {
-			t.Setenv(k, "") // restores the value after the test
-			if err := os.Unsetenv(k); err != nil {
-				t.Fatal(err)
-			}
-		}
 	}
 }
