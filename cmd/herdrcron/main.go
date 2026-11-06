@@ -33,7 +33,10 @@ const usage = `usage: herdrcron <command>
 commands:
   daemon            run the daemon in the foreground
   list              list tasks with target, schedule, state, last run and next fire
-  run <id>          start a manual run of a task now, even if it is off or paused
+  run [--parallel] <id>
+                    start a manual run of a task now, even if it is off or paused;
+                    --parallel starts it next to an active run (overlap skip)
+  stop <run-id>     stop an active run
   logs [-f] [--task <id>]
                     print the daemon log; -f follows it, --task filters by task
   install-service   install and start the daemon as a systemd user service
@@ -77,6 +80,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return runList(ctx, p, stdout, stderr)
 	case "run":
 		return runRun(ctx, p, args[1:], stdout, stderr)
+	case "stop":
+		return runStop(ctx, p, args[1:], stdout, stderr)
 	case "logs":
 		return runLogs(ctx, p, args[1:], stdout, stderr)
 	case "install-service":
@@ -142,10 +147,15 @@ func runList(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
 }
 
 // runRun starts a manual run and prints one line about it. It exits 1 if
-// the run failed to start.
+// the run failed to start or the task has an active run (overlap skip)
+// and --parallel is not given.
 func runRun(ctx context.Context, p paths.Paths, args []string, stdout, stderr io.Writer) int {
+	parallel := false
+	if len(args) > 0 && args[0] == "--parallel" {
+		parallel, args = true, args[1:]
+	}
 	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
-		fmt.Fprintf(stderr, "usage: herdrcron run <id>\n")
+		fmt.Fprintf(stderr, "usage: herdrcron run [--parallel] <id>\n")
 		return 2
 	}
 	c := dial(p, stderr)
@@ -157,15 +167,22 @@ func runRun(ctx context.Context, p paths.Paths, args []string, stdout, stderr io
 	// possibly starting the herdr server.
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	var r api.RunSummary
-	if err := c.Call(ctx, api.MethodTasksRunNow, api.RunNowParams{ID: args[0]}, &r); err != nil {
+	var r api.RunNowResult
+	if err := c.Call(ctx, api.MethodTasksRunNow, api.RunNowParams{ID: args[0], ForceParallel: parallel}, &r); err != nil {
 		var rpcErr *api.Error
-		if errors.As(err, &rpcErr) {
+		switch {
+		case errors.As(err, &rpcErr) && rpcErr.Code == api.CodeRunActive:
+			fmt.Fprintf(stderr, "herdrcron run: %s; use `herdrcron run --parallel %s` to start another one\n", rpcErr.Message, args[0])
+		case errors.As(err, &rpcErr):
 			fmt.Fprintln(stderr, "herdrcron run:", strings.TrimPrefix(rpcErr.Message, "invalid params: "))
-		} else {
+		default:
 			fmt.Fprintln(stderr, "herdrcron: tasks.run_now:", err)
 		}
 		return 1
+	}
+	if r.Queued {
+		fmt.Fprintf(stdout, "run of %s queued: it starts when the active run ends or a slot on the target is free\n", r.TaskID)
+		return 0
 	}
 	line := fmt.Sprintf("run %s started for %s: %s", r.ID, r.TaskID, r.Status)
 	if r.HerdrTab != "" {
@@ -178,6 +195,38 @@ func runRun(ctx context.Context, p paths.Paths, args []string, stdout, stderr io
 	if r.Status == "failed" {
 		return 1
 	}
+	return 0
+}
+
+// runStop stops an active run and prints how it ended. The daemon answers
+// once the stop sequence is done, which takes about 12 s.
+func runStop(ctx context.Context, p paths.Paths, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
+		fmt.Fprintf(stderr, "usage: herdrcron stop <run-id>\n")
+		return 2
+	}
+	c := dial(p, stderr)
+	if c == nil {
+		return 1
+	}
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	var r api.RunSummary
+	if err := c.Call(ctx, api.MethodRunsStop, api.RunsStopParams{RunID: args[0]}, &r); err != nil {
+		var rpcErr *api.Error
+		if errors.As(err, &rpcErr) {
+			fmt.Fprintln(stderr, "herdrcron stop:", strings.TrimPrefix(rpcErr.Message, "invalid params: "))
+		} else {
+			fmt.Fprintln(stderr, "herdrcron: runs.stop:", err)
+		}
+		return 1
+	}
+	line := fmt.Sprintf("run %s of %s: %s", r.ID, r.TaskID, r.Status)
+	if r.ExitReason != "" {
+		line += ": " + r.ExitReason
+	}
+	fmt.Fprintln(stdout, line)
 	return 0
 }
 

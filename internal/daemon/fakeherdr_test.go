@@ -1,0 +1,249 @@
+package daemon_test
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"maps"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/WillemDeGroef/herdrcron/internal/herdr"
+	"github.com/WillemDeGroef/herdrcron/internal/target"
+)
+
+// paneState is what `herdr pane list` reports for a pane.
+type paneState int
+
+const (
+	paneWorking paneState = iota // agent claude, working (the default)
+	paneIdle
+	paneDone
+	paneBlocked
+	paneGone // the pane no longer exists
+)
+
+type fakePane struct {
+	id, tab, ws string
+	state       paneState
+}
+
+// fakeHerdr is a stateful target.Target that plays the subset of herdr
+// 0.9.1 the runner uses (a trimmed copy of the runner package's fake).
+// Panes report agent claude, working, until the test changes them.
+type fakeHerdr struct {
+	mu sync.Mutex
+
+	calls      [][]string
+	files      map[string][]byte
+	workspaces map[string]string // label -> id
+	tabs       map[string]string // tab id -> workspace id
+	panes      map[string]*fakePane
+	order      []string // pane ids in creation order
+	nextID     int
+
+	unreachable bool   // pane list fails
+	output      string // pane read text
+}
+
+func newFakeHerdr() *fakeHerdr {
+	return &fakeHerdr{
+		files: map[string][]byte{}, workspaces: map[string]string{},
+		tabs: map[string]string{}, panes: map[string]*fakePane{},
+	}
+}
+
+func (f *fakeHerdr) Name() string { return "local" }
+
+func (f *fakeHerdr) PutFile(_ context.Context, path string, data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.files[path] = slices.Clone(data)
+	return nil
+}
+
+func (f *fakeHerdr) RemoveFile(_ context.Context, path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.files, path)
+	return nil
+}
+
+// set changes what pane list reports for the pane.
+func (f *fakeHerdr) set(paneID string, s paneState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.panes[paneID].state = s
+}
+
+func (f *fakeHerdr) setUnreachable(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unreachable = v
+}
+
+func (f *fakeHerdr) setOutput(s string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.output = s
+}
+
+func (f *fakeHerdr) tabOpen(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.tabs[id]
+	return ok
+}
+
+// count returns how many calls started with prefix.
+func (f *fakeHerdr) count(prefix ...string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if len(c) >= len(prefix) && slices.Equal(c[:len(prefix)], prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// keysSent returns the key lists of `pane send-keys` calls for the pane.
+func (f *fakeHerdr) keysSent(paneID string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, c := range f.calls {
+		if len(c) > 4 && c[1] == "pane" && c[2] == "send-keys" && c[3] == paneID {
+			out = append(out, strings.Join(c[4:], " "))
+		}
+	}
+	return out
+}
+
+func herdrErr(code string) error {
+	b, _ := json.Marshal(herdr.ErrorResponse{Error: herdr.ErrorBody{Code: code, Message: code}, ID: "cli"})
+	return &target.ExitError{Code: 1, Stderr: b}
+}
+
+func ok[T any](v T) ([]byte, error) {
+	return json.Marshal(herdr.Response[T]{ID: "cli", Result: v})
+}
+
+func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, slices.Clone(argv))
+	if argv[0] != "herdr" {
+		// The preflight script: argv ends with <command> <cwd>; print the cwd.
+		return []byte(argv[len(argv)-1] + "\n"), nil
+	}
+	switch strings.Join(argv[1:min(3, len(argv))], " ") {
+	case "pane list":
+		if f.unreachable {
+			return nil, fmt.Errorf("ssh: connect to host: connection refused")
+		}
+		list := []herdr.PaneInfo{}
+		for _, id := range f.order {
+			p := f.panes[id]
+			if p.state == paneGone {
+				continue
+			}
+			info := herdr.PaneInfo{PaneID: p.id, TabID: p.tab, WorkspaceID: p.ws}
+			agent := "claude"
+			info.Agent = &agent
+			switch p.state {
+			case paneWorking:
+				info.AgentStatus = herdr.AgentStatusWorking
+			case paneIdle:
+				info.AgentStatus = herdr.AgentStatusIdle
+			case paneDone:
+				info.AgentStatus = herdr.AgentStatusDone
+			case paneBlocked:
+				info.AgentStatus = herdr.AgentStatusBlocked
+			}
+			list = append(list, info)
+		}
+		return ok(herdr.PaneListResult{Type: "pane_list", Panes: list})
+	case "workspace list":
+		var list []herdr.WorkspaceInfo
+		for label, id := range f.workspaces {
+			list = append(list, herdr.WorkspaceInfo{WorkspaceID: id, Label: label})
+		}
+		return ok(herdr.WorkspaceListResult{Type: "workspace_list", Workspaces: list})
+	case "workspace create":
+		label := flag(argv, "--label")
+		f.nextID++
+		ws := fmt.Sprintf("w%d", f.nextID)
+		f.workspaces[label] = ws
+		tab, pane := f.newTab(ws)
+		return ok(herdr.WorkspaceCreatedResult{
+			Type: "workspace_created", Workspace: herdr.WorkspaceInfo{WorkspaceID: ws, Label: label},
+			Tab: herdr.TabInfo{TabID: tab, WorkspaceID: ws, Label: "1"}, RootPane: pane,
+		})
+	case "tab create":
+		ws := flag(argv, "--workspace")
+		if !slices.Contains(slices.Collect(maps.Values(f.workspaces)), ws) {
+			return nil, herdrErr(herdr.CodeWorkspaceNotFound)
+		}
+		label := flag(argv, "--label")
+		tab, pane := f.newTab(ws)
+		return ok(herdr.TabCreatedResult{
+			Type: "tab_created", Tab: herdr.TabInfo{TabID: tab, WorkspaceID: ws, Label: label}, RootPane: pane,
+		})
+	case "tab rename":
+		return ok(herdr.TabInfoResult{Type: "tab_info", Tab: herdr.TabInfo{TabID: argv[3], Label: argv[4]}})
+	case "tab close":
+		id := argv[3]
+		if _, found := f.tabs[id]; !found {
+			return nil, herdrErr(herdr.CodeTabNotFound)
+		}
+		delete(f.tabs, id)
+		for _, p := range f.panes {
+			if p.tab == id {
+				p.state = paneGone
+			}
+		}
+		return ok(herdr.OkResult{Type: "ok"})
+	case "pane run", "pane send-keys", "pane read":
+		if p, found := f.panes[argv[3]]; !found || p.state == paneGone {
+			return nil, herdrErr(herdr.CodePaneNotFound)
+		}
+		if argv[2] == "read" {
+			return []byte(f.output), nil
+		}
+		return nil, nil
+	case "pane process-info":
+		p, found := f.panes[flag(argv, "--pane")]
+		if !found || p.state == paneGone {
+			return nil, herdrErr(herdr.CodePaneNotFound)
+		}
+		pid, fg := uint32(100), uint32(200)
+		return ok(herdr.PaneProcessInfoResult{Type: "pane_process_info", ProcessInfo: herdr.PaneProcessInfo{
+			PaneID: p.id, ShellPID: &pid, ForegroundProcessGroupID: &fg,
+		}})
+	}
+	return nil, fmt.Errorf("fake herdr: unexpected argv %q", argv)
+}
+
+// newTab creates a tab with a root pane whose agent is working.
+func (f *fakeHerdr) newTab(ws string) (string, herdr.PaneInfo) {
+	f.nextID++
+	tab := fmt.Sprintf("%s:t%d", ws, f.nextID)
+	pane := fmt.Sprintf("%s:p%d", ws, f.nextID)
+	f.tabs[tab] = ws
+	f.panes[pane] = &fakePane{id: pane, tab: tab, ws: ws}
+	f.order = append(f.order, pane)
+	return tab, herdr.PaneInfo{PaneID: pane, TabID: tab, WorkspaceID: ws, AgentStatus: herdr.AgentStatusUnknown}
+}
+
+func flag(argv []string, name string) string {
+	for i, a := range argv {
+		if a == name && i+1 < len(argv) {
+			return argv[i+1]
+		}
+	}
+	return ""
+}

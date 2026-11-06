@@ -16,6 +16,7 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/api"
 	"github.com/WillemDeGroef/herdrcron/internal/clock"
 	"github.com/WillemDeGroef/herdrcron/internal/config"
+	"github.com/WillemDeGroef/herdrcron/internal/dispatch"
 	"github.com/WillemDeGroef/herdrcron/internal/logging"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
 	"github.com/WillemDeGroef/herdrcron/internal/runner"
@@ -44,6 +45,7 @@ type daemon struct {
 	store   *store.Store
 	sched   *scheduler.Scheduler
 	runner  *runner.Runner
+	disp    *dispatch.Dispatcher
 	clk     clock.Clock
 	log     *slog.Logger
 }
@@ -92,8 +94,19 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	if targets == nil {
 		targets = realTargets(cfg)
 	}
-	d.runner = runner.New(runner.Options{Clock: clk, Store: st, Targets: targets, Config: cfg, ConfigDir: p.ConfigDir, Log: log})
-	d.sched = scheduler.New(scheduler.Options{Clock: clk, Store: st, Runs: d.runner, Config: cfg, Log: log})
+	d.runner = runner.New(runner.Options{
+		Clock: clk, Store: st, Targets: targets, Config: cfg, ConfigDir: p.ConfigDir, Log: log,
+		// d.disp is set before any run can start or end.
+		OnEnd: func(ctx context.Context, run store.Run) { d.disp.RunEnded(ctx, run) },
+	})
+	d.disp = dispatch.New(dispatch.Options{Runs: d.runner, Store: st, Config: cfg, Log: log})
+	d.sched = scheduler.New(scheduler.Options{Clock: clk, Store: st, Runs: d.disp, Config: cfg, Log: log})
+	// Recover open runs before the scheduler reads task_state: a catch-up
+	// fire must see a recovered run as active and follow overlap.
+	if err := d.runner.Recover(ctx, validTasks(tasks)); err != nil {
+		log.Error("cannot recover open runs", "err", err)
+		return err
+	}
 	if err := d.sched.SetTasks(ctx, tasks); err != nil {
 		log.Error("cannot schedule tasks", "err", err)
 		return err
@@ -110,6 +123,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	srv.Handle(api.MethodTasksList, d.tasksList)
 	srv.Handle(api.MethodTasksRunNow, d.tasksRunNow)
 	srv.Handle(api.MethodRunsList, d.runsList)
+	srv.Handle(api.MethodRunsStop, d.runsStop)
 	log.Info("daemon listening", "socket", p.Socket())
 	if opts.OnListening != nil {
 		opts.OnListening(p.Socket())
@@ -132,6 +146,17 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	<-runnerDone
 	log.Info("daemon stopped")
 	return err
+}
+
+// validTasks returns the tasks whose files loaded without error.
+func validTasks(entries []config.TaskEntry) []config.Task {
+	var out []config.Task
+	for _, e := range entries {
+		if e.Err == nil {
+			out = append(out, e.Task)
+		}
+	}
+	return out
 }
 
 // realTargets returns the targets runs can use. Only local exists so far;
@@ -231,7 +256,9 @@ func (d *daemon) tasksList(ctx context.Context, _ json.RawMessage) (any, error) 
 }
 
 // tasksRunNow starts a manual run of a valid task, whether or not it is
-// enabled or paused (spec rule 6).
+// enabled or paused (spec rule 6). It follows the task's overlap: with skip
+// and an active run it fails with CodeRunActive unless force_parallel is
+// set; with queue it may only queue the fire.
 func (d *daemon) tasksRunNow(ctx context.Context, params json.RawMessage) (any, error) {
 	var p api.RunNowParams
 	if err := decodeParams(params, &p); err != nil {
@@ -248,11 +275,39 @@ func (d *daemon) tasksRunNow(ctx context.Context, params json.RawMessage) (any, 
 	if e.Err != nil {
 		return nil, &api.Error{Code: api.CodeInvalidParams, Message: fmt.Sprintf("task %s is invalid: %v", e.ID, e.Err)}
 	}
-	// p.ForceParallel is accepted but not acted on: overlap handling does
-	// not exist yet, so every run_now starts a run.
-	run, err := d.runner.Start(ctx, e.Task, store.TriggerManual, time.Time{})
-	if err != nil {
+	out, err := d.disp.Submit(ctx, e.Task, store.TriggerManual, time.Time{}, p.ForceParallel)
+	switch {
+	case errors.Is(err, dispatch.ErrActive):
+		return nil, &api.Error{Code: api.CodeRunActive,
+			Message: fmt.Sprintf("task %s has an active run (overlap: skip)", e.ID)}
+	case err != nil:
 		return nil, fmt.Errorf("start run of %s: %w", e.ID, err)
+	case out.Run.ID != "":
+		return api.RunNowResult{RunSummary: *runSummary(out.Run)}, nil
+	case out.Skipped:
+		// overlap queue with a fire already pending: this one is dropped.
+		return nil, &api.Error{Code: api.CodeRunActive,
+			Message: fmt.Sprintf("task %s has an active run and a queued fire (overlap: queue)", e.ID)}
+	}
+	return api.RunNowResult{RunSummary: api.RunSummary{TaskID: e.ID, Target: e.Task.Target, Trigger: store.TriggerManual}, Queued: true}, nil
+}
+
+// runsStop stops an active run and returns it once the stop sequence is
+// done: status stopped, output tail saved, tab closed.
+func (d *daemon) runsStop(ctx context.Context, params json.RawMessage) (any, error) {
+	var p api.RunsStopParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if p.RunID == "" {
+		return nil, api.InvalidParams(errors.New("run_id is required"))
+	}
+	run, err := d.runner.Stop(ctx, p.RunID)
+	if errors.Is(err, runner.ErrNotActive) {
+		return nil, api.InvalidParams(fmt.Errorf("run %s is not active", p.RunID))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stop run %s: %w", p.RunID, err)
 	}
 	return runSummary(run), nil
 }

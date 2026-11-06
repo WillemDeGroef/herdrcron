@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/config"
 )
@@ -99,6 +100,28 @@ func TestLoadHistoryDays(t *testing.T) {
 	writeFile(t, path, "history_days: -1\n")
 	if _, err := config.Load(path); err == nil {
 		t.Error("history_days -1: want error")
+	}
+}
+
+func TestLoadCatchUpWindow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CatchUpWindow.Duration != 24*time.Hour {
+		t.Errorf("default CatchUpWindow = %s, want 24h", cfg.CatchUpWindow.Duration)
+	}
+	writeFile(t, path, "catch_up_window: 6h\n")
+	if cfg, err = config.Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CatchUpWindow.Duration != 6*time.Hour {
+		t.Errorf("CatchUpWindow = %s, want 6h", cfg.CatchUpWindow.Duration)
+	}
+	writeFile(t, path, "catch_up_window: -1h\n")
+	if _, err := config.Load(path); err == nil {
+		t.Error("catch_up_window -1h: want error")
 	}
 }
 

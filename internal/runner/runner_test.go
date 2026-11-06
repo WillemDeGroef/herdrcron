@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,14 +29,19 @@ type env struct {
 	herdr     *fakeHerdr
 	runner    *runner.Runner
 	configDir string
+	dbPath    string
 	log       *bytes.Buffer
+
+	mu    sync.Mutex
+	ended []store.Run // runs passed to OnEnd
 }
 
 const prompt = "Update the deps.\nSay \"done\" and 'stop'."
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "herdrcron.db"))
+	dbPath := filepath.Join(t.TempDir(), "herdrcron.db")
+	st, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,21 +54,39 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	e := &env{
-		t: t, ctx: context.Background(), store: st, herdr: newFakeHerdr(), configDir: dir,
+		t: t, ctx: context.Background(), store: st, herdr: newFakeHerdr(), configDir: dir, dbPath: dbPath,
 		clock: clock.NewFake(time.Date(2026, 11, 6, 7, 0, 0, 0, time.UTC)),
 		log:   &bytes.Buffer{},
 	}
-	e.runner = runner.New(runner.Options{
+	e.runner = e.newRunner()
+	return e
+}
+
+// newRunner returns a runner on the env's store, fake herdr and clock, as
+// a restarted daemon would make it.
+func (e *env) newRunner() *runner.Runner {
+	return runner.New(runner.Options{
 		Clock:     e.clock,
-		Store:     st,
+		Store:     e.store,
 		Targets:   map[string]target.Target{"local": e.herdr},
 		Config:    config.Config{Timezone: "Europe/Brussels", Targets: map[string]config.Target{"local": {}}},
-		ConfigDir: dir,
+		ConfigDir: e.configDir,
 		Log:       slog.New(slog.NewJSONHandler(e.log, nil)),
 		// The fake server answers at once or never.
 		ServerStartWait: 50 * time.Millisecond,
+		OnEnd: func(_ context.Context, run store.Run) {
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			e.ended = append(e.ended, run)
+		},
 	})
-	return e
+}
+
+// endedRuns returns the runs OnEnd was called with, in order.
+func (e *env) endedRuns() []store.Run {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.ended)
 }
 
 func deps() config.Task {
@@ -530,7 +554,7 @@ func TestRunLogLinesCarryRunTaskAndTarget(t *testing.T) {
 	secondTask := deps()
 	secondTask.ID = "other"
 	second := e.start(secondTask)
-	e.herdr.serverDown = true
+	e.herdr.unreachable = true
 	e.runner.PollTarget(e.ctx, "local")
 
 	wantTask := map[string]string{first.ID: "deps", second.ID: "other"}
