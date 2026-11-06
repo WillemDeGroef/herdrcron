@@ -132,8 +132,8 @@ func (f fieldErrors) err() error {
 // without the prompt file having to exist. Problems are collected by field.
 func (d *daemon) draft(def api.TaskDef, prompt string) (config.Task, fieldErrors) {
 	fe := fieldErrors{}
-	if len(prompt) > config.MaxPromptBytes {
-		fe.add("prompt", config.PromptTooLarge(int64(len(prompt))))
+	if problem := config.CheckPromptSize(int64(len(prompt))); problem != "" {
+		fe.add("prompt", problem)
 	}
 	t, timeoutErr := taskFromDef(def)
 	if timeoutErr != nil {

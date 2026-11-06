@@ -31,6 +31,7 @@ func TestRealHerdrRunEndsDone(t *testing.T) {
 	if _, err := exec.LookPath("herdr"); err != nil {
 		t.Skip("herdr not on PATH")
 	}
+	isolateFromUserHerdr(t)
 	session := fmt.Sprintf("hc-it-%d", os.Getpid())
 	bin := t.TempDir()
 	wrapper := filepath.Join(bin, "herdr")
@@ -107,5 +108,20 @@ func TestRealHerdrRunEndsDone(t *testing.T) {
 	out, _ := exec.Command(wrapper, "tab", "get", got.HerdrTab).CombinedOutput()
 	if !strings.Contains(string(out), "not_found") {
 		t.Errorf("on_done close_tab left tab %s: %s", got.HerdrTab, out)
+	}
+}
+
+// isolateFromUserHerdr unsets every HERDR_* variable for the test, so that
+// no herdr command it runs can reach the user's server through
+// HERDR_SOCKET_PATH (set when the tests run inside a herdr pane).
+func isolateFromUserHerdr(t *testing.T) {
+	t.Helper()
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "HERDR_") {
+			t.Setenv(k, "") // restores the value after the test
+			if err := os.Unsetenv(k); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }

@@ -18,7 +18,7 @@ The spec says all criteria "must pass on the user's machines", so every item als
 | 2 | Same task on a remote target starts there; `a` attaches | verified-by-test (fake ssh); **needs-user** |
 | 3 | Closing the TUI stops no schedule or run | verified-by-test; needs-user sign-off |
 | 4 | TUI toggle, pause, resume, add, edit, delete, run now change the task file | verified-by-test; needs-user sign-off |
-| 5 | A hand edit shows in the open TUI within 2 s | verified-by-test (real daemon) |
+| 5 | A hand edit shows in the open TUI within 2 s | verified-by-test (real daemon); needs-user sign-off |
 | 6 | A run that needs a permission shows `blocked` and sends one notification | verified-by-test (fake herdr, fake notifier); **needs-user** |
 | 7 | A run past its timeout is stopped and shows `timeout` | verified-by-test; needs-user sign-off |
 | 8 | Restarting the daemon during a run starts no duplicate and keeps tracking | verified-by-test; needs-user sign-off |
@@ -73,6 +73,7 @@ The spec says all criteria "must pass on the user's machines", so every item als
 ### 5. A hand edit of a task file shows in the open TUI within 2 s
 
 - [x] verified-by-test: `cmd/herdrcron`: `TestTUIShowsHandEditWithin2s` (real daemon, teatest, 2 s deadline). `internal/daemon`: `TestHandEditReachesSubscribersWithinTwoSeconds`.
+- [ ] needs-user sign-off: with `herdrcron` open, change `schedule:` in `~/.config/herdrcron/tasks/<id>.yaml` in an editor and save. The TUI row shows the new schedule and next fire within 2 s.
 
 ### 6. A run that needs a permission shows `blocked` and sends one notification
 

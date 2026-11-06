@@ -13,7 +13,7 @@ tar xzf herdrcron_<version>_linux_amd64.tar.gz herdrcron
 install -m 0755 herdrcron ~/.local/bin/
 ```
 
-Or build from source with Go 1.24 or newer (no cgo needed; SQLite is pure Go):
+Or build from source with Go 1.24.2 or newer (no cgo needed; SQLite is pure Go):
 
 ```sh
 CGO_ENABLED=0 go install github.com/WillemDeGroef/herdrcron/cmd/herdrcron@latest
@@ -96,7 +96,7 @@ Each run opens a tab labelled `hc-<task>-<HHMM>` in a workspace labelled `hc-<re
 
 ### Prompt size
 
-Prompts are limited to **131071 bytes**. Linux limits one command-line argument to 128 KiB including its terminating NUL, and the shell in the pane passes the prompt to the agent as one argument. herdrcron refuses a bigger prompt when it validates the task: on load the task shows as `invalid`, and the TUI form and `tasks.create`/`tasks.update` give a field error on the prompt. It does not fall back to typing the prompt into the agent with `herdr pane send-text`: that path has the same per-argument limit, needs a second launch path that waits for the agent's input box, and pasting 128 KiB into a TUI is fragile. Keep long instructions in a file in the repo and point to it from a short prompt. See `docs/herdr-findings.md`, "Prompts above 128 KiB".
+Prompts are limited to **131071 bytes**, on every platform. Linux limits one command-line argument to 128 KiB including its terminating NUL, and the shell in the pane passes the prompt to the agent as one argument. herdrcron refuses a bigger prompt when it validates the task: on load the task shows as `invalid`, and the TUI form and `tasks.create`/`tasks.update` give a field error on the prompt. It does not fall back to typing the prompt into the agent with `herdr pane send-text`: that path has the same per-argument limit, needs a second launch path that waits for the agent's input box, and pasting 128 KiB into a TUI is fragile. Keep long instructions in a file in the repo and point to it from a short prompt. See `docs/herdr-findings.md`, "Prompts above 128 KiB".
 
 ## Remote machines
 

@@ -621,7 +621,27 @@ func TestTasksCreateAndUpdateRefuseAPromptAboveTheArgumentLimit(t *testing.T) {
 	}
 	err = c.Call(context.Background(), api.MethodTasksUpdate,
 		api.TaskWriteParams{ID: def.ID, Version: created.Version, Task: def, Prompt: big}, nil)
-	if f := fieldErrors(t, rpcErr(t, err, api.CodeValidation)); len(f["prompt"]) != 1 {
-		t.Errorf("update: field errors = %v, want one prompt error", f)
+	if f := fieldErrors(t, rpcErr(t, err, api.CodeValidation)); len(f["prompt"]) != 1 || !strings.Contains(f["prompt"][0], "131071") {
+		t.Errorf("update: field errors = %v, want one prompt error naming the limit", f)
+	}
+	promptPath := filepath.Join(p.ConfigDir, "prompts", def.ID+".md")
+	if data, _ := os.ReadFile(promptPath); len(data) != 131071 {
+		t.Errorf("refused update changed the prompt file to %d bytes", len(data))
+	}
+
+	// A hand edit made the prompt too big: an update with a short prompt
+	// fixes it, rather than failing on the file it replaces.
+	write(t, promptPath, big)
+	var detail api.TaskDetail
+	for i := 0; detail.Summary.Error == ""; i++ {
+		if i > 300 {
+			t.Fatal("hand-edited oversized prompt never made the task invalid")
+		}
+		time.Sleep(10 * time.Millisecond)
+		detail = call[api.TaskDetail](t, c, api.MethodTasksGet, api.TaskIDParams{ID: def.ID})
+	}
+	if err := c.Call(context.Background(), api.MethodTasksUpdate,
+		api.TaskWriteParams{ID: def.ID, Version: detail.Version, Task: def, Prompt: "short"}, nil); err != nil {
+		t.Errorf("update with a short prompt over an oversized prompt file: %v", err)
 	}
 }
