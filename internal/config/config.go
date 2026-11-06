@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -16,8 +18,7 @@ import (
 // host. It always exists and needs no entry in config.yaml.
 const LocalTarget = "local"
 
-// Config is the content of config.yaml. Later tickets add the remaining
-// global settings (poll_interval, notify, ...).
+// Config is the content of config.yaml.
 type Config struct {
 	Timezone string `yaml:"timezone"`
 	// HistoryDays is how long run history is kept; default 90.
@@ -27,8 +28,31 @@ type Config struct {
 	// CatchUpWindow is how old a missed fire may be and still be caught
 	// up (missed: run_once); default 24h.
 	CatchUpWindow Duration          `yaml:"catch_up_window"`
+	Notify        Notify            `yaml:"notify"`
 	Targets       map[string]Target `yaml:"targets"`
 }
+
+// Notify is the notify section of config.yaml.
+type Notify struct {
+	// Command is the argv of the notify command; the message is appended
+	// as one more argument. Empty: no notifications.
+	Command []string `yaml:"command"`
+	// On lists the events that notify; omitted means every event.
+	On []string `yaml:"on"`
+}
+
+// Notify events: the run states that notify, and a target that stops
+// answering.
+const (
+	EventBlocked           = "blocked"
+	EventFailed            = "failed"
+	EventTimeout           = "timeout"
+	EventLost              = "lost"
+	EventTargetUnreachable = "target_unreachable"
+)
+
+// NotifyEvents are the valid notify.on values, in the spec's order.
+var NotifyEvents = []string{EventBlocked, EventFailed, EventTimeout, EventLost, EventTargetUnreachable}
 
 // DefaultHistoryDays is the history_days default.
 const DefaultHistoryDays = 90
@@ -95,6 +119,14 @@ func Load(path string) (Config, error) {
 		cfg.CatchUpWindow.Duration = DefaultCatchUpWindow
 	case cfg.CatchUpWindow.Duration < 0:
 		return Config{}, fmt.Errorf("catch_up_window must be > 0, got %s", cfg.CatchUpWindow.Duration)
+	}
+	if cfg.Notify.On == nil {
+		cfg.Notify.On = slices.Clone(NotifyEvents)
+	}
+	for _, ev := range cfg.Notify.On {
+		if !slices.Contains(NotifyEvents, ev) {
+			return Config{}, fmt.Errorf("notify.on: unknown event %q (want one of %s)", ev, strings.Join(NotifyEvents, ", "))
+		}
 	}
 	if _, err := time.LoadLocation(cfg.Timezone); err != nil {
 		return Config{}, fmt.Errorf("config timezone %q: %w", cfg.Timezone, err)

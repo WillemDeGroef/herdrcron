@@ -139,3 +139,60 @@ func TestLocationFallsBackToConfigTimezone(t *testing.T) {
 		t.Error("unknown task timezone: want error")
 	}
 }
+
+func TestLoadNotify(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, `
+notify:
+  command: ["ntfy", "publish", "herdrcron"]
+  on: [blocked, lost]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Notify.Command; len(got) != 3 || got[0] != "ntfy" || got[2] != "herdrcron" {
+		t.Errorf("Notify.Command = %q, want the argv as written", got)
+	}
+	if got := cfg.Notify.On; len(got) != 2 || got[0] != "blocked" || got[1] != "lost" {
+		t.Errorf("Notify.On = %q, want [blocked lost]", got)
+	}
+}
+
+func TestLoadNotifyOnDefaultsToEveryEvent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, "notify:\n  command: [notify-send]\n")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"blocked", "failed", "timeout", "lost", "target_unreachable"}
+	if got := cfg.Notify.On; len(got) != len(want) {
+		t.Fatalf("Notify.On = %q, want %q", got, want)
+	}
+	for i := range want {
+		if cfg.Notify.On[i] != want[i] {
+			t.Errorf("Notify.On = %q, want %q", cfg.Notify.On, want)
+		}
+	}
+}
+
+func TestLoadNotifyEmptyOnNotifiesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, "notify:\n  command: [notify-send]\n  on: []\n")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Notify.On) != 0 {
+		t.Errorf("Notify.On = %q, want none", cfg.Notify.On)
+	}
+}
+
+func TestLoadNotifyRejectsUnknownEvent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, "notify:\n  command: [notify-send]\n  on: [blocked, done]\n")
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("Load accepted notify.on: done")
+	}
+}
