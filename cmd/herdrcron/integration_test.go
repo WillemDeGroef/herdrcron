@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/api"
+	"github.com/WillemDeGroef/herdrcron/internal/paths"
 	"github.com/WillemDeGroef/herdrcron/internal/testherdr"
 )
 
@@ -33,16 +34,14 @@ func TestRealHerdrDaemonRunsTask(t *testing.T) {
 		t.Skip("herdr not on PATH")
 	}
 	testherdr.UnsetUserEnv(t)
-	p := xdg(t) // temporary HOME and XDG dirs, shared with the daemon
-	// The daemon's config lives in xdg's tree. herdr sessions go there too
-	// ($XDG_CONFIG_HOME/herdr/sessions), not into the user's config.
-	dirs := testherdr.Dirs{
-		Home:       os.Getenv("HOME"),
-		ConfigHome: os.Getenv("XDG_CONFIG_HOME"),
-		StateHome:  os.Getenv("XDG_STATE_HOME"),
-		CacheHome:  filepath.Join(os.Getenv("HOME"), "cache"),
+	// Temporary HOME and full XDG tree (including XDG_CACHE_HOME) so the
+	// daemon, local PutFile and herdr agree on ~/.cache without touching
+	// the user's config or server.
+	dirs := testherdr.Fresh(t)
+	p, err := paths.FromEnv()
+	if err != nil {
+		t.Fatal(err)
 	}
-	dirs.Apply(t)
 	session := fmt.Sprintf("hc-it-daemon-%d", os.Getpid())
 	wrapper := filepath.Join(t.TempDir(), "herdr")
 	write(t, wrapper, "#!/bin/sh\nexec "+herdr+" --session "+session+" \"$@\"\n")
