@@ -37,7 +37,7 @@ func (c Config) Location(t Task) (*time.Location, error) {
 	}
 	loc, err := time.LoadLocation(name)
 	if err != nil {
-		return nil, fmt.Errorf("timezone %q is unknown", name)
+		return nil, fmt.Errorf("timezone %q: %w", name, err)
 	}
 	return loc, nil
 }

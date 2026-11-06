@@ -92,27 +92,37 @@ type Run struct {
 // Open opens the database at path, creating the file and tables if missing.
 // The parent directory must exist.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// Pragmas go in the DSN so every connection database/sql opens gets them.
+	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(0)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	// One connection: SQLite has one writer anyway, and this avoids
 	// SQLITE_BUSY between connections of the same process.
 	db.SetMaxOpenConns(1)
-	init := []string{
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA foreign_keys = OFF",
-		schema,
-		fmt.Sprintf("PRAGMA user_version = %d", schemaVersion),
-	}
-	for _, stmt := range init {
-		if _, err := db.Exec(stmt); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("init %s: %w", path, err)
-		}
+	if err := migrate(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("init %s: %w", path, err)
 	}
 	return &Store{db: db}, nil
+}
+
+// migrate creates the tables, and refuses a database written by a newer
+// schema.
+func migrate(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version > schemaVersion {
+		return fmt.Errorf("database schema version %d is newer than this herdrcron (%d)", version, schemaVersion)
+	}
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	_, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion))
+	return err
 }
 
 // Close closes the database.
@@ -319,6 +329,37 @@ func (s *Store) PutTaskState(ctx context.Context, st TaskState) error {
 		st.TaskID, lastRun, timeValue(st.NextFireAt), timeValue(st.LastFireAt))
 	if err != nil {
 		return fmt.Errorf("put task state %s: %w", st.TaskID, err)
+	}
+	return nil
+}
+
+// SetNextFire sets the task's next_fire_at (zero: none) and keeps the rest
+// of its state.
+func (s *Store) SetNextFire(ctx context.Context, taskID string, next time.Time) error {
+	if taskID == "" {
+		return errors.New("set next fire: empty task id")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO task_state (task_id, next_fire_at) VALUES (?, ?)
+		ON CONFLICT (task_id) DO UPDATE SET next_fire_at = excluded.next_fire_at`,
+		taskID, timeValue(next))
+	if err != nil {
+		return fmt.Errorf("set next fire %s: %w", taskID, err)
+	}
+	return nil
+}
+
+// RecordFire sets the task's last_run_id and last_fire_at and keeps its
+// next_fire_at.
+func (s *Store) RecordFire(ctx context.Context, taskID, runID string, firedAt time.Time) error {
+	if taskID == "" {
+		return errors.New("record fire: empty task id")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO task_state (task_id, last_run_id, last_fire_at) VALUES (?, ?, ?)
+		ON CONFLICT (task_id) DO UPDATE SET
+		last_run_id = excluded.last_run_id, last_fire_at = excluded.last_fire_at`,
+		taskID, runID, timeValue(firedAt))
+	if err != nil {
+		return fmt.Errorf("record fire %s: %w", taskID, err)
 	}
 	return nil
 }

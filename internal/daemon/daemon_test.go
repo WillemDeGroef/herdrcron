@@ -287,7 +287,7 @@ func TestScheduledFireShowsAsLastRunAndMovesNext(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		got := listByID(t, c)["nightly"]
-		if got.LastRun != nil {
+		if got.LastRun != nil && got.LastRun.EndedAt != "" {
 			if got.LastRun.Status != "done" || got.LastRun.Trigger != "schedule" ||
 				got.LastRun.ScheduledAt != "2026-11-06T23:00:00Z" || len(got.LastRun.ID) != 26 {
 				t.Errorf("last run = %+v", got.LastRun)
@@ -298,7 +298,7 @@ func TestScheduledFireShowsAsLastRunAndMovesNext(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("no run recorded after the fire time")
+			t.Fatal("no ended run recorded after the fire time")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

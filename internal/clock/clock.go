@@ -60,12 +60,20 @@ func (f *Fake) After(d time.Duration) <-chan time.Time {
 }
 
 // Advance moves the clock forward by d and fires the waiters that are due.
-func (f *Fake) Advance(d time.Duration) { f.Set(f.Now().Add(d)) }
+func (f *Fake) Advance(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.set(f.now.Add(d))
+}
 
 // Set moves the clock to t and fires the waiters that are due.
 func (f *Fake) Set(t time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.set(t)
+}
+
+func (f *Fake) set(t time.Time) {
 	f.now = t
 	kept := f.waiters[:0]
 	for _, w := range f.waiters {
@@ -78,8 +86,9 @@ func (f *Fake) Set(t time.Time) {
 	f.waiters = kept
 }
 
-// Waiters returns the number of pending After calls. Tests use it to wait
-// until the code under test is blocked on the clock.
+// Waiters returns the number of pending After calls, including ones whose
+// caller stopped listening. Tests use it to wait until the code under test
+// is blocked on the clock.
 func (f *Fake) Waiters() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

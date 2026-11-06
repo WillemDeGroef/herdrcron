@@ -21,6 +21,11 @@ import (
 // NTP step) delays a fire by at most this much.
 const maxWait = time.Minute
 
+// lateGrace is how late a fire may start and still count as on time. A
+// fire time further in the past (the host slept, the daemon stalled) is a
+// missed fire and does not start a scheduled run.
+const lateGrace = time.Minute
+
 // pruneEvery is how often run history is pruned.
 const pruneEvery = time.Hour
 
@@ -29,7 +34,7 @@ type Options struct {
 	Clock   clock.Clock
 	Store   *store.Store
 	Targets map[string]target.Target // by target name
-	Config  config.Config            // timezone fallback and history_days
+	Config  config.Config            // as loaded: timezone fallback and history_days
 	Log     *slog.Logger
 }
 
@@ -49,6 +54,7 @@ type Scheduler struct {
 
 type entry struct {
 	task  config.Task
+	loc   string // time zone name
 	sched schedule.Schedule
 	next  time.Time
 }
@@ -63,15 +69,22 @@ func New(o Options) *Scheduler {
 }
 
 // SetTasks replaces the task list. Valid, enabled tasks get a next_fire_at
-// computed from now in their time zone; off and invalid tasks get none.
-// The result is written to task_state.
+// in their time zone; off and invalid tasks get none. A task that was
+// already scheduled with the same schedule and time zone keeps its next
+// fire time; any other task's is computed from now. The result is written
+// to task_state.
+//
+// SetTasks overwrites the next_fire_at stored by an earlier daemon, so the
+// missed-fire check on start must read task_state before calling it.
 func (s *Scheduler) SetTasks(ctx context.Context, entries []config.TaskEntry) error {
 	now := s.clock.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	tasks := make(map[string]*entry, len(entries))
 	for _, e := range entries {
 		var next time.Time
 		if e.Err == nil && e.Task.Enabled {
-			en, err := s.newEntry(e.Task, now)
+			en, err := s.newEntry(e.Task, now, s.tasks[e.ID])
 			if err != nil {
 				// Validation parses the schedule too, so this is a bug or a
 				// race with a hand edit; the task just does not fire.
@@ -81,13 +94,11 @@ func (s *Scheduler) SetTasks(ctx context.Context, entries []config.TaskEntry) er
 				next = en.next
 			}
 		}
-		if err := s.putNext(ctx, e.ID, next); err != nil {
+		if err := s.store.SetNextFire(ctx, e.ID, next); err != nil {
 			return err
 		}
 	}
-	s.mu.Lock()
 	s.tasks = tasks
-	s.mu.Unlock()
 	select {
 	case s.reload <- struct{}{}:
 	default:
@@ -95,7 +106,9 @@ func (s *Scheduler) SetTasks(ctx context.Context, entries []config.TaskEntry) er
 	return nil
 }
 
-func (s *Scheduler) newEntry(t config.Task, now time.Time) (*entry, error) {
+// newEntry schedules t. It keeps the next fire time of old, the task's
+// current entry, if the schedule and time zone did not change.
+func (s *Scheduler) newEntry(t config.Task, now time.Time, old *entry) (*entry, error) {
 	loc, err := s.cfg.Location(t)
 	if err != nil {
 		return nil, err
@@ -104,21 +117,11 @@ func (s *Scheduler) newEntry(t config.Task, now time.Time) (*entry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("schedule %q: %w", t.Schedule, err)
 	}
-	return &entry{task: t, sched: sched, next: sched.Next(now)}, nil
-}
-
-// putNext stores next as the task's next_fire_at and keeps the rest of its
-// task_state.
-func (s *Scheduler) putNext(ctx context.Context, id string, next time.Time) error {
-	st, _, err := s.store.GetTaskState(ctx, id)
-	if err != nil {
-		return fmt.Errorf("task %s: %w", id, err)
+	en := &entry{task: t, loc: loc.String(), sched: sched, next: sched.Next(now)}
+	if old != nil && old.task.Schedule == t.Schedule && old.loc == en.loc && !old.next.IsZero() {
+		en.next = old.next
 	}
-	st.TaskID, st.NextFireAt = id, next
-	if err := s.store.PutTaskState(ctx, st); err != nil {
-		return fmt.Errorf("task %s: %w", id, err)
-	}
-	return nil
+	return en, nil
 }
 
 // NextFire returns the task's next fire time, or false if it has none (off,
@@ -144,19 +147,21 @@ func (s *Scheduler) Tick(ctx context.Context) time.Time {
 	type due struct {
 		e           *entry
 		scheduledAt time.Time
+		next        time.Time
 	}
 	var fire []due
 	s.mu.Lock()
 	for _, e := range s.tasks {
 		if !e.next.IsZero() && !e.next.After(now) {
-			fire = append(fire, due{e, e.next})
-			e.next = e.sched.Next(now)
+			d := due{e: e, scheduledAt: e.next, next: e.sched.Next(now)}
+			e.next = d.next
+			fire = append(fire, d)
 		}
 	}
 	s.mu.Unlock()
 
 	for _, d := range fire {
-		s.fire(ctx, d.e.task, d.scheduledAt, d.e.next, now)
+		s.fire(ctx, d.e, d.scheduledAt, d.next, now)
 	}
 
 	s.mu.Lock()
@@ -170,26 +175,37 @@ func (s *Scheduler) Tick(ctx context.Context) time.Time {
 	return wake
 }
 
-// fire starts one scheduled run of t, unless t is paused, and records the
-// fire in task_state.
-func (s *Scheduler) fire(ctx context.Context, t config.Task, scheduledAt, next, now time.Time) {
+// fire handles one fire time of e: it starts a scheduled run unless the
+// task is paused or the fire is missed, and records it in task_state.
+func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now time.Time) {
+	t := e.task
 	log := s.log.With("task_id", t.ID, "target", t.Target)
-	st, _, err := s.store.GetTaskState(ctx, t.ID)
-	if err != nil {
-		log.Error("cannot read task state", "err", err)
-	}
-	st.TaskID, st.NextFireAt = t.ID, next
-	if paused(t, now) {
+	// The state must be written even when ctx is cancelled mid-fire.
+	wctx := context.WithoutCancel(ctx)
+	switch {
+	case now.Sub(scheduledAt) > lateGrace:
+		// The missed policy (skip or run_once with trigger catch_up) is
+		// not implemented yet; for now a missed fire is only logged.
+		log.Warn("fire missed", "scheduled_at", scheduledAt, "late_by", now.Sub(scheduledAt).String())
+	case paused(t, now):
+		// Paused fire times pass without a run and are not caught up.
 		log.Info("fire skipped: task paused", "scheduled_at", scheduledAt, "paused_until", t.PausedUntil)
-	} else {
+	default:
 		run, err := s.start(ctx, t, store.TriggerSchedule, scheduledAt)
 		if err != nil {
 			log.Error("cannot start run", "err", err)
-		} else {
-			st.LastRunID, st.LastFireAt = run.ID, scheduledAt
+		} else if err := s.store.RecordFire(wctx, t.ID, run.ID, scheduledAt); err != nil {
+			log.Error("cannot write task state", "err", err)
 		}
 	}
-	if err := s.store.PutTaskState(ctx, st); err != nil {
+	// A SetTasks during the run may have replaced the entry; its next fire
+	// time is then already stored.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tasks[t.ID] != e {
+		return
+	}
+	if err := s.store.SetNextFire(wctx, t.ID, next); err != nil {
 		log.Error("cannot write task state", "err", err)
 	}
 }
@@ -211,7 +227,8 @@ func paused(t config.Task, now time.Time) bool {
 //
 // Until the herdr adapter exists, a launch is one Target.Exec of the agent
 // argv, and the run ends when Exec returns: done on success, failed with
-// the error as exit reason.
+// the error as exit reason. It runs inside Tick, so it must stay fast; the
+// herdr adapter launches and then tracks the run by polling.
 func (s *Scheduler) start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
 	tg, ok := s.targets[t.Target]
 	if !ok {
@@ -234,7 +251,7 @@ func (s *Scheduler) start(ctx context.Context, t config.Task, trigger string, sc
 	if err != nil {
 		run.Status, run.ExitReason = store.StatusFailed, err.Error()
 	}
-	if err := s.store.UpdateRun(ctx, run); err != nil {
+	if err := s.store.UpdateRun(context.WithoutCancel(ctx), run); err != nil {
 		return run, err
 	}
 	log.Info("run ended", "status", run.Status, "exit_reason", run.ExitReason)
@@ -252,11 +269,7 @@ func (s *Scheduler) prune(ctx context.Context, now time.Time) {
 	s.nextPrune = now.Add(pruneEvery)
 	s.mu.Unlock()
 
-	days := s.cfg.HistoryDays
-	if days <= 0 {
-		days = config.DefaultHistoryDays
-	}
-	cutoff := now.AddDate(0, 0, -days)
+	cutoff := now.AddDate(0, 0, -s.cfg.HistoryDays)
 	n, err := s.store.DeleteRunsBefore(ctx, cutoff)
 	if err != nil {
 		s.log.Error("cannot prune run history", "err", err)

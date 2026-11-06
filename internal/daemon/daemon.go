@@ -189,7 +189,7 @@ func (d *daemon) tasksList(ctx context.Context, _ json.RawMessage) (any, error) 
 			s.State = api.StateIdle
 		}
 		if next, ok := d.sched.NextFire(e.ID); ok {
-			s.NextFireAt = formatTime(next)
+			s.NextFireAt = apiTime(next)
 		}
 		last, ok, err := d.store.LastRun(ctx, e.ID)
 		if err != nil {
@@ -206,13 +206,13 @@ func (d *daemon) tasksList(ctx context.Context, _ json.RawMessage) (any, error) 
 func runSummary(r store.Run) *api.RunSummary {
 	return &api.RunSummary{
 		ID: r.ID, Trigger: r.Trigger, Status: r.Status,
-		ScheduledAt: formatTime(r.ScheduledAt), StartedAt: formatTime(r.StartedAt),
-		EndedAt: formatTime(r.EndedAt), ExitReason: r.ExitReason,
+		ScheduledAt: apiTime(r.ScheduledAt), StartedAt: apiTime(r.StartedAt),
+		EndedAt: apiTime(r.EndedAt), ExitReason: r.ExitReason,
 	}
 }
 
-// formatTime is RFC 3339 in UTC, or "" for the zero time.
-func formatTime(t time.Time) string {
+// apiTime is RFC 3339 in UTC, or "" for the zero time.
+func apiTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}

@@ -241,17 +241,64 @@ func TestFireRecordsRunAndRecomputesNextFireAt(t *testing.T) {
 	}
 }
 
-func TestLateTickFiresOnceAndSkipsAhead(t *testing.T) {
+func TestSlightlyLateTickStillFires(t *testing.T) {
 	e := newEnv(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
 	e.setTasks(valid(task("hourly", "@hourly")))
-	e.clock.Set(time.Date(2026, 11, 6, 17, 30, 0, 0, time.UTC)) // daemon was asleep
+	e.clock.Set(time.Date(2026, 11, 6, 13, 0, 50, 0, time.UTC))
 	e.sched.Tick(e.ctx)
 	if n := len(e.runs("hourly")); n != 1 {
 		t.Errorf("%d runs, want 1", n)
 	}
+}
+
+// A fire time that passed long ago (the host slept) is a missed fire: it
+// does not start a scheduled run. The missed policy owns it.
+func TestFireTimeLongPastIsMissedNotRun(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
+	e.setTasks(valid(task("hourly", "@hourly")))
+	e.clock.Set(time.Date(2026, 11, 6, 17, 30, 0, 0, time.UTC))
+	e.sched.Tick(e.ctx)
+	if n := len(e.runs("hourly")); n != 0 {
+		t.Errorf("%d runs, want 0", n)
+	}
 	want := time.Date(2026, 11, 6, 18, 0, 0, 0, time.UTC)
 	if got, _ := e.sched.NextFire("hourly"); !got.Equal(want) {
 		t.Errorf("NextFire = %v, want %v", got, want)
+	}
+	if got := e.state("hourly").NextFireAt; !got.Equal(want) {
+		t.Errorf("task_state next_fire_at = %v, want %v", got, want)
+	}
+}
+
+func TestReloadKeepsNextFireOfUnchangedTasks(t *testing.T) {
+	start := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	e := newEnv(t, start)
+	every := task("every", "@every 2h")
+	e.setTasks(valid(every))
+	e.clock.Set(start.Add(90 * time.Minute))
+
+	// Same schedule: the fire stays at 14:00, not now+2h.
+	renamed := every
+	renamed.Name = "renamed"
+	e.setTasks(valid(renamed))
+	if got, _ := e.sched.NextFire("every"); !got.Equal(start.Add(2 * time.Hour)) {
+		t.Errorf("unchanged schedule: NextFire = %v, want 14:00", got)
+	}
+	// New schedule: recomputed from now.
+	changed := every
+	changed.Schedule = "@every 3h"
+	e.setTasks(valid(changed))
+	if got, _ := e.sched.NextFire("every"); !got.Equal(start.Add(90*time.Minute + 3*time.Hour)) {
+		t.Errorf("changed schedule: NextFire = %v, want 16:30", got)
+	}
+	// Disable then enable: recomputed from now.
+	changed.Enabled = false
+	e.setTasks(valid(changed))
+	e.clock.Set(start.Add(2 * time.Hour))
+	changed.Enabled = true
+	e.setTasks(valid(changed))
+	if got, _ := e.sched.NextFire("every"); !got.Equal(start.Add(5 * time.Hour)) {
+		t.Errorf("re-enabled: NextFire = %v, want 17:00", got)
 	}
 }
 
@@ -336,6 +383,10 @@ func TestDSTFallBackBrussels(t *testing.T) {
 func TestOldRunsArePruned(t *testing.T) {
 	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	e := newEnv(t, now)
+	e.config.HistoryDays = 7
+	e.sched = scheduler.New(scheduler.Options{Clock: e.clock, Store: e.store,
+		Targets: map[string]target.Target{"local": e.local}, Config: e.config,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	insert := func(id string, started time.Time, ended bool) {
 		r := store.Run{ID: id, TaskID: "t", Target: "local", Trigger: store.TriggerManual,
 			StartedAt: started, Status: store.StatusRunning}
@@ -346,15 +397,15 @@ func TestOldRunsArePruned(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	insert(store.NewRunID(now.AddDate(0, 0, -91)), now.AddDate(0, 0, -91), true)
-	insert(store.NewRunID(now.AddDate(0, 0, -89)), now.AddDate(0, 0, -89), true)
-	active := store.NewRunID(now.AddDate(0, 0, -95))
-	insert(active, now.AddDate(0, 0, -95), false)
+	insert(store.NewRunID(now.AddDate(0, 0, -8)), now.AddDate(0, 0, -8), true)
+	insert(store.NewRunID(now.AddDate(0, 0, -6)), now.AddDate(0, 0, -6), true)
+	active := store.NewRunID(now.AddDate(0, 0, -30))
+	insert(active, now.AddDate(0, 0, -30), false)
 
 	e.sched.Tick(e.ctx)
 	runs := e.runs("t")
 	if len(runs) != 2 || runs[0].ID != active {
-		t.Errorf("after prune: %+v, want the active and the 89-day-old run", runs)
+		t.Errorf("after prune: %+v, want the active and the 6-day-old run", runs)
 	}
 }
 

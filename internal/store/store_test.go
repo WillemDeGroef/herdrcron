@@ -394,3 +394,47 @@ func assertRunEqual(t *testing.T, got, want store.Run) {
 		t.Errorf("run = %+v, want %+v", got, want)
 	}
 }
+
+func TestSetNextFireAndRecordFireTouchOnlyTheirColumns(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	next := time.Date(2026, 11, 6, 13, 0, 0, 0, time.UTC)
+	if err := s.SetNextFire(ctx, "a", next); err != nil {
+		t.Fatal(err)
+	}
+	assertTaskState(t, s, store.TaskState{TaskID: "a", NextFireAt: next})
+
+	fired := next
+	if err := s.RecordFire(ctx, "a", "01ARZ3NDEKTSV4RRFFQ69G5FAV", fired); err != nil {
+		t.Fatal(err)
+	}
+	assertTaskState(t, s, store.TaskState{TaskID: "a", LastRunID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", NextFireAt: next, LastFireAt: fired})
+
+	// Clearing the next fire keeps the last run and fire.
+	if err := s.SetNextFire(ctx, "a", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	assertTaskState(t, s, store.TaskState{TaskID: "a", LastRunID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", LastFireAt: fired})
+
+	// RecordFire on a task without state creates it.
+	if err := s.RecordFire(ctx, "b", "01ARZ3NDEKTSV4RRFFQ69G5FAW", fired); err != nil {
+		t.Fatal(err)
+	}
+	assertTaskState(t, s, store.TaskState{TaskID: "b", LastRunID: "01ARZ3NDEKTSV4RRFFQ69G5FAW", LastFireAt: fired})
+}
+
+func TestOpenRefusesNewerSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetUserVersionForTest(99); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	if s, err := store.Open(path); err == nil {
+		_ = s.Close()
+		t.Fatal("Open of a database with a newer schema: want error")
+	}
+}
