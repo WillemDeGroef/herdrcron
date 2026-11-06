@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -111,5 +113,193 @@ func TestUnknownCommand(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "usage") {
 		t.Errorf("stderr = %q", errOut.String())
+	}
+}
+
+func TestLogsPrintsAndFiltersByTask(t *testing.T) {
+	p := xdg(t)
+	write(t, p.Log(),
+		`{"time":"2026-11-06T10:00:00Z","level":"INFO","msg":"daemon starting"}`+"\n"+
+			`{"time":"2026-11-06T10:00:01Z","level":"INFO","msg":"run started","run_id":"r1","task_id":"nightly","target":"local"}`+"\n"+
+			`{"time":"2026-11-06T10:00:02Z","level":"INFO","msg":"run started","run_id":"r2","task_id":"other","target":"vps"}`+"\n")
+
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"logs"}, &out, &errOut); code != 0 {
+		t.Fatalf("logs exit %d: %s", code, errOut.String())
+	}
+	if n := strings.Count(out.String(), "\n"); n != 3 {
+		t.Fatalf("want 3 lines, got:\n%s", out.String())
+	}
+
+	out.Reset()
+	if code := run(context.Background(), []string{"logs", "--task", "nightly"}, &out, &errOut); code != 0 {
+		t.Fatalf("logs --task exit %d: %s", code, errOut.String())
+	}
+	want := "2026-11-06T10:00:01Z INFO run started run_id=r1 task_id=nightly target=local\n"
+	if out.String() != want {
+		t.Fatalf("logs --task nightly =\n%q\nwant\n%q", out.String(), want)
+	}
+}
+
+func TestLogsWithoutLogFails(t *testing.T) {
+	xdg(t)
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"logs"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if !strings.Contains(errOut.String(), "no log yet") {
+		t.Errorf("stderr = %q", errOut.String())
+	}
+}
+
+func TestLogsRejectsBadFlags(t *testing.T) {
+	xdg(t)
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"logs", "--bogus"}, &out, &errOut); code != 2 {
+		t.Fatalf("exit %d, want 2", code)
+	}
+}
+
+func TestLogsFollowStopsOnCancel(t *testing.T) {
+	p := xdg(t)
+	write(t, p.Log(), `{"time":"t","level":"INFO","msg":"hello"}`+"\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	var out, errOut bytes.Buffer
+	if code := run(ctx, []string{"logs", "-f"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "hello") {
+		t.Errorf("out = %q", out.String())
+	}
+}
+
+func TestInstallServiceRunsServiceManager(t *testing.T) {
+	xdg(t)
+	var calls []string
+	orig := serviceRunner
+	serviceRunner = func(_ context.Context, name string, args ...string) error {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	t.Cleanup(func() { serviceRunner = orig })
+	// The test binary lives under the temp dir, which install-service
+	// refuses; pretend it was installed.
+	fakeExecutable(t, "/usr/local/bin/herdrcron")
+
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{"install-service"}, &out, &errOut)
+	switch runtime.GOOS {
+	case "linux", "darwin":
+		if code != 0 {
+			t.Fatalf("exit %d: %s", code, errOut.String())
+		}
+		if len(calls) == 0 {
+			t.Fatal("no service manager commands run")
+		}
+	default:
+		if code != 1 {
+			t.Fatalf("exit %d, want 1 on %s", code, runtime.GOOS)
+		}
+	}
+}
+
+func fakeExecutable(t *testing.T, path string) {
+	t.Helper()
+	orig := executable
+	executable = func() (string, error) { return path, nil }
+	t.Cleanup(func() { executable = orig })
+}
+
+func TestInstallServiceHelpDoesNotInstall(t *testing.T) {
+	xdg(t)
+	called := false
+	orig := serviceRunner
+	serviceRunner = func(context.Context, string, ...string) error {
+		called = true
+		return nil
+	}
+	t.Cleanup(func() { serviceRunner = orig })
+
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"install-service", "--help"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d, want 0: %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "install-service") {
+		t.Errorf("stdout = %q, want usage", out.String())
+	}
+	if called {
+		t.Error("service manager was run for --help")
+	}
+}
+
+func TestInstallServiceRejectsArguments(t *testing.T) {
+	xdg(t)
+	called := false
+	orig := serviceRunner
+	serviceRunner = func(context.Context, string, ...string) error {
+		called = true
+		return nil
+	}
+	t.Cleanup(func() { serviceRunner = orig })
+
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"install-service", "now"}, &out, &errOut); code != 2 {
+		t.Fatalf("exit %d, want 2: %s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "unexpected argument") {
+		t.Errorf("stderr = %q", errOut.String())
+	}
+	if called {
+		t.Error("service manager was run for an unexpected argument")
+	}
+}
+
+func TestInstallServicePropagatesServiceError(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("install-service only exercises the service stack on linux and darwin")
+	}
+	xdg(t)
+	boom := errors.New("systemctl boom")
+	orig := serviceRunner
+	serviceRunner = func(context.Context, string, ...string) error { return boom }
+	t.Cleanup(func() { serviceRunner = orig })
+	fakeExecutable(t, "/usr/local/bin/herdrcron")
+
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{"install-service"}, &out, &errOut)
+	if code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	msg := errOut.String()
+	if !strings.Contains(msg, "systemctl boom") {
+		t.Fatalf("stderr = %q, want the wrapped error text", msg)
+	}
+	// Avoid "herdrcron install-service: systemctl …: systemctl …" double-prefix noise.
+	if strings.Count(msg, "install-service:") != 0 {
+		t.Errorf("stderr should not repeat install-service prefix: %q", msg)
+	}
+}
+
+func TestInstallServiceRefusesTempDirBinary(t *testing.T) {
+	xdg(t)
+	called := false
+	orig := serviceRunner
+	serviceRunner = func(context.Context, string, ...string) error {
+		called = true
+		return nil
+	}
+	t.Cleanup(func() { serviceRunner = orig })
+	fakeExecutable(t, filepath.Join(os.TempDir(), "go-build123", "b001", "exe", "herdrcron"))
+
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"install-service"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if !strings.Contains(errOut.String(), "temporary directory") {
+		t.Errorf("stderr lacks the temp-dir explanation: %q", errOut.String())
+	}
+	if called {
+		t.Error("service manager was run for a temp-dir binary")
 	}
 }
