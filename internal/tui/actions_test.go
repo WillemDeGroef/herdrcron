@@ -277,6 +277,48 @@ func TestFilter(t *testing.T) {
 	}
 }
 
+// TestFilterMatchesShownSchedule checks "/" against the schedule the row
+// shows, not only the cron expression stored in the task.
+func TestFilterMatchesShownSchedule(t *testing.T) {
+	m := newTestModel(fixture(), plain())
+	msg := m.load()()
+	loaded, ok := msg.(loadedMsg)
+	if !ok {
+		t.Fatalf("load = %T", msg)
+	}
+	m.applyLoad(loaded)
+	m.filter.SetValue("daily")
+	var ids []string
+	for _, task := range m.visible() {
+		ids = append(ids, task.ID)
+	}
+	if len(ids) != 1 || ids[0] != "nightly-e2e" {
+		t.Fatalf("filter daily = %v, want nightly-e2e", ids)
+	}
+}
+
+// TestTaskChangedRefreshesGlobalPauseBanner checks an external pause_all.
+// The daemon publishes task.changed and no status event; the banner comes
+// from status, so the TUI must re-read it.
+func TestTaskChangedRefreshesGlobalPauseBanner(t *testing.T) {
+	f := fixture()
+	tm := start(t, newTestModel(f, plain()))
+	f.set(api.MethodStatus, api.StatusResult{
+		Version: "dev", UptimeSeconds: 3*24*3600 + 3600,
+		Targets: []api.TargetStatus{
+			{Name: "local", Reachability: "reachable"},
+			{Name: "vps", Reachability: "reachable"},
+			{Name: "buildbox", Reachability: "unreachable"},
+		},
+		GlobalPause: api.GlobalPause{PausedAll: true, PausedTargets: []string{}},
+	})
+	f.push(t, api.EventTaskChanged, api.TaskChangedEvent{ID: "peppol-sh-deps", Task: &api.TaskSummary{
+		ID: "peppol-sh-deps", Target: "local", Schedule: "0 7 * * 1", State: api.StatePaused, Enabled: true,
+	}})
+	waitText(t, tm, "ALL TARGETS PAUSED")
+	finalView(t, tm)
+}
+
 func TestGroupByTarget(t *testing.T) {
 	tm := start(t, newTestModel(fixture(), plain()))
 	tm.Send(key("g"))

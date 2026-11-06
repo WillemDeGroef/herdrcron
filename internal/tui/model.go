@@ -50,7 +50,8 @@ const (
 const reconnectDelay = time.Second
 
 // refreshEvery re-reads the daemon status (uptime, global pause) and
-// re-renders relative times.
+// re-renders relative times. task.changed also re-reads status: pause_all
+// and resume_all publish no status event, only task.changed.
 const refreshEvery = 30 * time.Second
 
 // runsListLimit is how many recent runs the TUI reads to find active runs.
@@ -58,22 +59,24 @@ const runsListLimit = 200
 
 // Model is the Bubble Tea model of the main screen.
 type Model struct {
-	ctx      context.Context
-	backend  Backend
-	now      func() time.Time
-	loc      *time.Location
-	st       styles
-	width    int
-	height   int
-	loaded   bool
-	connErr  string // why the TUI has no live connection to the daemon; empty when it has
-	gen      int    // generation of the current subscription
-	events   <-chan api.Notification
-	cancel   context.CancelFunc // ends the current subscription
-	status   api.StatusResult
-	statusAt time.Time // when status was read, for the uptime
-	tasks    map[string]api.TaskSummary
-	active   map[string]map[string]api.RunSummary // task id → run id → active run
+	ctx            context.Context
+	backend        Backend
+	now            func() time.Time
+	loc            *time.Location
+	st             styles
+	width          int
+	height         int
+	loaded         bool
+	connErr        string // why the TUI has no live connection to the daemon; empty when it has
+	gen            int    // generation of the current subscription
+	events         <-chan api.Notification
+	cancel         context.CancelFunc // ends the current subscription
+	status         api.StatusResult
+	statusAt       time.Time // when status was read, for the uptime
+	statusInFlight bool      // a status read is running
+	statusAgain    bool      // another status read should follow the one in flight
+	tasks          map[string]api.TaskSummary
+	active         map[string]map[string]api.RunSummary // task id → run id → active run
 
 	selected string // id of the selected task
 	offset   int    // first visible row
@@ -149,7 +152,10 @@ type (
 		tasks  []api.TaskSummary
 		runs   []api.RunSummary
 	}
-	statusMsg struct{ status api.StatusResult }
+	statusMsg struct {
+		status api.StatusResult
+		err    error
+	}
 	// doneMsg reports a finished action: text for the message line and
 	// whether to re-read the state. Changed tasks arrive on the stream.
 	doneMsg struct {
@@ -217,11 +223,21 @@ func (m Model) loadStatus() tea.Cmd {
 	ctx, b := m.ctx, m.backend
 	return func() tea.Msg {
 		var s api.StatusResult
-		if err := b.Call(ctx, api.MethodStatus, nil, &s); err != nil {
-			return nil // the next refresh tries again; the stream reports a lost daemon
-		}
-		return statusMsg{s}
+		err := b.Call(ctx, api.MethodStatus, nil, &s)
+		return statusMsg{status: s, err: err}
 	}
+}
+
+// requestStatus reads the daemon status, coalescing a burst of asks into
+// the read already running plus one follow-up. pause_all emits one
+// task.changed per task; one read after the burst is enough for the banner.
+func (m *Model) requestStatus() tea.Cmd {
+	if m.statusInFlight {
+		m.statusAgain = true
+		return nil
+	}
+	m.statusInFlight = true
+	return m.loadStatus()
 }
 
 // Update handles one message.
@@ -261,20 +277,29 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		m.applyLoad(msg)
 		return m, nil
 	case statusMsg:
-		m.status, m.statusAt = msg.status, m.now()
+		m.statusInFlight = false
+		// A burst asked for another read: keep the status from that read,
+		// not from the one that was already running when the burst began.
+		if msg.err == nil && !m.statusAgain {
+			m.status, m.statusAt = msg.status, m.now()
+		}
+		if m.statusAgain {
+			m.statusAgain = false
+			return m, m.requestStatus()
+		}
 		return m, nil
 	case refreshMsg:
 		next := tea.Tick(refreshEvery, func(time.Time) tea.Msg { return refreshMsg{} })
 		if m.connErr != "" {
 			return m, next
 		}
-		return m, tea.Batch(next, m.loadStatus())
+		return m, tea.Batch(next, m.requestStatus())
 	case eventMsg:
 		if msg.gen != m.gen {
 			return m, nil
 		}
-		m.applyEvent(msg.n)
-		return m, waitEvent(m.gen, m.events)
+		cmd := m.applyEvent(msg.n)
+		return m, tea.Batch(waitEvent(m.gen, m.events), cmd)
 	case doneMsg:
 		m.setMessage(msg.text, msg.err)
 		if msg.reload {
@@ -303,23 +328,25 @@ func (m *Model) applyLoad(msg loadedMsg) {
 	}
 }
 
-func (m *Model) applyEvent(n api.Notification) {
+func (m *Model) applyEvent(n api.Notification) tea.Cmd {
 	switch n.Method {
 	case api.EventTaskChanged:
 		var ev api.TaskChangedEvent
 		if json.Unmarshal(n.Params, &ev) != nil {
-			return
+			return nil
 		}
 		if ev.Deleted || ev.Task == nil {
 			delete(m.tasks, ev.ID)
 			delete(m.active, ev.ID)
-			return
+		} else {
+			m.tasks[ev.ID] = *ev.Task
 		}
-		m.tasks[ev.ID] = *ev.Task
+		// pause_all changes the banner and only publishes task.changed.
+		return m.requestStatus()
 	case api.EventRunChanged:
 		var ev api.RunChangedEvent
 		if json.Unmarshal(n.Params, &ev) != nil {
-			return
+			return nil
 		}
 		m.noteRun(ev.Run)
 		if t, ok := m.tasks[ev.Run.TaskID]; ok && (t.LastRun == nil || t.LastRun.ID == ev.Run.ID || t.LastRun.StartedAt <= ev.Run.StartedAt) {
@@ -330,16 +357,17 @@ func (m *Model) applyEvent(n api.Notification) {
 	case api.EventTargetChanged:
 		var ev api.TargetChangedEvent
 		if json.Unmarshal(n.Params, &ev) != nil {
-			return
+			return nil
 		}
 		for i, t := range m.status.Targets {
 			if t.Name == ev.Target.Name {
 				m.status.Targets[i] = ev.Target
-				return
+				return nil
 			}
 		}
 		m.status.Targets = append(m.status.Targets, ev.Target)
 	}
+	return nil
 }
 
 // Run statuses the TUI tells apart (the "status" of api.RunSummary).
@@ -414,7 +442,9 @@ func (m Model) visible() []api.TaskSummary {
 	q := strings.ToLower(strings.TrimSpace(m.filter.Value()))
 	out := make([]api.TaskSummary, 0, len(m.tasks))
 	for _, t := range m.tasks {
-		if q != "" && !strings.Contains(strings.ToLower(strings.Join([]string{t.ID, t.Name, t.Target, t.Schedule, t.State}, " ")), q) {
+		// Match the schedule as stored and as shown ("0 7 * * 1" and "Mon 07:00").
+		shown := strings.Join([]string{t.ID, t.Name, t.Target, t.Schedule, scheduleText(t.Schedule), t.State}, " ")
+		if q != "" && !strings.Contains(strings.ToLower(shown), q) {
 			continue
 		}
 		out = append(out, t)
