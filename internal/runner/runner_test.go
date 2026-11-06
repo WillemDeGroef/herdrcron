@@ -33,7 +33,24 @@ type env struct {
 	log       *bytes.Buffer
 
 	mu    sync.Mutex
-	ended []store.Run // runs passed to OnEnd
+	ended []store.Run    // runs passed to OnEnd
+	notes []notification // Notify calls
+}
+
+type notification struct{ event, message string }
+
+// Notify records a notification; the env is the runner's notifier.
+func (e *env) Notify(event, message string, _ *slog.Logger) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.notes = append(e.notes, notification{event, message})
+}
+
+// notifications returns the Notify calls so far, in order.
+func (e *env) notifications() []notification {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.notes)
 }
 
 const prompt = "Update the deps.\nSay \"done\" and 'stop'."
@@ -74,6 +91,7 @@ func (e *env) newRunner() *runner.Runner {
 		Log:       slog.New(slog.NewJSONHandler(e.log, nil)),
 		// The fake server answers at once or never.
 		ServerStartWait: 50 * time.Millisecond,
+		Notifier:        e,
 		OnEnd: func(_ context.Context, run store.Run) {
 			e.mu.Lock()
 			defer e.mu.Unlock()

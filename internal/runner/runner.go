@@ -22,6 +22,7 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/config"
 	"github.com/WillemDeGroef/herdrcron/internal/herdr"
 	"github.com/WillemDeGroef/herdrcron/internal/logging"
+	"github.com/WillemDeGroef/herdrcron/internal/notify"
 	"github.com/WillemDeGroef/herdrcron/internal/shellquote"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
 	"github.com/WillemDeGroef/herdrcron/internal/target"
@@ -68,7 +69,20 @@ type Options struct {
 	// path (done, lost, failed, stopped, timeout, failed to start), with no
 	// runner lock held.
 	OnEnd func(ctx context.Context, run store.Run)
+	// Notifier, if set, gets the run's notifications: blocked on each
+	// change to blocked, and failed, timeout or lost when the run ends
+	// so. It filters by notify.on itself.
+	Notifier Notifier
 }
+
+// Notifier sends a notification for event (one of config.NotifyEvents).
+// Notify must not block the caller: it is called during polls.
+type Notifier interface {
+	Notify(event, message string, log *slog.Logger)
+}
+
+// notifyEnds are the end statuses that notify; the status is the event.
+var notifyEnds = []string{store.StatusFailed, store.StatusTimeout, store.StatusLost}
 
 // Runner starts and tracks runs. Its methods are safe for concurrent use.
 type Runner struct {
@@ -80,6 +94,7 @@ type Runner struct {
 	waitStart time.Duration
 	targets   map[string]*targetState
 	onEnd     func(context.Context, store.Run)
+	notifier  Notifier
 
 	// stopCtx is the context of stop sequences: Run cancels it when it
 	// returns, and waits for the stops to give up (the runs stay open for
@@ -141,7 +156,7 @@ type activeRun struct {
 func New(o Options) *Runner {
 	r := &Runner{
 		clock: o.Clock, store: o.Store, cfg: o.Config, configDir: o.ConfigDir, log: o.Log,
-		waitStart: o.ServerStartWait, onEnd: o.OnEnd,
+		waitStart: o.ServerStartWait, onEnd: o.OnEnd, notifier: o.Notifier,
 		targets: make(map[string]*targetState, len(o.Targets)),
 		active:  map[string]*activeRun{},
 	}
@@ -604,10 +619,15 @@ func (r *Runner) track(ctx context.Context, ts *targetState, a *activeRun, p her
 		if err := r.store.UpdateRun(ctx, a.run); err != nil {
 			a.log.Error("cannot store run status", "err", err)
 		}
+		// Only on the change: a run recovered as blocked was notified
+		// before the restart.
+		if status == store.StatusBlocked {
+			r.notify(a, config.EventBlocked)
+		}
 	}
 	// On every blocked sample, not only on the change: a run recovered as
 	// blocked has no change. Polls skip a run being stopped, and beginStop
-	// starts at most one stop. Notifying on blocked is a later ticket.
+	// starts at most one stop.
 	if status == store.StatusBlocked && a.task.OnBlocked == "stop" {
 		r.beginStop(a, store.StatusStopped, "blocked (on_blocked: stop)")
 	}
@@ -659,6 +679,9 @@ func (r *Runner) end(ctx context.Context, a *activeRun, status, reason string) (
 	a.run.Status, a.run.ExitReason, a.run.EndedAt = status, reason, r.clock.Now()
 	err := r.store.UpdateRun(ctx, a.run)
 	a.log.Info("run ended", "status", status, "exit_reason", reason)
+	if slices.Contains(notifyEnds, status) {
+		r.notify(a, status)
+	}
 	if r.onEnd != nil {
 		defer r.onEnd(ctx, a.run)
 	}
@@ -680,6 +703,13 @@ func (r *Runner) end(ctx context.Context, a *activeRun, status, reason string) (
 		}
 	}
 	return a.run, err
+}
+
+// notify sends the notification for event about a's run as it is now.
+func (r *Runner) notify(a *activeRun, event string) {
+	if r.notifier != nil {
+		r.notifier.Notify(event, notify.RunMessage(a.run), a.log)
+	}
 }
 
 // Stop stops an active run at the user's request (step 10): status

@@ -19,6 +19,7 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/config"
 	"github.com/WillemDeGroef/herdrcron/internal/dispatch"
 	"github.com/WillemDeGroef/herdrcron/internal/logging"
+	"github.com/WillemDeGroef/herdrcron/internal/notify"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
 	"github.com/WillemDeGroef/herdrcron/internal/runner"
 	"github.com/WillemDeGroef/herdrcron/internal/scheduler"
@@ -104,9 +105,13 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	if targets == nil {
 		targets = realTargets(cfg)
 	}
+	notifier := notify.New(cfg.Notify, log)
+	// Let notifications already started reach the user before exiting.
+	defer notifier.Wait()
 	d.runner = runner.New(runner.Options{
 		Clock: clk, Store: st, Targets: targets, Config: cfg, ConfigDir: p.ConfigDir, Log: log,
-		OnEnd: func(ctx context.Context, run store.Run) { d.disp.RunEnded(ctx, run) },
+		OnEnd:    func(ctx context.Context, run store.Run) { d.disp.RunEnded(ctx, run) },
+		Notifier: notifier,
 	})
 	d.disp = dispatch.New(dispatch.Options{Runs: d.runner, Store: st, Config: cfg, Log: log})
 	d.sched = scheduler.New(scheduler.Options{
