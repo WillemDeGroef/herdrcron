@@ -59,7 +59,9 @@ func TestFakeRemoveFile(t *testing.T) {
 		t.Errorf("RemoveFile recorded calls: %q", f.Calls())
 	}
 	boom := errors.New("boom")
-	f.PutFile(ctx, "/tmp/q.md", []byte("x"))
+	if err := f.PutFile(ctx, "/tmp/q.md", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
 	f.SetErr(boom)
 	if err := f.RemoveFile(ctx, "/tmp/q.md"); !errors.Is(err, boom) {
 		t.Errorf("RemoveFile err = %v, want boom", err)

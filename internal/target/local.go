@@ -72,13 +72,13 @@ func (*Local) PutFile(_ context.Context, path string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("put file: %w", err)
 	}
-	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	defer func() { _ = os.Remove(tmp.Name()) }() // no-op after a successful rename
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("put file: %w", err)
 	}
 	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("put file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
