@@ -38,6 +38,17 @@ commands:
                     print the daemon log; -f follows it, --task filters by task
   install-service   install and start the daemon as a systemd user service
                     (Linux) or launchd agent (macOS)
+  enable <id>       turn a task on (enabled: true)
+  disable <id>      turn a task off (enabled: false)
+  pause <id> [--until T]
+                    pause a task until T (RFC 3339, or local time as
+                    2026-11-10T08:00, "2026-11-10 08:00" or 2026-11-10),
+                    or indefinitely without --until
+  resume <id>       end a task's pause
+  pause --all [--target NAME]
+                    pause every task, or every task on one target
+  resume --all [--target NAME]
+                    end a global pause (of every target, or of one target)
 `
 
 // serviceRunner runs systemctl/launchctl for install-service; tests swap it.
@@ -81,6 +92,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return runLogs(ctx, p, args[1:], stdout, stderr)
 	case "install-service":
 		return runInstallService(ctx, p, args[1:], stdout, stderr)
+	case "enable", "disable":
+		return runSetEnabled(ctx, p, args[0], args[1:], stdout, stderr)
+	case "pause":
+		return runPause(ctx, p, args[1:], time.Now(), stdout, stderr)
+	case "resume":
+		return runResume(ctx, p, args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -117,17 +134,27 @@ func dial(p paths.Paths, stderr io.Writer) *api.Client {
 	return c
 }
 
-func runList(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
+// callDaemon dials the daemon and makes one call. On failure it writes the
+// error to stderr (with how to start the daemon if it is not running) and
+// returns false.
+func callDaemon(ctx context.Context, p paths.Paths, stderr io.Writer, method string, params, result any) bool {
 	c := dial(p, stderr)
 	if c == nil {
-		return 1
+		return false
 	}
 	defer func() { _ = c.Close() }()
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	if err := c.Call(ctx, method, params, result); err != nil {
+		fmt.Fprintf(stderr, "herdrcron: %s: %v\n", method, err)
+		return false
+	}
+	return true
+}
+
+func runList(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
 	var res api.TasksListResult
-	if err := c.Call(ctx, api.MethodTasksList, nil, &res); err != nil {
-		fmt.Fprintln(stderr, "herdrcron: tasks.list:", err)
+	if !callDaemon(ctx, p, stderr, api.MethodTasksList, nil, &res) {
 		return 1
 	}
 	if len(res.Tasks) == 0 {
@@ -234,6 +261,232 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// parseInterleaved parses args with fl, allowing flags before, between and
+// after positional arguments (the flag package stops at the first
+// positional). Everything after "--" is positional. It returns the
+// positional arguments.
+func parseInterleaved(fl *flag.FlagSet, args []string) ([]string, error) {
+	var pos []string
+	for {
+		if err := fl.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fl.Args()
+		if consumed := len(args) - len(rest); consumed > 0 && args[consumed-1] == "--" {
+			return append(pos, rest...), nil
+		}
+		if len(rest) == 0 {
+			return pos, nil
+		}
+		pos = append(pos, rest[0])
+		args = rest[1:]
+	}
+}
+
+// parseTaskArgs parses the flags of a per-task command and returns its one
+// task id. ok is false after a usage error (already written to stderr);
+// code is then the exit code.
+func parseTaskArgs(fl *flag.FlagSet, cmd string, args []string, stderr io.Writer) (id string, code int, ok bool) {
+	pos, err := parseInterleaved(fl, args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return "", 0, false
+		}
+		return "", 2, false
+	}
+	if len(pos) != 1 {
+		fmt.Fprintf(stderr, "herdrcron %s: want exactly one task id, got %d arguments\n", cmd, len(pos))
+		return "", 2, false
+	}
+	return pos[0], 0, true
+}
+
+func runSetEnabled(ctx context.Context, p paths.Paths, cmd string, args []string, stdout, stderr io.Writer) int {
+	fl := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	fl.SetOutput(stderr)
+	id, code, ok := parseTaskArgs(fl, cmd, args, stderr)
+	if !ok {
+		return code
+	}
+	var t api.TaskSummary
+	if !callDaemon(ctx, p, stderr, api.MethodTasksSetEnabled, api.SetEnabledParams{ID: id, Enabled: cmd == "enable"}, &t) {
+		return 1
+	}
+	if t.State == api.StateOff {
+		fmt.Fprintf(stdout, "%s: off\n", t.ID)
+	} else {
+		fmt.Fprintf(stdout, "%s: enabled%s\n", t.ID, taskOutlook(t, time.Local))
+	}
+	return 0
+}
+
+// taskOutlook describes when an enabled task fires next: ", next fire …",
+// or why it does not.
+func taskOutlook(t api.TaskSummary, loc *time.Location) string {
+	switch {
+	case t.State == api.StatePaused && t.PausedUntil != "":
+		return ", " + pausedText(t.PausedUntil, loc)
+	case t.State == api.StatePaused:
+		return ", paused by a global pause"
+	case t.NextFireAt != "":
+		return ", next fire " + nextFire(t.NextFireAt, loc)
+	case t.State != "" && t.State != api.StateIdle:
+		return " (" + t.State + ")"
+	}
+	return ""
+}
+
+// pausedText describes a paused_until value.
+func pausedText(until string, loc *time.Location) string {
+	if until == api.PauseIndefinite {
+		return "paused indefinitely"
+	}
+	return "paused until " + nextFire(until, loc)
+}
+
+func runPause(ctx context.Context, p paths.Paths, args []string, now time.Time, stdout, stderr io.Writer) int {
+	fl := flag.NewFlagSet("pause", flag.ContinueOnError)
+	fl.SetOutput(stderr)
+	all := fl.Bool("all", false, "pause every task (a global pause)")
+	target := fl.String("target", "", "with --all: pause only the tasks on this target")
+	until := fl.String("until", "", "pause until this time instead of indefinitely")
+	pos, err := parseInterleaved(fl, args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	set := map[string]bool{}
+	fl.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	if *all {
+		if len(pos) > 0 {
+			fmt.Fprintf(stderr, "herdrcron pause: --all takes no task id (got %q)\n", pos[0])
+			return 2
+		}
+		if set["until"] {
+			fmt.Fprintln(stderr, "herdrcron pause: --until is not supported with --all")
+			return 2
+		}
+		return runGlobalPause(ctx, p, api.MethodPauseAll, *target, stdout, stderr)
+	}
+	if set["target"] {
+		fmt.Fprintln(stderr, "herdrcron pause: --target needs --all")
+		return 2
+	}
+	if len(pos) != 1 {
+		fmt.Fprintf(stderr, "herdrcron pause: want exactly one task id, got %d arguments\n", len(pos))
+		return 2
+	}
+	params := api.PauseParams{ID: pos[0], Until: api.PauseIndefinite}
+	if set["until"] {
+		params.Until, err = parseUntil(*until, now, time.Local)
+		if err != nil {
+			fmt.Fprintln(stderr, "herdrcron pause: --until:", err)
+			return 2
+		}
+	}
+	var t api.TaskSummary
+	if !callDaemon(ctx, p, stderr, api.MethodTasksPause, params, &t) {
+		return 1
+	}
+	if t.PausedUntil != "" {
+		fmt.Fprintf(stdout, "%s: %s\n", t.ID, pausedText(t.PausedUntil, time.Local))
+	} else {
+		fmt.Fprintf(stdout, "%s: %s\n", t.ID, t.State)
+	}
+	return 0
+}
+
+func runResume(ctx context.Context, p paths.Paths, args []string, stdout, stderr io.Writer) int {
+	fl := flag.NewFlagSet("resume", flag.ContinueOnError)
+	fl.SetOutput(stderr)
+	all := fl.Bool("all", false, "end the global pause")
+	target := fl.String("target", "", "with --all: end only the pause of this target")
+	pos, err := parseInterleaved(fl, args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	targetSet := false
+	fl.Visit(func(f *flag.Flag) { targetSet = targetSet || f.Name == "target" })
+	if *all {
+		if len(pos) > 0 {
+			fmt.Fprintf(stderr, "herdrcron resume: --all takes no task id (got %q)\n", pos[0])
+			return 2
+		}
+		return runGlobalPause(ctx, p, api.MethodResumeAll, *target, stdout, stderr)
+	}
+	if targetSet {
+		fmt.Fprintln(stderr, "herdrcron resume: --target needs --all")
+		return 2
+	}
+	if len(pos) != 1 {
+		fmt.Fprintf(stderr, "herdrcron resume: want exactly one task id, got %d arguments\n", len(pos))
+		return 2
+	}
+	var t api.TaskSummary
+	if !callDaemon(ctx, p, stderr, api.MethodTasksResume, api.TaskIDParams{ID: pos[0]}, &t) {
+		return 1
+	}
+	if t.State == api.StateOff {
+		fmt.Fprintf(stdout, "%s: resumed, but off (enable it with `herdrcron enable %s`)\n", t.ID, t.ID)
+	} else {
+		fmt.Fprintf(stdout, "%s: resumed%s\n", t.ID, taskOutlook(t, time.Local))
+	}
+	return 0
+}
+
+func runGlobalPause(ctx context.Context, p paths.Paths, method, target string, stdout, stderr io.Writer) int {
+	var gp api.GlobalPause
+	if !callDaemon(ctx, p, stderr, method, api.TargetParams{Target: target}, &gp) {
+		return 1
+	}
+	fmt.Fprintln(stdout, formatGlobalPause(gp))
+	return 0
+}
+
+// formatGlobalPause describes the daemon's global pause in one line.
+func formatGlobalPause(gp api.GlobalPause) string {
+	switch {
+	case gp.PausedAll:
+		return "paused: all targets"
+	case len(gp.PausedTargets) > 0:
+		return "paused targets: " + strings.Join(gp.PausedTargets, ", ")
+	}
+	return "no global pause"
+}
+
+// untilLayouts are the zone-less forms --until accepts, read in local time.
+var untilLayouts = []string{"2006-01-02T15:04", "2006-01-02T15:04:05", "2006-01-02 15:04", "2006-01-02"}
+
+// parseUntil turns a --until value into an RFC 3339 time after now. s is
+// RFC 3339 with a zone, or one of untilLayouts read in loc.
+func parseUntil(s string, now time.Time, loc *time.Location) (string, error) {
+	if s == "" {
+		return "", errors.New("empty time")
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		parsed := false
+		for _, layout := range untilLayouts {
+			if lt, lerr := time.ParseInLocation(layout, s, loc); lerr == nil {
+				t, parsed = lt, true
+				break
+			}
+		}
+		if !parsed {
+			return "", fmt.Errorf("cannot read %q as a time; use RFC 3339 (2026-11-10T08:00:00Z) or local 2026-11-10T08:00, \"2026-11-10 08:00\" or 2026-11-10", s)
+		}
+	}
+	if !t.After(now) {
+		return "", fmt.Errorf("%s is in the past", t.Format(time.RFC3339))
+	}
+	return t.Format(time.RFC3339), nil
 }
 
 func runLogs(ctx context.Context, p paths.Paths, args []string, stdout, stderr io.Writer) int {

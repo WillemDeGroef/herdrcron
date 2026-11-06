@@ -1,12 +1,13 @@
 // Package scheduler fires tasks at their schedule's fire times. It keeps
 // next_fire_at per task in the store, starts a run for every fire through
-// a Starter, and prunes run history older than history_days.
+// a Starter (runner.Runner), and prunes run history older than history_days.
 package scheduler
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -44,6 +45,12 @@ type Options struct {
 	Runs   Starter
 	Config config.Config // as loaded: timezone fallback and history_days
 	Log    *slog.Logger
+	// OnPauseExpired is called from Tick when a task's timed paused_until
+	// has passed, including a task that is off or invalid. The daemon
+	// clears it in the task file. It may call SetTask. A non-nil error is
+	// retried later; nil means the pause is done (cleared, or already gone).
+	// A nil func means nothing is called.
+	OnPauseExpired func(ctx context.Context, taskID string) error
 }
 
 // Scheduler fires tasks. Its methods are safe for concurrent use.
@@ -55,9 +62,13 @@ type Scheduler struct {
 	log    *slog.Logger
 	reload chan struct{}
 
+	onPauseExpired func(ctx context.Context, taskID string) error
+
 	mu        sync.Mutex
-	tasks     map[string]*entry // scheduled tasks: valid and enabled
+	tasks     map[string]*entry // enabled tasks, and any task waiting to clear a timed pause
 	nextPrune time.Time
+	pausedAll bool                // global pause of every target
+	pausedOn  map[string]struct{} // global pause by target name
 }
 
 type entry struct {
@@ -65,14 +76,24 @@ type entry struct {
 	loc   string // time zone name
 	sched schedule.Schedule
 	next  time.Time
+	// pauseEnd is when a timed pause should be cleared. Zero means there is
+	// nothing to clear. A failed clear moves it forward so the next attempt
+	// waits instead of spinning: the wake time would otherwise be in the past.
+	pauseEnd time.Time
 }
+
+// pauseClearRetry is how long to wait before clearing paused_until again
+// after the write failed.
+const pauseClearRetry = time.Minute
 
 // New returns a scheduler with no tasks.
 func New(o Options) *Scheduler {
 	return &Scheduler{
 		clock: o.Clock, store: o.Store, runs: o.Runs, cfg: o.Config, log: o.Log,
-		reload: make(chan struct{}, 1),
-		tasks:  map[string]*entry{},
+		reload:         make(chan struct{}, 1),
+		tasks:          map[string]*entry{},
+		pausedOn:       map[string]struct{}{},
+		onPauseExpired: o.OnPauseExpired,
 	}
 }
 
@@ -82,6 +103,10 @@ func New(o Options) *Scheduler {
 // fire time; any other task's is computed from now. The result is written
 // to task_state.
 //
+// A task that is off or invalid is not fired, but a timed pause on it is
+// still watched: when paused_until passes, Tick reports it so the daemon
+// can clear the file.
+//
 // SetTasks overwrites the next_fire_at stored by an earlier daemon, so the
 // missed-fire check on start must read task_state before calling it.
 func (s *Scheduler) SetTasks(ctx context.Context, entries []config.TaskEntry) error {
@@ -90,28 +115,100 @@ func (s *Scheduler) SetTasks(ctx context.Context, entries []config.TaskEntry) er
 	defer s.mu.Unlock()
 	tasks := make(map[string]*entry, len(entries))
 	for _, e := range entries {
-		var next time.Time
-		if e.Err == nil && e.Task.Enabled {
-			en, err := s.newEntry(e.Task, now, s.tasks[e.ID])
-			if err != nil {
-				// Validation parses the schedule too, so this is a bug or a
-				// race with a hand edit; the task just does not fire.
-				s.log.Error("cannot schedule task", "task_id", e.ID, "err", err)
-			} else {
-				tasks[e.ID] = en
-				next = en.next
-			}
+		en, next, err := s.entryFor(e, now, s.tasks[e.ID])
+		if err != nil {
+			// Validation parses the schedule too, so this is a bug or a
+			// race with a hand edit; the task just does not fire.
+			s.log.Error("cannot schedule task", "task_id", e.ID, "err", err)
+			en, next = nil, time.Time{}
+		}
+		if en != nil {
+			tasks[e.ID] = en
 		}
 		if err := s.store.SetNextFire(ctx, e.ID, next); err != nil {
 			return err
 		}
 	}
 	s.tasks = tasks
+	s.wake()
+	return nil
+}
+
+// SetTask replaces one task after an enable, disable, pause, resume or
+// edit. Unlike SetTasks it always computes the next fire time from now. A
+// task that is off or invalid gets no next fire time. A timed pause on it
+// is still watched until it is cleared.
+func (s *Scheduler) SetTask(ctx context.Context, e config.TaskEntry) error {
+	now := s.clock.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tasks, e.ID)
+	en, next, err := s.entryFor(e, now, nil)
+	if err != nil {
+		// As in SetTasks: the task does not fire, and has no next fire.
+		s.log.Error("cannot schedule task", "task_id", e.ID, "err", err)
+		return s.store.SetNextFire(ctx, e.ID, time.Time{})
+	}
+	if en != nil {
+		s.tasks[e.ID] = en
+	}
+	if err := s.store.SetNextFire(ctx, e.ID, next); err != nil {
+		return err
+	}
+	s.wake()
+	return nil
+}
+
+// entryFor returns the scheduler entry for e and the next_fire_at to store.
+// old is the previous entry, used by SetTasks to keep an unchanged fire
+// time; SetTask passes nil so the next fire is computed from now.
+// A task that does not fire is returned only when it has a timed pause to
+// clear, and then its next fire time is zero so Tick will not start it.
+func (s *Scheduler) entryFor(e config.TaskEntry, now time.Time, old *entry) (*entry, time.Time, error) {
+	if e.Err == nil && e.Task.Enabled {
+		en, err := s.newEntry(e.Task, now, old)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		return en, en.next, nil
+	}
+	if end, ok := e.Task.PauseEnd(); ok {
+		return &entry{task: e.Task, pauseEnd: end}, time.Time{}, nil
+	}
+	return nil, time.Time{}, nil
+}
+
+// SetGlobalPause sets the global pause: all pauses every task, targets
+// pauses every task on those targets. Fire times that pass during a global
+// pause start no run and are not caught up.
+func (s *Scheduler) SetGlobalPause(all bool, targets []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pausedAll = all
+	s.pausedOn = make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		s.pausedOn[t] = struct{}{}
+	}
+}
+
+// GloballyPaused reports whether a global pause covers target.
+func (s *Scheduler) GloballyPaused(target string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.globallyPaused(target)
+}
+
+func (s *Scheduler) globallyPaused(target string) bool {
+	_, ok := s.pausedOn[target]
+	return s.pausedAll || ok
+}
+
+// wake makes Run recompute its wake-up time. Call it with s.mu held.
+func (s *Scheduler) wake() {
 	select {
 	case s.reload <- struct{}{}:
 	default:
 	}
-	return nil
 }
 
 // newEntry schedules t. It keeps the next fire time of old, the task's
@@ -126,6 +223,7 @@ func (s *Scheduler) newEntry(t config.Task, now time.Time, old *entry) (*entry, 
 		return nil, fmt.Errorf("schedule %q: %w", t.Schedule, err)
 	}
 	en := &entry{task: t, loc: loc.String(), sched: sched, next: sched.Next(now)}
+	en.pauseEnd, _ = t.PauseEnd()
 	if old != nil && old.task.Schedule == t.Schedule && old.loc == en.loc && !old.next.IsZero() {
 		en.next = old.next
 	}
@@ -144,8 +242,9 @@ func (s *Scheduler) NextFire(id string) (time.Time, bool) {
 	return e.next, true
 }
 
-// Tick fires every task whose fire time has come, prunes old runs when due,
-// and returns the earliest next fire time (zero if no task is scheduled).
+// Tick fires every task whose fire time has come, reports timed pauses that
+// have ended, prunes old runs when due, and returns the earliest next fire
+// time or pause end (zero if there is none).
 // A task fires at most once per Tick, however late the Tick is; its next
 // fire time is then computed from now.
 func (s *Scheduler) Tick(ctx context.Context) time.Time {
@@ -156,12 +255,14 @@ func (s *Scheduler) Tick(ctx context.Context) time.Time {
 		e           *entry
 		scheduledAt time.Time
 		next        time.Time
+		globalPause bool
 	}
 	var fire []due
+	var expired []string
 	s.mu.Lock()
 	for _, e := range s.tasks {
 		if !e.next.IsZero() && !e.next.After(now) {
-			d := due{e: e, scheduledAt: e.next, next: e.sched.Next(now)}
+			d := due{e: e, scheduledAt: e.next, next: e.sched.Next(now), globalPause: s.globallyPaused(e.task.Target)}
 			e.next = d.next
 			fire = append(fire, d)
 		}
@@ -169,23 +270,44 @@ func (s *Scheduler) Tick(ctx context.Context) time.Time {
 	s.mu.Unlock()
 
 	for _, d := range fire {
-		s.fire(ctx, d.e, d.scheduledAt, d.next, now)
+		s.fire(ctx, d.e, d.scheduledAt, d.next, now, d.globalPause)
+	}
+
+	// After the fires: a fire time equal to paused_until is not paused, and
+	// fire has judged it with the entry it had.
+	s.mu.Lock()
+	for id, e := range s.tasks {
+		if !e.pauseEnd.IsZero() && !e.pauseEnd.After(now) {
+			expired = append(expired, id)
+		}
+	}
+	s.mu.Unlock()
+	slices.Sort(expired)
+	for _, id := range expired {
+		var err error
+		if s.onPauseExpired != nil {
+			err = s.onPauseExpired(ctx, id)
+		}
+		s.finishPause(id, now, err)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var wake time.Time
 	for _, e := range s.tasks {
-		if !e.next.IsZero() && (wake.IsZero() || e.next.Before(wake)) {
-			wake = e.next
+		for _, t := range []time.Time{e.next, e.pauseEnd} {
+			if !t.IsZero() && (wake.IsZero() || t.Before(wake)) {
+				wake = t
+			}
 		}
 	}
 	return wake
 }
 
 // fire handles one fire time of e: it starts a scheduled run unless the
-// task is paused or the fire is missed, and records it in task_state.
-func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now time.Time) {
+// task is paused, a global pause covers its target, or the fire is missed,
+// and records it in task_state.
+func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now time.Time, globalPause bool) {
 	t := e.task
 	log := s.log.With(logging.KeyTaskID, t.ID, logging.KeyTarget, t.Target)
 	// The state must be written even when ctx is cancelled mid-fire.
@@ -196,11 +318,21 @@ func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now t
 		// paused_until must not start a fire the pause covered. Those
 		// slots are not missed fires, so nothing catches them up.
 		log.Info("fire skipped: task paused", "scheduled_at", scheduledAt, "paused_until", t.PausedUntil)
+	case globalPause:
+		// Like a task pause: the slot passes and nothing catches it up.
+		log.Info("fire skipped: global pause", "scheduled_at", scheduledAt)
 	case now.Sub(scheduledAt) > lateGrace:
 		// The missed policy (skip or run_once with trigger catch_up) is
 		// not implemented yet; for now a missed fire is only logged.
 		log.Warn("fire missed", "scheduled_at", scheduledAt, "late_by", now.Sub(scheduledAt).String())
 	default:
+		// Tick queued this fire, then dropped the lock. Runner.Start may
+		// block; a pause or disable during an earlier fire in this tick
+		// must still suppress this one.
+		if why := s.fireSuppressed(t.ID, t.Target, scheduledAt); why != "" {
+			log.Info("fire skipped: "+why, "scheduled_at", scheduledAt)
+			break
+		}
 		run, err := s.runs.Start(ctx, t, store.TriggerSchedule, scheduledAt)
 		if run.ID != "" {
 			log = logging.ForRun(s.log, run.ID, t.ID, t.Target)
@@ -225,6 +357,50 @@ func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now t
 	}
 	if err := s.store.SetNextFire(wctx, t.ID, next); err != nil {
 		log.Error("cannot write task state", "err", err)
+	}
+}
+
+// fireSuppressed reports why a queued fire must not start, now that the
+// lock is free again. "" means the fire still stands. The task as queued
+// was not paused and no global pause covered it; this catches a change
+// that landed after that snapshot.
+func (s *Scheduler) fireSuppressed(id, targetName string, scheduledAt time.Time) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.globallyPaused(targetName) {
+		return "global pause"
+	}
+	cur, ok := s.tasks[id]
+	if !ok || !cur.task.Enabled {
+		return "task disabled"
+	}
+	if cur.task.PausedAt(scheduledAt) {
+		return "task paused"
+	}
+	return ""
+}
+
+// finishPause records the result of OnPauseExpired for id. A failed clear
+// is tried again after pauseClearRetry; a success drops the pause so it
+// is reported once. A pause SetTask installed in the meantime (a new end
+// still in the future) is left alone.
+func (s *Scheduler) finishPause(id string, now time.Time, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.tasks[id]
+	due := e != nil && !e.pauseEnd.IsZero() && !e.pauseEnd.After(now)
+	switch {
+	case err != nil:
+		if due {
+			e.pauseEnd = now.Add(pauseClearRetry)
+		}
+		s.log.Error("cannot clear paused_until", logging.KeyTaskID, id, "err", err)
+	case due:
+		e.pauseEnd = time.Time{}
+		s.log.Info("pause ended", logging.KeyTaskID, id)
+	case e == nil || e.pauseEnd.IsZero():
+		// The callback cleared the pause and replaced or dropped the entry.
+		s.log.Info("pause ended", logging.KeyTaskID, id)
 	}
 }
 

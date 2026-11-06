@@ -114,10 +114,7 @@ func LoadTasks(configDir string, cfg Config) ([]TaskEntry, error) {
 		if f.IsDir() || !strings.HasSuffix(f.Name(), ".yaml") {
 			continue
 		}
-		path := filepath.Join(dir, f.Name())
-		e := TaskEntry{ID: strings.TrimSuffix(f.Name(), ".yaml"), File: path}
-		e.Task, e.Err = loadTask(path, e.ID, configDir, cfg)
-		entries = append(entries, e)
+		entries = append(entries, LoadTask(configDir, strings.TrimSuffix(f.Name(), ".yaml"), cfg))
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
 	return entries, nil

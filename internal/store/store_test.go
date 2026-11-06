@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"testing"
@@ -437,4 +438,73 @@ func TestOpenRefusesNewerSchema(t *testing.T) {
 		_ = s.Close()
 		t.Fatal("Open of a database with a newer schema: want error")
 	}
+}
+
+func assertGlobalPause(t *testing.T, s *store.Store, wantAll bool, wantTargets ...string) {
+	t.Helper()
+	all, targets, err := s.GlobalPause(context.Background())
+	if err != nil {
+		t.Fatalf("GlobalPause: %v", err)
+	}
+	if all != wantAll || !slices.Equal(targets, wantTargets) {
+		t.Errorf("GlobalPause = %v, %q; want %v, %q", all, targets, wantAll, wantTargets)
+	}
+}
+
+func TestGlobalPausePerTarget(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	assertGlobalPause(t, s, false)
+	for _, target := range []string{"vps", "local", "vps"} { // pausing twice is fine
+		if err := s.SetGlobalPause(ctx, target, true); err != nil {
+			t.Fatalf("SetGlobalPause(%q, true): %v", target, err)
+		}
+	}
+	assertGlobalPause(t, s, false, "local", "vps")
+	if err := s.SetGlobalPause(ctx, "vps", false); err != nil {
+		t.Fatalf("SetGlobalPause(vps, false): %v", err)
+	}
+	assertGlobalPause(t, s, false, "local")
+	if err := s.SetGlobalPause(ctx, "vps", false); err != nil { // resuming twice is fine
+		t.Fatalf("SetGlobalPause(vps, false) again: %v", err)
+	}
+	assertGlobalPause(t, s, false, "local")
+}
+
+func TestGlobalPauseAllTargets(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	for _, target := range []string{"vps", ""} {
+		if err := s.SetGlobalPause(ctx, target, true); err != nil {
+			t.Fatalf("SetGlobalPause(%q, true): %v", target, err)
+		}
+	}
+	assertGlobalPause(t, s, true, "vps")
+	if err := s.SetGlobalPause(ctx, "", false); err != nil {
+		t.Fatalf("SetGlobalPause(\"\", false): %v", err)
+	}
+	assertGlobalPause(t, s, false) // resuming all clears the per-target pause too
+}
+
+func TestGlobalPauseSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	ctx := context.Background()
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for _, target := range []string{"", "vps"} {
+		if err := s.SetGlobalPause(ctx, target, true); err != nil {
+			t.Fatalf("SetGlobalPause(%q, true): %v", target, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	assertGlobalPause(t, s, true, "vps")
 }
