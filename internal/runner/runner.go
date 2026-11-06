@@ -162,7 +162,7 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 	if !ok {
 		return fmt.Errorf("unknown target %q", t.Target)
 	}
-	cwd, err := r.preflight(ctx, ts, t)
+	cwd, err := r.preflight(ctx, ts, t, a.log)
 	if err != nil {
 		return err
 	}
@@ -287,12 +287,12 @@ pwd`
 // preflight runs step 2 and returns the cwd as resolved on the target. A
 // pass is cached for 10 min: the herdr server per target, the agent
 // command and cwd per target, command and cwd. Failures are not cached.
-func (r *Runner) preflight(ctx context.Context, ts *targetState, t config.Task) (string, error) {
+func (r *Runner) preflight(ctx context.Context, ts *targetState, t config.Task, log *slog.Logger) (string, error) {
 	now := r.clock.Now()
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	if now.After(ts.serverUntil) {
-		if err := r.checkServer(ctx, ts); err != nil {
+		if err := r.checkServer(ctx, ts, log); err != nil {
 			return "", err
 		}
 		ts.serverUntil = now.Add(preflightTTL)
@@ -322,7 +322,7 @@ func (r *Runner) preflight(ctx context.Context, ts *targetState, t config.Task) 
 
 // checkServer checks that the herdr server answers. If it is not running,
 // it starts it once and waits up to waitStart for it to answer.
-func (r *Runner) checkServer(ctx context.Context, ts *targetState) error {
+func (r *Runner) checkServer(ctx context.Context, ts *targetState, log *slog.Logger) error {
 	_, err := ts.herdr.PaneList(ctx)
 	if !herdr.IsCode(err, herdr.CodeServerNotRunning) {
 		if err != nil {
@@ -330,7 +330,7 @@ func (r *Runner) checkServer(ctx context.Context, ts *targetState) error {
 		}
 		return nil
 	}
-	r.log.Info("herdr server not running; starting it", logging.KeyTarget, ts.t.Name())
+	log.Info("herdr server not running; starting it")
 	if err := ts.herdr.StartServer(ctx); err != nil {
 		return fmt.Errorf("preflight: start herdr server: %w", err)
 	}
@@ -386,8 +386,12 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 	panes, err := ts.herdr.PaneList(ctx)
 	if err != nil {
 		// Unreachable targets and backoff are a later ticket; the runs stay
-		// open and the next poll tries again.
-		r.log.Warn("poll failed", logging.KeyTarget, name, "err", err, "active_runs", len(runs))
+		// open and the next poll tries again. One line per run so each
+		// carries that run's id: `herdrcron logs --task` keeps only records
+		// with task_id.
+		for _, a := range runs {
+			a.log.Warn("poll failed", "err", err, "active_runs", len(runs))
+		}
 		return
 	}
 	// A run that ends must be stored even when the daemon stops mid-poll.

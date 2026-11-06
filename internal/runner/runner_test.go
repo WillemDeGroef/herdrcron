@@ -1,8 +1,9 @@
 package runner_test
 
 import (
+	"bytes"
 	"context"
-	"io"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -27,6 +28,7 @@ type env struct {
 	herdr     *fakeHerdr
 	runner    *runner.Runner
 	configDir string
+	log       *bytes.Buffer
 }
 
 const prompt = "Update the deps.\nSay \"done\" and 'stop'."
@@ -48,6 +50,7 @@ func newEnv(t *testing.T) *env {
 	e := &env{
 		t: t, ctx: context.Background(), store: st, herdr: newFakeHerdr(), configDir: dir,
 		clock: clock.NewFake(time.Date(2026, 11, 6, 7, 0, 0, 0, time.UTC)),
+		log:   &bytes.Buffer{},
 	}
 	e.runner = runner.New(runner.Options{
 		Clock:     e.clock,
@@ -55,7 +58,7 @@ func newEnv(t *testing.T) *env {
 		Targets:   map[string]target.Target{"local": e.herdr},
 		Config:    config.Config{Timezone: "Europe/Brussels", Targets: map[string]config.Target{"local": {}}},
 		ConfigDir: dir,
-		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Log:       slog.New(slog.NewJSONHandler(e.log, nil)),
 		// The fake server answers at once or never.
 		ServerStartWait: 50 * time.Millisecond,
 	})
@@ -498,5 +501,59 @@ func TestLaunchFailureClosesTheTabAndDeletesThePromptFile(t *testing.T) {
 	}
 	if e.runner.Active(run.ID) {
 		t.Errorf("failed run is still tracked")
+	}
+}
+
+// Lines emitted while a run is in progress carry that run's id, so
+// `herdrcron logs --task` can keep them. A poll covers every active run,
+// so a failed poll is one line per run.
+func TestRunLogLinesCarryRunTaskAndTarget(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.serverDown, e.herdr.serverStarts = true, true
+	first := e.start(deps())
+	secondTask := deps()
+	secondTask.ID = "other"
+	second := e.start(secondTask)
+	e.herdr.serverDown = true
+	e.runner.PollTarget(e.ctx, "local")
+
+	wantTask := map[string]string{first.ID: "deps", second.ID: "other"}
+	sawStart := false
+	sawPoll := map[string]bool{}
+	for _, line := range bytes.Split(bytes.TrimSpace(e.log.Bytes()), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(line, &rec); err != nil {
+			t.Fatalf("log line: %v\n%s", err, line)
+		}
+		msg, _ := rec["msg"].(string)
+		if msg != "herdr server not running; starting it" && msg != "poll failed" {
+			continue
+		}
+		runID, _ := rec["run_id"].(string)
+		taskID, _ := rec["task_id"].(string)
+		target, _ := rec["target"].(string)
+		if wantTask[runID] != taskID || target != "local" {
+			t.Errorf("%s = %s", msg, line)
+		}
+		switch msg {
+		case "herdr server not running; starting it":
+			if runID != first.ID {
+				t.Errorf("server start attributed to %s, want the run whose preflight started it", runID)
+			}
+			sawStart = true
+		case "poll failed":
+			sawPoll[runID] = true
+		}
+	}
+	if !sawStart {
+		t.Fatalf("no server-start line\n%s", e.log.Bytes())
+	}
+	for id := range wantTask {
+		if !sawPoll[id] {
+			t.Errorf("no poll-failed line for %s\n%s", id, e.log.Bytes())
+		}
 	}
 }
