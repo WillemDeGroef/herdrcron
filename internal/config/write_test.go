@@ -47,7 +47,7 @@ func TestDefaultTask(t *testing.T) {
 	got := config.DefaultTask("nightly")
 	want := config.Task{
 		ID: "nightly", Enabled: true, Overlap: "skip", Missed: "run_once",
-		OnDone: "keep_tab", OnBlocked: "notify", PromptFile: filepath.Join("prompts", "nightly.md"),
+		OnDone: "close_tab", OnBlocked: "notify", PromptFile: filepath.Join("prompts", "nightly.md"),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("DefaultTask = %+v, want %+v", got, want)
@@ -197,7 +197,7 @@ prompt_file: prompts/nightly.md
 timeout: 2h
 overlap: skip
 missed: run_once
-on_done: keep_tab
+on_done: close_tab
 on_blocked: notify
 `
 	if got := readFile(t, path); got != want {
@@ -279,7 +279,7 @@ cwd: ~/src/peppol-sh
 paused_until: null
 overlap: skip
 missed: run_once
-on_done: keep_tab
+on_done: close_tab
 on_blocked: notify
 `
 	if got := readFile(t, path); got != want {

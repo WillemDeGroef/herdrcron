@@ -92,7 +92,7 @@ func TestNewFormCreatesWithDefaults(t *testing.T) {
 	want := api.TaskWriteParams{Task: api.TaskDef{
 		ID: "my-task", Target: "local", Schedule: "@daily", Enabled: true,
 		Agent: api.AgentDef{Command: "claude"}, Timeout: "30m",
-		Overlap: "skip", Missed: "run_once", OnDone: "keep_tab", OnBlocked: "notify",
+		Overlap: "skip", Missed: "run_once", OnDone: "close_tab", OnBlocked: "notify",
 	}}
 	if !reflect.DeepEqual(got[0], want) {
 		t.Fatalf("create params = %+v, want %+v", got[0], want)
@@ -277,13 +277,13 @@ func TestFormPickersToggleArgsAndEnv(t *testing.T) {
 	tabs(tm, fOverlap-fArgs)
 	tm.Send(ctrl(tea.KeyLeft)) // skip → parallel
 	tabs(tm, fOnDone-fOverlap)
-	tm.Send(key("space")) // keep_tab → close_tab
+	tm.Send(key("space")) // close_tab → keep_tab
 	tabs(tm, fEnv-fOnDone)
 	typeText(tm, `FOO=1 BAR='x y'`)
 	tm.Send(ctrl(tea.KeyCtrlS))
 	p := waitCall(t, f, api.MethodTasksCreate, 1)[0].(api.TaskWriteParams)
 	finalView(t, tm)
-	if p.Task.Target != "vps" || p.Task.Enabled || p.Task.Overlap != "parallel" || p.Task.OnDone != "close_tab" {
+	if p.Task.Target != "vps" || p.Task.Enabled || p.Task.Overlap != "parallel" || p.Task.OnDone != "keep_tab" {
 		t.Errorf("task = %+v", p.Task)
 	}
 	if want := []string{"--a", "b c", `d"e`, "f g"}; !reflect.DeepEqual(p.Task.Agent.Args, want) {

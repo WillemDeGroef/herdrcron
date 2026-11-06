@@ -153,7 +153,7 @@ func LoadTasks(configDir string, cfg Config) ([]TaskEntry, error) {
 // and the default prompt file, prompts/<id>.md.
 func DefaultTask(id string) Task {
 	return Task{
-		ID: id, Enabled: true, Overlap: "skip", Missed: "run_once", OnDone: "keep_tab", OnBlocked: "notify",
+		ID: id, Enabled: true, Overlap: "skip", Missed: "run_once", OnDone: "close_tab", OnBlocked: "notify",
 		PromptFile: defaultPromptFile(id),
 	}
 }
