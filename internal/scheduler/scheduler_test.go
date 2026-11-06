@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,17 +15,61 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/config"
 	"github.com/WillemDeGroef/herdrcron/internal/scheduler"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
-	"github.com/WillemDeGroef/herdrcron/internal/target"
 )
 
+// fakeRuns is a scheduler.Starter that stores each run as done, or returns
+// err without storing anything, and records every call.
+type fakeRuns struct {
+	clock *clock.Fake
+	store *store.Store
+
+	mu    sync.Mutex
+	calls []startCall
+	err   error
+}
+
+type startCall struct {
+	task        config.Task
+	trigger     string
+	scheduledAt time.Time
+}
+
+func (f *fakeRuns) Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, startCall{task: t, trigger: trigger, scheduledAt: scheduledAt})
+	err := f.err
+	f.mu.Unlock()
+	if err != nil {
+		return store.Run{}, err
+	}
+	now := f.clock.Now()
+	run := store.Run{
+		ID: store.NewRunID(now), TaskID: t.ID, Target: t.Target, Trigger: trigger,
+		ScheduledAt: scheduledAt, StartedAt: now, EndedAt: now, Status: store.StatusDone,
+	}
+	return run, f.store.InsertRun(ctx, run)
+}
+
+func (f *fakeRuns) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+func (f *fakeRuns) Calls() []startCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.calls)
+}
+
 type env struct {
-	t      *testing.T
-	ctx    context.Context
-	clock  *clock.Fake
-	store  *store.Store
-	local  *target.Fake
-	sched  *scheduler.Scheduler
-	config config.Config
+	t       *testing.T
+	ctx     context.Context
+	clock   *clock.Fake
+	store   *store.Store
+	starter *fakeRuns
+	sched   *scheduler.Scheduler
+	config  config.Config
 }
 
 func brussels(t *testing.T) *time.Location {
@@ -48,15 +93,15 @@ func newEnv(t *testing.T, now time.Time) *env {
 		ctx:    context.Background(),
 		clock:  clock.NewFake(now),
 		store:  st,
-		local:  target.NewFake("local"),
 		config: config.Config{Timezone: "Europe/Brussels", HistoryDays: 90},
 	}
+	e.starter = &fakeRuns{clock: e.clock, store: st}
 	e.sched = scheduler.New(scheduler.Options{
-		Clock:   e.clock,
-		Store:   st,
-		Targets: map[string]target.Target{"local": e.local},
-		Config:  e.config,
-		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Clock:  e.clock,
+		Store:  st,
+		Runs:   e.starter,
+		Config: e.config,
+		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	return e
 }
@@ -227,8 +272,9 @@ func TestFireRecordsRunAndRecomputesNextFireAt(t *testing.T) {
 	if r.Status != store.StatusDone || r.EndedAt.IsZero() {
 		t.Errorf("status %q ended_at %v, want done and ended", r.Status, r.EndedAt)
 	}
-	if calls := e.local.Calls(); len(calls) != 1 || !slices.Equal(calls[0], []string{"claude", "--permission-mode", "acceptEdits"}) {
-		t.Errorf("target calls = %q", calls)
+	calls := e.starter.Calls()
+	if len(calls) != 1 || calls[0].task.ID != "hourly" || calls[0].trigger != store.TriggerSchedule || !calls[0].scheduledAt.Equal(fireAt) {
+		t.Errorf("Start calls = %+v, want one for hourly with trigger schedule at %v", calls, fireAt)
 	}
 
 	next := time.Date(2026, 11, 6, 14, 0, 0, 0, loc)
@@ -302,17 +348,22 @@ func TestReloadKeepsNextFireOfUnchangedTasks(t *testing.T) {
 	}
 }
 
-func TestTargetErrorFailsTheRun(t *testing.T) {
+// A run that cannot be stored at all (Start returns an error) leaves no
+// last_run_id, and the task still gets its next fire time.
+func TestStartErrorStillMovesNextFire(t *testing.T) {
 	e := newEnv(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
-	e.local.SetErr(errors.New("herdr: no server"))
+	e.starter.setErr(errors.New("database is locked"))
 	e.setTasks(valid(task("t", "@hourly")))
 	e.runUntil(time.Date(2026, 11, 6, 13, 0, 0, 0, time.UTC))
-	runs := e.runs("t")
-	if len(runs) != 1 || runs[0].Status != store.StatusFailed || runs[0].ExitReason != "herdr: no server" {
-		t.Fatalf("runs = %+v, want one failed run with the error as reason", runs)
+	if n := len(e.starter.Calls()); n != 1 {
+		t.Fatalf("%d Start calls, want 1", n)
 	}
-	if got := e.state("t").NextFireAt; !got.Equal(time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)) {
-		t.Errorf("next_fire_at = %v after a failed run", got)
+	st := e.state("t")
+	if st.LastRunID != "" {
+		t.Errorf("last_run_id = %q, want none", st.LastRunID)
+	}
+	if !st.NextFireAt.Equal(time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)) {
+		t.Errorf("next_fire_at = %v after a failed start", st.NextFireAt)
 	}
 }
 
@@ -414,7 +465,7 @@ func TestOldRunsArePruned(t *testing.T) {
 	e := newEnv(t, now)
 	e.config.HistoryDays = 7
 	e.sched = scheduler.New(scheduler.Options{Clock: e.clock, Store: e.store,
-		Targets: map[string]target.Target{"local": e.local}, Config: e.config,
+		Runs: e.starter, Config: e.config,
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	insert := func(id string, started time.Time, ended bool) {
 		r := store.Run{ID: id, TaskID: "t", Target: "local", Trigger: store.TriggerManual,

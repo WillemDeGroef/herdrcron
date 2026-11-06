@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,7 +16,20 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/clock"
 	"github.com/WillemDeGroef/herdrcron/internal/daemon"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
+	"github.com/WillemDeGroef/herdrcron/internal/target"
 )
+
+// errHerdr is what the fake local target answers to every call, so runs
+// through it fail at preflight. The runner has its own state-machine
+// tests; daemon tests only check the API wiring.
+var errHerdr = errors.New("no herdr in daemon tests")
+
+// fakeTargets is a Targets override: only local, and it fails every call.
+func fakeTargets() map[string]target.Target {
+	local := target.NewFake("local")
+	local.SetErr(errHerdr)
+	return map[string]target.Target{"local": local}
+}
 
 func write(t *testing.T, path, content string) {
 	t.Helper()
@@ -301,7 +315,7 @@ func TestScheduledFireShowsAsLastRunAndMovesNext(t *testing.T) {
 	p := setup(t)
 	write(t, p.ConfigFile(), "timezone: Europe/Brussels\ntargets:\n  vps:\n    host: vps\n")
 	clk := clock.NewFake(time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
-	c := startWith(t, p, daemon.Options{Version: "test", Clock: clk})
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clk, Targets: fakeTargets()})
 
 	byID := listByID(t, c)
 	// @daily in Brussels: midnight CET is 23:00 UTC.
@@ -319,8 +333,10 @@ func TestScheduledFireShowsAsLastRunAndMovesNext(t *testing.T) {
 	for {
 		got := listByID(t, c)["nightly"]
 		if got.LastRun != nil && got.LastRun.EndedAt != "" {
-			if got.LastRun.Status != "done" || got.LastRun.Trigger != "schedule" ||
-				got.LastRun.ScheduledAt != "2026-11-06T23:00:00Z" || len(got.LastRun.ID) != 26 {
+			// The fake target fails preflight, so the run ends failed.
+			if got.LastRun.Status != "failed" || got.LastRun.Trigger != "schedule" ||
+				got.LastRun.ScheduledAt != "2026-11-06T23:00:00Z" || len(got.LastRun.ID) != 26 ||
+				!strings.Contains(got.LastRun.ExitReason, errHerdr.Error()) {
 				t.Errorf("last run = %+v", got.LastRun)
 			}
 			if got.NextFireAt != "2026-11-07T23:00:00Z" {
@@ -335,5 +351,111 @@ func TestScheduledFireShowsAsLastRunAndMovesNext(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(p.StateDir, "herdrcron.db")); err != nil {
 		t.Errorf("state database: %v", err)
+	}
+}
+
+func runNow(c *api.Client, id string) (api.RunSummary, error) {
+	var res api.RunSummary
+	err := c.Call(context.Background(), api.MethodTasksRunNow, api.RunNowParams{ID: id}, &res)
+	return res, err
+}
+
+func TestRunNowStartsAManualRun(t *testing.T) {
+	p := setup(t)
+	clk := clock.NewFake(time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clk, Targets: fakeTargets()})
+
+	got, err := runNow(c, "nightly")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.ID) != 26 || got.TaskID != "nightly" || got.Target != "local" || got.Trigger != "manual" ||
+		got.ScheduledAt != "" || got.StartedAt != "2026-11-06T12:00:00Z" {
+		t.Errorf("run_now result = %+v", got)
+	}
+	if got.Status != "failed" || got.EndedAt == "" || !strings.Contains(got.ExitReason, errHerdr.Error()) {
+		t.Errorf("run_now result = %+v, want failed at preflight with the target error", got)
+	}
+	last := listByID(t, c)["nightly"].LastRun
+	if last == nil || last.ID != got.ID || last.Trigger != "manual" {
+		t.Errorf("tasks.list last run = %+v, want the manual run %s", last, got.ID)
+	}
+
+	// run_now ignores enabled: false. vps has no target yet, so the run
+	// fails with the runner's reason.
+	parked, err := runNow(c, "parked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parked.TaskID != "parked" || parked.Status != "failed" || !strings.Contains(parked.ExitReason, `unknown target "vps"`) {
+		t.Errorf("run_now parked = %+v, want a failed run for the unknown target", parked)
+	}
+}
+
+func TestRunNowRejectsUnknownAndInvalidTasks(t *testing.T) {
+	c := startWith(t, setup(t), daemon.Options{Version: "test", Targets: fakeTargets()})
+	_, err := runNow(c, "nope")
+	var rpcErr *api.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != api.CodeInvalidParams || !strings.Contains(rpcErr.Message, `"nope"`) {
+		t.Errorf("run_now unknown task: err = %v, want invalid params naming the id", err)
+	}
+	_, err = runNow(c, "broken")
+	if err == nil || !strings.Contains(err.Error(), `unknown target "mars"`) {
+		t.Errorf("run_now invalid task: err = %v, want the validation error", err)
+	}
+	if err := c.Call(context.Background(), api.MethodTasksRunNow, nil, nil); err == nil {
+		t.Error("run_now without params: want an error")
+	}
+	var res api.RunsListResult
+	if err := c.Call(context.Background(), api.MethodRunsList, nil, &res); err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Runs) != 0 {
+		t.Errorf("runs after rejected run_now calls = %+v, want none", res.Runs)
+	}
+}
+
+func TestRunsListNewestFirstAndByTask(t *testing.T) {
+	p := setup(t)
+	start := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(start)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clk, Targets: fakeTargets()})
+
+	var ids []string // oldest first
+	for i, id := range []string{"nightly", "parked", "nightly"} {
+		clk.Set(start.Add(time.Duration(i) * time.Minute))
+		r, err := runNow(c, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, r.ID)
+	}
+	list := func(params any) []string {
+		t.Helper()
+		var res api.RunsListResult
+		if err := c.Call(context.Background(), api.MethodRunsList, params, &res); err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, r := range res.Runs {
+			out = append(out, r.ID)
+		}
+		return out
+	}
+	if got, want := list(nil), []string{ids[2], ids[1], ids[0]}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("runs.list = %v, want %v", got, want)
+	}
+	if got, want := list(api.RunsListParams{TaskID: "nightly"}), []string{ids[2], ids[0]}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("runs.list nightly = %v, want %v", got, want)
+	}
+	if got, want := list(api.RunsListParams{Limit: 1}), []string{ids[2]}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("runs.list limit 1 = %v, want %v", got, want)
+	}
+	var res api.RunsListResult
+	if err := c.Call(context.Background(), api.MethodRunsList, api.RunsListParams{TaskID: "nope"}, &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Runs == nil || len(res.Runs) != 0 {
+		t.Errorf("runs.list unknown task = %#v, want an empty list", res.Runs)
 	}
 }

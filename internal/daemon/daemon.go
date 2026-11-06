@@ -18,6 +18,7 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/config"
 	"github.com/WillemDeGroef/herdrcron/internal/logging"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
+	"github.com/WillemDeGroef/herdrcron/internal/runner"
 	"github.com/WillemDeGroef/herdrcron/internal/scheduler"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
 	"github.com/WillemDeGroef/herdrcron/internal/target"
@@ -28,8 +29,11 @@ type Options struct {
 	Version string // reported by "status"
 	// OnListening, if set, is called once the socket accepts connections.
 	OnListening func(socket string)
-	// Clock drives the scheduler; nil means the system clock.
+	// Clock drives the scheduler and the runner; nil means the system clock.
 	Clock clock.Clock
+	// Targets, if set, replaces the real targets by name; tests use it to
+	// run without herdr.
+	Targets map[string]target.Target
 }
 
 type daemon struct {
@@ -39,6 +43,7 @@ type daemon struct {
 	tasks   []config.TaskEntry
 	store   *store.Store
 	sched   *scheduler.Scheduler
+	runner  *runner.Runner
 	clk     clock.Clock
 	log     *slog.Logger
 }
@@ -83,13 +88,12 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	for _, e := range tasks {
 		logTask(log, e)
 	}
-	// Until the herdr adapter exists, every target is a fake that runs
-	// nothing; see target.Fake.
-	targets := make(map[string]target.Target, len(cfg.Targets))
-	for name := range cfg.Targets {
-		targets[name] = target.NewFake(name)
+	targets := opts.Targets
+	if targets == nil {
+		targets = realTargets(cfg)
 	}
-	d.sched = scheduler.New(scheduler.Options{Clock: clk, Store: st, Targets: targets, Config: cfg, Log: log})
+	d.runner = runner.New(runner.Options{Clock: clk, Store: st, Targets: targets, Config: cfg, ConfigDir: p.ConfigDir, Log: log})
+	d.sched = scheduler.New(scheduler.Options{Clock: clk, Store: st, Runs: d.runner, Config: cfg, Log: log})
 	if err := d.sched.SetTasks(ctx, tasks); err != nil {
 		log.Error("cannot schedule tasks", "err", err)
 		return err
@@ -104,6 +108,8 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	srv := api.NewServer(log)
 	srv.Handle(api.MethodStatus, d.status)
 	srv.Handle(api.MethodTasksList, d.tasksList)
+	srv.Handle(api.MethodTasksRunNow, d.tasksRunNow)
+	srv.Handle(api.MethodRunsList, d.runsList)
 	log.Info("daemon listening", "socket", p.Socket())
 	if opts.OnListening != nil {
 		opts.OnListening(p.Socket())
@@ -115,11 +121,28 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		defer close(schedDone)
 		_ = d.sched.Run(ctx) // returns when ctx is done
 	}()
+	runnerDone := make(chan struct{})
+	go func() {
+		defer close(runnerDone)
+		d.runner.Run(ctx) // returns when ctx is done
+	}()
 	err = srv.Serve(ctx, ln)
 	cancel()
 	<-schedDone
+	<-runnerDone
 	log.Info("daemon stopped")
 	return err
+}
+
+// realTargets returns the targets runs can use. Only local exists so far;
+// SSH targets come later, and the runner fails their runs as unknown
+// targets meanwhile.
+func realTargets(cfg config.Config) map[string]target.Target {
+	targets := map[string]target.Target{}
+	if _, ok := cfg.Targets[config.LocalTarget]; ok {
+		targets[config.LocalTarget] = target.NewLocal()
+	}
+	return targets
 }
 
 // logTask logs one loaded task. Never log prompt text or env values: only
@@ -207,11 +230,73 @@ func (d *daemon) tasksList(ctx context.Context, _ json.RawMessage) (any, error) 
 	return res, nil
 }
 
+// tasksRunNow starts a manual run of a valid task, whether or not it is
+// enabled or paused (spec rule 6).
+func (d *daemon) tasksRunNow(ctx context.Context, params json.RawMessage) (any, error) {
+	var p api.RunNowParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if p.ID == "" {
+		return nil, api.InvalidParams(errors.New("id is required"))
+	}
+	i := slices.IndexFunc(d.tasks, func(e config.TaskEntry) bool { return e.ID == p.ID })
+	if i < 0 {
+		return nil, api.InvalidParams(fmt.Errorf("unknown task %q", p.ID))
+	}
+	e := d.tasks[i]
+	if e.Err != nil {
+		return nil, &api.Error{Code: api.CodeInvalidParams, Message: fmt.Sprintf("task %s is invalid: %v", e.ID, e.Err)}
+	}
+	// p.ForceParallel is accepted but not acted on: overlap handling does
+	// not exist yet, so every run_now starts a run.
+	run, err := d.runner.Start(ctx, e.Task, store.TriggerManual, time.Time{})
+	if err != nil {
+		return nil, fmt.Errorf("start run of %s: %w", e.ID, err)
+	}
+	return runSummary(run), nil
+}
+
+// runsList returns runs newest first, of one task or all.
+func (d *daemon) runsList(ctx context.Context, params json.RawMessage) (any, error) {
+	var p api.RunsListParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if p.Limit < 0 {
+		return nil, api.InvalidParams(errors.New("limit must not be negative"))
+	}
+	if p.Limit == 0 {
+		p.Limit = api.DefaultRunsLimit
+	}
+	runs, err := d.store.ListRuns(ctx, p.TaskID, p.Limit)
+	if err != nil {
+		return nil, err
+	}
+	res := api.RunsListResult{Runs: make([]api.RunSummary, 0, len(runs))}
+	for _, r := range runs {
+		res.Runs = append(res.Runs, *runSummary(r))
+	}
+	return res, nil
+}
+
+// decodeParams decodes params into v; absent params leave v as is.
+func decodeParams(params json.RawMessage, v any) error {
+	if len(params) == 0 || string(params) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(params, v); err != nil {
+		return api.InvalidParams(err)
+	}
+	return nil
+}
+
 func runSummary(r store.Run) *api.RunSummary {
 	return &api.RunSummary{
-		ID: r.ID, Trigger: r.Trigger, Status: r.Status,
+		ID: r.ID, TaskID: r.TaskID, Target: r.Target, Trigger: r.Trigger, Status: r.Status,
 		ScheduledAt: apiTime(r.ScheduledAt), StartedAt: apiTime(r.StartedAt),
 		EndedAt: apiTime(r.EndedAt), ExitReason: r.ExitReason,
+		HerdrWorkspace: r.HerdrWorkspace, HerdrTab: r.HerdrTab, HerdrPane: r.HerdrPane,
 	}
 }
 

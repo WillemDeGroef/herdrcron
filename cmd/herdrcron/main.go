@@ -33,6 +33,7 @@ const usage = `usage: herdrcron <command>
 commands:
   daemon            run the daemon in the foreground
   list              list tasks with target, schedule, state, last run and next fire
+  run <id>          start a manual run of a task now, even if it is off or paused
   logs [-f] [--task <id>]
                     print the daemon log; -f follows it, --task filters by task
   install-service   install and start the daemon as a systemd user service
@@ -74,6 +75,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return runDaemon(ctx, p, stderr)
 	case "list":
 		return runList(ctx, p, stdout, stderr)
+	case "run":
+		return runRun(ctx, p, args[1:], stdout, stderr)
 	case "logs":
 		return runLogs(ctx, p, args[1:], stdout, stderr)
 	case "install-service":
@@ -100,7 +103,8 @@ func runDaemon(ctx context.Context, p paths.Paths, stderr io.Writer) int {
 	return 0
 }
 
-func runList(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
+// dial connects to the daemon, or prints why not and returns nil.
+func dial(p paths.Paths, stderr io.Writer) *api.Client {
 	c, err := api.Dial(p.Socket())
 	if err != nil {
 		if errors.Is(err, api.ErrDaemonNotRunning) {
@@ -108,6 +112,14 @@ func runList(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
 		} else {
 			fmt.Fprintln(stderr, "herdrcron:", err)
 		}
+		return nil
+	}
+	return c
+}
+
+func runList(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
+	c := dial(p, stderr)
+	if c == nil {
 		return 1
 	}
 	defer func() { _ = c.Close() }()
@@ -124,6 +136,46 @@ func runList(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
 	}
 	if err := printTasks(stdout, res.Tasks, time.Now(), time.Local); err != nil {
 		fmt.Fprintln(stderr, "herdrcron:", err)
+		return 1
+	}
+	return 0
+}
+
+// runRun starts a manual run and prints one line about it. It exits 1 if
+// the run failed to start.
+func runRun(ctx context.Context, p paths.Paths, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
+		fmt.Fprintf(stderr, "usage: herdrcron run <id>\n")
+		return 2
+	}
+	c := dial(p, stderr)
+	if c == nil {
+		return 1
+	}
+	defer func() { _ = c.Close() }()
+	// Start waits for the launch in herdr, which includes preflight and
+	// possibly starting the herdr server.
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	var r api.RunSummary
+	if err := c.Call(ctx, api.MethodTasksRunNow, api.RunNowParams{ID: args[0]}, &r); err != nil {
+		var rpcErr *api.Error
+		if errors.As(err, &rpcErr) {
+			fmt.Fprintln(stderr, "herdrcron run:", strings.TrimPrefix(rpcErr.Message, "invalid params: "))
+		} else {
+			fmt.Fprintln(stderr, "herdrcron: tasks.run_now:", err)
+		}
+		return 1
+	}
+	line := fmt.Sprintf("run %s started for %s: %s", r.ID, r.TaskID, r.Status)
+	if r.HerdrTab != "" {
+		line += fmt.Sprintf(", herdr tab %s pane %s", r.HerdrTab, r.HerdrPane)
+	}
+	if r.ExitReason != "" {
+		line += ": " + r.ExitReason
+	}
+	fmt.Fprintln(stdout, line)
+	if r.Status == "failed" {
 		return 1
 	}
 	return 0

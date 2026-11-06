@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -341,5 +342,112 @@ func TestInstallServiceRefusesTempDirBinary(t *testing.T) {
 	}
 	if called {
 		t.Error("service manager was run for a temp-dir binary")
+	}
+}
+
+// stubDaemon serves handlers on the daemon socket of p until the test ends.
+func stubDaemon(t *testing.T, p paths.Paths, handlers map[string]api.HandlerFunc) {
+	t.Helper()
+	ln, err := api.Listen(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := api.NewServer(nil)
+	for m, h := range handlers {
+		srv.Handle(m, h)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Serve(ctx, ln)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
+func runNowStub(t *testing.T, res api.RunSummary, gotID *string) map[string]api.HandlerFunc {
+	return map[string]api.HandlerFunc{
+		api.MethodTasksRunNow: func(_ context.Context, params json.RawMessage) (any, error) {
+			var p api.RunNowParams
+			if err := json.Unmarshal(params, &p); err != nil {
+				t.Errorf("run_now params %s: %v", params, err)
+			}
+			*gotID = p.ID
+			if p.ID == "nope" {
+				return nil, api.InvalidParams(errors.New(`unknown task "nope"`))
+			}
+			return res, nil
+		},
+	}
+}
+
+func TestRunPrintsTheStartedRun(t *testing.T) {
+	p := xdg(t)
+	var gotID string
+	stubDaemon(t, p, runNowStub(t, api.RunSummary{ID: "01JRUN", TaskID: "nightly", Target: "local",
+		Trigger: "manual", Status: "running", HerdrWorkspace: "w1", HerdrTab: "w1:t2", HerdrPane: "w1:p3"}, &gotID))
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "nightly"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	if gotID != "nightly" {
+		t.Errorf("run_now id = %q, want nightly", gotID)
+	}
+	if got, want := out.String(), "run 01JRUN started for nightly: running, herdr tab w1:t2 pane w1:p3\n"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestRunThatFailsToStartExitsNonZero(t *testing.T) {
+	p := xdg(t)
+	var gotID string
+	stubDaemon(t, p, runNowStub(t, api.RunSummary{ID: "01JRUN", TaskID: "nightly", Target: "local",
+		Trigger: "manual", Status: "failed", ExitReason: "preflight: cwd /nope does not exist"}, &gotID))
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "nightly"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if got, want := out.String(), "run 01JRUN started for nightly: failed: preflight: cwd /nope does not exist\n"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestRunUnknownTaskFails(t *testing.T) {
+	p := xdg(t)
+	var gotID string
+	stubDaemon(t, p, runNowStub(t, api.RunSummary{}, &gotID))
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "nope"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if msg := errOut.String(); !strings.Contains(msg, `unknown task "nope"`) {
+		t.Errorf("stderr = %q, want the daemon's error", msg)
+	}
+}
+
+func TestRunWithoutDaemonFails(t *testing.T) {
+	xdg(t)
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "nightly"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if msg := errOut.String(); !strings.Contains(msg, "daemon is not running") || !strings.Contains(msg, "herdrcron daemon") {
+		t.Fatalf("stderr = %q, want a clear message that says how to start it", msg)
+	}
+}
+
+func TestRunNeedsOneTaskID(t *testing.T) {
+	xdg(t)
+	for _, args := range [][]string{{"run"}, {"run", "a", "b"}} {
+		var out, errOut bytes.Buffer
+		if code := run(context.Background(), args, &out, &errOut); code != 2 {
+			t.Errorf("%q: exit %d, want 2", args, code)
+		}
+		if !strings.Contains(errOut.String(), "usage") {
+			t.Errorf("%q: stderr = %q, want usage", args, errOut.String())
+		}
 	}
 }

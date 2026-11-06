@@ -8,14 +8,14 @@ Results of the spike for issue #1. Every herdr call in herdrcron is built on thi
 - Errors from the server: JSON on **stderr**, exit status 1, `{"error": {"code": "...", "message": "..."}, "id": "..."}`. Codes seen: `pane_not_found`, `tab_not_found`, `workspace_not_found`, `agent_not_found`, `server_not_running`. Syntax errors exit 2.
 - IDs are opaque and server-scoped: workspace `w15`, tab `w15:t2`, pane `w15:p2`. Closed tab and pane ids are not reused. Parse them from responses; never build them.
 - Two exceptions print plain text, not JSON: `pane read` (the terminal text) and `pane run`/`pane send-keys`/`pane send-text` (nothing on success, exit 0).
-- The CLI picks its server from `HERDR_SOCKET_PATH` (set inside herdr panes) or from `--session <name>`; without either it uses the default session socket `~/.config/herdr/herdr.sock`. The daemon must not pass a socket or session, so it always talks to the user's default session. Under systemd no `HERDR_*` variables are set, which is what we want.
+- The CLI picks its server from `HERDR_SOCKET_PATH` (set inside herdr panes) or from `--session <name>`; without either it uses the default session socket `~/.config/herdr/herdr.sock`. The daemon must not pass a socket or session, so it always talks to the user's default session. Under systemd no `HERDR_*` variables are set, which is what we want. A daemon started by hand inside a herdr pane inherits them, so the local target drops every `HERDR_*` variable from the commands it runs.
 
 ## Workspaces, tabs and panes
 
 | Intent | Command | Result |
 | --- | --- | --- |
 | List workspaces | `herdr workspace list` | `workspace_list`: `.result.workspaces[]` (`WorkspaceInfo`: `workspace_id`, `label`, `active_tab_id`, `tab_count`, `pane_count`, `agent_status`, ...) |
-| Create workspace | `herdr workspace create --cwd <cwd> --label hc-<repo> --no-focus` | `workspace_created`: `.result.workspace`, `.result.tab`, `.result.root_pane` |
+| Create workspace | `herdr workspace create --cwd <cwd> --label hc-<repo> --no-focus [--env K=V ...]` | `workspace_created`: `.result.workspace`, `.result.tab`, `.result.root_pane` |
 | List tabs of a workspace | `herdr tab list --workspace <wid>` | `tab_list`: `.result.tabs[]` (`TabInfo`: `tab_id`, `label`, `pane_count`, `agent_status`, ...) |
 | Create tab in a workspace | `herdr tab create --workspace <wid> --cwd <cwd> --label hc-<task>-<HHMM> --no-focus [--env K=V ...]` | `tab_created`: `.result.tab`, `.result.root_pane` |
 | Rename a tab | `herdr tab rename <tab_id> <label>` | `tab_info` |
