@@ -98,9 +98,13 @@ func (n *Notifier) Wait() {
 }
 
 // RunMessage is the notification text for run in its current status.
+// It deliberately omits exit_reason for blocked: that field can hold text
+// from an earlier transition (e.g. after on_blocked: stop + recovery) or
+// details we avoid putting in user-visible channels; blocked notifications
+// are only "this run is waiting for you".
 func RunMessage(r store.Run) string {
 	what := r.Status
-	if r.ExitReason != "" {
+	if r.ExitReason != "" && r.Status != store.StatusBlocked {
 		what += ": " + r.ExitReason
 	}
 	return fmt.Sprintf("herdrcron: %s %s (target %s, run %s)", r.TaskID, what, r.Target, r.ID)

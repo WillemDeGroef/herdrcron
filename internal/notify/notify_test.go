@@ -149,4 +149,8 @@ func TestRunMessage(t *testing.T) {
 	if got, want := notify.RunMessage(r), "herdrcron: deps blocked (target local, run 01JRUN)"; got != want {
 		t.Errorf("RunMessage = %q, want %q", got, want)
 	}
+	r.ExitReason = "stale reason must not appear in blocked notification"
+	if got, want := notify.RunMessage(r), "herdrcron: deps blocked (target local, run 01JRUN)"; got != want {
+		t.Errorf("RunMessage blocked with exit_reason = %q, want %q (no exit_reason)", got, want)
+	}
 }
