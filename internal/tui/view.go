@@ -110,6 +110,8 @@ func (m Model) View() string {
 		return m.fit(m.outputView())
 	case screenForm:
 		return m.fit(m.formView())
+	case screenTargets:
+		return m.fit(m.targetsView())
 	}
 	if m.mode == modeHelp {
 		return m.fit(m.helpView())
@@ -158,9 +160,9 @@ func (m Model) titleLine() string {
 
 func (m Model) targetBadge(t api.TargetStatus) string {
 	switch t.Reachability {
-	case "reachable":
+	case api.ReachReachable:
 		return t.Name + " ●"
-	case "unreachable":
+	case api.ReachUnreachable:
 		return t.Name + " " + m.st.critical.Render("○ unreachable")
 	}
 	return t.Name + " " + m.st.dim.Render("?")
@@ -431,6 +433,7 @@ func (m Model) helpView() string {
 		{"e", "edit the task (form)"},
 		{"E", "edit the prompt in $EDITOR"},
 		{"d", "delete the task (asks first; offers stop and delete with an active run)"},
+		{"t", "targets: reachability, herdr version, last preflight; c checks"},
 		{"/", "filter by text; esc clears"},
 		{"g", "group by target"},
 		{"?", "this help"},

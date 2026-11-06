@@ -45,10 +45,11 @@ type Options struct {
 type screen int
 
 const (
-	screenMain   screen = iota
-	screenDetail        // detail.go: task definition, next fires, runs; a run's output tail
-	screenOutput        // output.go: live output of an active run
-	screenForm          // form.go: new or edit task
+	screenMain    screen = iota
+	screenDetail         // detail.go: task definition, next fires, runs; a run's output tail
+	screenOutput         // output.go: live output of an active run
+	screenForm           // form.go: new or edit task
+	screenTargets        // targets.go: reachability, herdr version, last preflight
 )
 
 // mode is what the keyboard drives: the list or one of the prompts.
@@ -108,12 +109,19 @@ type Model struct {
 	message  string
 	msgErr   bool
 
-	screen screen
-	exec   func(cmd *exec.Cmd, done func(error) tea.Msg) tea.Cmd
-	editor []string
-	detail detailState // screenDetail
-	output outputState // screenOutput
-	form   formState   // screenForm
+	screen  screen
+	exec    func(cmd *exec.Cmd, done func(error) tea.Msg) tea.Cmd
+	editor  []string
+	detail  detailState  // screenDetail
+	output  outputState  // screenOutput
+	form    formState    // screenForm
+	targets targetsState // screenTargets
+
+	// targetRev counts local target updates. targetGen is the rev at which
+	// each target last changed, so a status read started earlier cannot
+	// paint over it.
+	targetRev int
+	targetGen map[string]int
 }
 
 // confirmation is a pending y/n question.
@@ -188,6 +196,7 @@ type (
 	statusMsg struct {
 		status api.StatusResult
 		err    error
+		rev    int // targetRev when the read started
 	}
 	// doneMsg reports a finished action: text for the message line and
 	// whether to re-read the state. Changed tasks arrive on the stream.
@@ -253,12 +262,21 @@ func (m Model) load() tea.Cmd {
 }
 
 func (m Model) loadStatus() tea.Cmd {
-	ctx, b := m.ctx, m.backend
+	ctx, b, rev := m.ctx, m.backend, m.targetRev
 	return func() tea.Msg {
 		var s api.StatusResult
 		err := b.Call(ctx, api.MethodStatus, nil, &s)
-		return statusMsg{status: s, err: err}
+		return statusMsg{status: s, err: err, rev: rev}
 	}
+}
+
+// touchTarget records that name just changed locally.
+func (m *Model) touchTarget(name string) {
+	m.targetRev++
+	if m.targetGen == nil {
+		m.targetGen = map[string]int{}
+	}
+	m.targetGen[name] = m.targetRev
 }
 
 // requestStatus reads the daemon status, coalescing a burst of asks into
@@ -289,6 +307,9 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		return m, cmd
 	}
 	if m, cmd, ok := m.formMsg(msg); ok {
+		return m, cmd
+	}
+	if m, cmd, ok := m.targetsMsg(msg); ok {
 		return m, cmd
 	}
 	switch msg := msg.(type) {
@@ -324,6 +345,9 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		// A burst asked for another read: keep the status from that read,
 		// not from the one that was already running when the burst began.
 		if msg.err == nil && !m.statusAgain {
+			// A read that started before target.changed or c finished still
+			// carries the older observation. The later one wins.
+			msg.status.Targets = mergeStatusTargets(m.status.Targets, msg.status.Targets, m.targetGen, msg.rev)
 			m.status, m.statusAt = msg.status, m.now()
 		}
 		if m.statusAgain {
@@ -405,11 +429,17 @@ func (m *Model) applyEvent(n api.Notification) tea.Cmd {
 		}
 		for i, t := range m.status.Targets {
 			if t.Name == ev.Target.Name {
-				m.status.Targets[i] = ev.Target
+				next := ev.Target
+				// A reachability event published before c was stored can
+				// arrive after the reply. The later check wins.
+				next.LastCheck = newerCheck(t.LastCheck, ev.Target.LastCheck)
+				m.status.Targets[i] = next
+				m.touchTarget(ev.Target.Name)
 				return nil
 			}
 		}
 		m.status.Targets = append(m.status.Targets, ev.Target)
+		m.touchTarget(ev.Target.Name)
 	}
 	return nil
 }

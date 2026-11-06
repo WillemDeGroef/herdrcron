@@ -32,6 +32,8 @@ func (m Model) key(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m.outputKey(msg)
 	case screenForm:
 		return m.formKey(msg)
+	case screenTargets:
+		return m.targetsKey(msg)
 	}
 	switch m.mode {
 	case modeHelp:
@@ -94,6 +96,8 @@ func (m Model) listKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.mode = modePauseAll
 	case "n":
 		return m.openNewForm()
+	case "t":
+		return m.openTargets()
 	}
 	t, ok := m.current()
 	if !ok {

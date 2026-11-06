@@ -1,0 +1,15 @@
+ herdrcron · targets
+  TARGET    REACHABILITY       HERDR                 LAST CHECK
+  local     ● reachable        0.9.1                 ✓ ok 5m ago
+› vps       ● reachable        ! 0.8.0 (want 0.9.1)  ✗ failed 1h ago
+  buildbox  ○ unreachable 10m  —                     — never
+
+ vps · last seen Nov 5 09:59
+  last check Nov 5 09:00
+  ✓ reachable
+  ✓ herdr server
+  ! herdr version         0.8.0, want 0.9.1
+  ✓ agent command claude  (factory-coordinator)
+  ✗ cwd /srv/factory      no such directory  (factory-coordinator, nightly-e2e)
+
+ ↑/↓ select  c check  pgup/pgdn scroll  esc back
