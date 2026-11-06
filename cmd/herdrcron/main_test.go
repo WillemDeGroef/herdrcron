@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -251,6 +252,29 @@ func TestInstallServiceRejectsArguments(t *testing.T) {
 	}
 	if called {
 		t.Error("service manager was run for an unexpected argument")
+	}
+}
+
+func TestInstallServicePropagatesServiceError(t *testing.T) {
+	xdg(t)
+	boom := errors.New("systemctl boom")
+	orig := serviceRunner
+	serviceRunner = func(context.Context, string, ...string) error { return boom }
+	t.Cleanup(func() { serviceRunner = orig })
+	fakeExecutable(t, "/usr/local/bin/herdrcron")
+
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{"install-service"}, &out, &errOut)
+	if code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	msg := errOut.String()
+	if !strings.Contains(msg, "systemctl boom") {
+		t.Fatalf("stderr = %q, want the wrapped error text", msg)
+	}
+	// Avoid "herdrcron install-service: systemctl …: systemctl …" double-prefix noise.
+	if strings.Count(msg, "install-service:") != 0 {
+		t.Errorf("stderr should not repeat install-service prefix: %q", msg)
 	}
 }
 

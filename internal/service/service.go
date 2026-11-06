@@ -115,6 +115,9 @@ func systemdUnit(o Options) string {
 	b.WriteString("[Service]\n")
 	b.WriteString("Type=simple\n")
 	fmt.Fprintf(&b, "ExecStart=%s daemon\n", systemdExecArg(o.Binary))
+	// Do not kill detached child processes (e.g. `herdr server` started in
+	// preflight in its own session). See docs/herdr-findings.md.
+	b.WriteString("KillMode=process\n")
 	b.WriteString("Restart=on-failure\n")
 	b.WriteString("RestartSec=5\n")
 	for _, e := range serviceEnv(o.Getenv) {
@@ -157,7 +160,7 @@ func installSystemd(ctx context.Context, o Options) (string, error) {
 		{"--user", "restart", unitName},
 	} {
 		if err := o.Run(ctx, "systemctl", args...); err != nil {
-			return unit, fmt.Errorf("systemctl %s: %w", strings.Join(args, " "), err)
+			return unit, err
 		}
 	}
 	fmt.Fprintf(o.Out, "Enabled and started %s.\n", unitName)

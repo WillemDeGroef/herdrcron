@@ -224,7 +224,7 @@ func runInstallService(ctx context.Context, p paths.Paths, args []string, stdout
 		Out:    stdout,
 	})
 	if err != nil {
-		fmt.Fprintln(stderr, "herdrcron install-service:", err)
+		fmt.Fprintf(stderr, "herdrcron: %v\n", err)
 		return 1
 	}
 	return 0

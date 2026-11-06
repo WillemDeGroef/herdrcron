@@ -112,6 +112,7 @@ func TestLinuxUnitContent(t *testing.T) {
 		"[Service]",
 		"Type=simple",
 		"ExecStart=/usr/local/bin/herdrcron daemon",
+		"KillMode=process",
 		"Restart=on-failure",
 		"RestartSec=5",
 		`Environment="PATH=/usr/local/bin:/usr/bin:/bin"`,
