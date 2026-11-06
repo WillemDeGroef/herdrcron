@@ -52,6 +52,8 @@ type daemon struct {
 	disp      *dispatch.Dispatcher
 	clk       clock.Clock
 	log       *slog.Logger
+	// sshControlDir holds the ssh ControlMaster sockets of SSH targets.
+	sshControlDir string
 	// configFile is config.yaml, re-read by "reload".
 	configFile string
 	bus        *bus
@@ -118,7 +120,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	d := &daemon{
 		version: opts.Version, started: time.Now(), configDir: p.ConfigDir,
 		cfg: cfg, tasks: tasks, store: st, clk: clk, log: log,
-		configFile: p.ConfigFile(), bus: newBus(log),
+		configFile: p.ConfigFile(), bus: newBus(log), sshControlDir: p.SSHControlDir(),
 		versions: map[string]string{}, deleting: map[string]bool{},
 		dirty: map[string]struct{}{}, dirtyWake: make(chan struct{}, 1),
 	}
@@ -131,7 +133,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	}
 	targets := opts.Targets
 	if targets == nil {
-		targets = realTargets(cfg)
+		targets = realTargets(cfg, p.SSHControlDir())
 	}
 	notifier := notify.New(cfg.Notify, log)
 	d.notifier = notifier
@@ -239,15 +241,23 @@ func validTasks(entries []config.TaskEntry) []config.Task {
 	return out
 }
 
-// realTargets returns the targets runs can use. Only local exists so far;
-// SSH targets come later, and the runner fails their runs as unknown
-// targets meanwhile.
-func realTargets(cfg config.Config) map[string]target.Target {
+// realTargets returns the targets runs can use: local, and an SSH target
+// for every other target in config.yaml.
+func realTargets(cfg config.Config, sshControlDir string) map[string]target.Target {
 	targets := map[string]target.Target{}
-	if _, ok := cfg.Targets[config.LocalTarget]; ok {
-		targets[config.LocalTarget] = target.NewLocal()
+	for name, t := range cfg.Targets {
+		if name == config.LocalTarget {
+			targets[name] = target.NewLocal()
+			continue
+		}
+		targets[name] = sshTarget(name, t, sshControlDir)
 	}
 	return targets
+}
+
+// sshTarget is the SSH target for the config.yaml target name.
+func sshTarget(name string, t config.Target, controlDir string) *target.SSH {
+	return target.NewSSH(target.SSHConfig{Name: name, Host: t.Host, Shell: t.Shell, ControlDir: controlDir})
 }
 
 // logTask logs one loaded task. Never log prompt text or env values: only
