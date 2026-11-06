@@ -24,6 +24,7 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
 	"github.com/WillemDeGroef/herdrcron/internal/service"
 	"github.com/WillemDeGroef/herdrcron/internal/tui"
+	untilparse "github.com/WillemDeGroef/herdrcron/internal/until"
 
 	"github.com/charmbracelet/x/term"
 )
@@ -461,7 +462,7 @@ func runPause(ctx context.Context, p paths.Paths, args []string, now time.Time, 
 	}
 	params := api.PauseParams{ID: pos[0], Until: api.PauseIndefinite}
 	if set["until"] {
-		params.Until, err = parseUntil(*until, now, time.Local)
+		params.Until, err = untilparse.Parse(*until, now, time.Local)
 		if err != nil {
 			fmt.Fprintln(stderr, "herdrcron pause: --until:", err)
 			return 2
@@ -538,34 +539,6 @@ func formatGlobalPause(gp api.GlobalPause) string {
 		return "paused targets: " + strings.Join(gp.PausedTargets, ", ")
 	}
 	return "no global pause"
-}
-
-// untilLayouts are the zone-less forms --until accepts, read in local time.
-var untilLayouts = []string{"2006-01-02T15:04", "2006-01-02T15:04:05", "2006-01-02 15:04", "2006-01-02"}
-
-// parseUntil turns a --until value into an RFC 3339 time after now. s is
-// RFC 3339 with a zone, or one of untilLayouts read in loc.
-func parseUntil(s string, now time.Time, loc *time.Location) (string, error) {
-	if s == "" {
-		return "", errors.New("empty time")
-	}
-	t, err := time.Parse(time.RFC3339, s)
-	if err != nil {
-		parsed := false
-		for _, layout := range untilLayouts {
-			if lt, lerr := time.ParseInLocation(layout, s, loc); lerr == nil {
-				t, parsed = lt, true
-				break
-			}
-		}
-		if !parsed {
-			return "", fmt.Errorf("cannot read %q as a time; use RFC 3339 (2026-11-10T08:00:00Z) or local 2026-11-10T08:00, \"2026-11-10 08:00\" or 2026-11-10", s)
-		}
-	}
-	if !t.After(now) {
-		return "", fmt.Errorf("%s is in the past", t.Format(time.RFC3339))
-	}
-	return t.Format(time.RFC3339), nil
 }
 
 func runLogs(ctx context.Context, p paths.Paths, args []string, stdout, stderr io.Writer) int {

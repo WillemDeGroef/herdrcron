@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/WillemDeGroef/herdrcron/internal/api"
+	"github.com/WillemDeGroef/herdrcron/internal/until"
 )
 
 // pauseAllChoice is one entry of the P menu.
@@ -153,9 +154,6 @@ func (m Model) pauseMenuKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// untilLayouts are the forms the pause date prompt reads, in local time.
-var untilLayouts = []string{"2006-01-02 15:04", "2006-01-02T15:04", "2006-01-02"}
-
 func (m Model) pauseDateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -168,7 +166,7 @@ func (m Model) pauseDateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.mode = modeList
 			return m, nil
 		}
-		until, err := parseUntil(m.dateIn.Value(), m.now(), m.loc)
+		until, err := until.Parse(m.dateIn.Value(), m.now(), m.loc)
 		if err != nil {
 			m.setMessage("", err)
 			return m, nil // stay in the prompt to correct it
@@ -180,19 +178,6 @@ func (m Model) pauseDateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.dateIn, cmd = m.dateIn.Update(msg)
 	return m, cmd
-}
-
-// parseUntil reads s in one of untilLayouts and checks it lies after now.
-func parseUntil(s string, now time.Time, loc *time.Location) (string, error) {
-	for _, layout := range untilLayouts {
-		if t, err := time.ParseInLocation(layout, s, loc); err == nil {
-			if !t.After(now) {
-				return "", fmt.Errorf("%s is in the past", s)
-			}
-			return t.Format(time.RFC3339), nil
-		}
-	}
-	return "", fmt.Errorf("cannot read %q as a date; use 2026-11-10 08:00 or 2026-11-10", s)
 }
 
 // pauseAllChoices are the P menu entries for the selected task's target
@@ -241,33 +226,42 @@ func (m Model) pauseAllKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 // Actions. Each calls the daemon and reports the outcome as a doneMsg.
 
 func (m Model) setEnabled(id string, enabled bool) tea.Cmd {
-	verb := "disabled"
-	if enabled {
-		verb = "enabled"
-	}
-	return m.taskCall(api.MethodTasksSetEnabled, api.SetEnabledParams{ID: id, Enabled: enabled}, verb+" "+id)
+	return m.taskOutcome(api.MethodTasksSetEnabled, api.SetEnabledParams{ID: id, Enabled: enabled}, func(t api.TaskSummary) string {
+		verb := "disabled"
+		if t.Enabled {
+			verb = "enabled"
+		}
+		return verb + " " + t.ID
+	})
 }
 
 func (m Model) pause(id, until string) tea.Cmd {
-	text := "paused " + id + " indefinitely"
-	if until != api.PauseIndefinite {
-		text = "paused " + id + " until " + fireTime(until).In(m.loc).Format("Mon 02 Jan 15:04")
-	}
-	return m.taskCall(api.MethodTasksPause, api.PauseParams{ID: id, Until: until}, text)
+	return m.taskOutcome(api.MethodTasksPause, api.PauseParams{ID: id, Until: until}, func(t api.TaskSummary) string {
+		if until == api.PauseIndefinite || t.PausedUntil == api.PauseIndefinite {
+			return "paused " + t.ID + " indefinitely"
+		}
+		if t.PausedUntil != "" {
+			return "paused " + t.ID + " until " + m.when(t.PausedUntil)
+		}
+		return "paused " + t.ID
+	})
 }
 
 func (m Model) resume(id string) tea.Cmd {
-	return m.taskCall(api.MethodTasksResume, api.TaskIDParams{ID: id}, "resumed "+id)
+	return m.taskOutcome(api.MethodTasksResume, api.TaskIDParams{ID: id}, func(t api.TaskSummary) string {
+		return "resumed " + t.ID
+	})
 }
 
-// taskCall makes a call whose result is the changed task.
-func (m Model) taskCall(method string, params any, text string) tea.Cmd {
+// taskOutcome makes a call and builds the message line from the task the daemon returns.
+func (m Model) taskOutcome(method string, params any, line func(api.TaskSummary) string) tea.Cmd {
 	ctx, b := m.ctx, m.backend
 	return func() tea.Msg {
-		if err := b.Call(ctx, method, params, nil); err != nil {
+		var t api.TaskSummary
+		if err := b.Call(ctx, method, params, &t); err != nil {
 			return doneMsg{err: fmt.Errorf("%s: %w", method, err)}
 		}
-		return doneMsg{text: text}
+		return doneMsg{text: line(t)}
 	}
 }
 
