@@ -372,6 +372,34 @@ func TestFormPickerEditClearsItsDaemonErrors(t *testing.T) {
 	}
 }
 
+func TestOpenEditFormCoversTheListWhileLoading(t *testing.T) {
+	m := newTestModel(fixture(), plain())
+	m, _ = m.openEditForm("peppol-sh-deps")
+	if m.screen != screenForm {
+		t.Fatalf("screen = %v, want the form while the task loads", m.screen)
+	}
+	if !strings.Contains(m.View(), "loading the task") {
+		t.Fatalf("view =\n%s", m.View())
+	}
+	// enter is the list's "open detail". On the loading form it must not leave.
+	m, _ = m.key(key("enter"))
+	if m.screen != screenForm {
+		t.Fatalf("enter left the loading form for screen %v", m.screen)
+	}
+	// A load for this open is applied. One from a form the user already
+	// closed is not, and it does not pull them back.
+	m, _, handled := m.formMsg(formLoadedMsg{seq: m.form.seq, det: peppolDetail()})
+	if !handled || m.screen != screenForm || !strings.Contains(m.View(), "edit task peppol-sh-deps") {
+		t.Fatalf("the load did not open the edit form:\n%s", m.View())
+	}
+	seq := m.form.seq
+	m = m.closeForm()
+	m, _, _ = m.formMsg(formLoadedMsg{seq: seq, det: peppolDetail()})
+	if m.screen != screenMain {
+		t.Fatalf("a load for a closed form reopened it")
+	}
+}
+
 func TestOpenNewFormResetsTheErrorFlag(t *testing.T) {
 	m := newTestModel(fixture(), plain())
 	m.setMessage("", errors.New("old failure"))

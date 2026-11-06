@@ -348,8 +348,10 @@ const DefaultOutputLines = 200
 const MaxOutputLines = 2000
 
 // RunsOutputResult is the result of "runs.output". For an active run
-// Output is the pane's recent text with ANSI escapes kept and Live is set;
-// for an ended run Output is its stored output_tail (plain text).
+// Output is the pane's recent text with ANSI escapes kept and Live is set.
+// A run still starting, with no pane yet, is live too (Output is the stored
+// tail, usually empty). For an ended run Output is its stored output_tail
+// (plain text) and Live is false.
 type RunsOutputResult struct {
 	RunID  string `json:"run_id"`
 	Status string `json:"status"`

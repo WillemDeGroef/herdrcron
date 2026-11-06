@@ -52,6 +52,7 @@ type fakeHerdr struct {
 	bin         string        // the herdr binary it answers to; "" means "herdr"
 	readErr     error         // pane read --format ansi fails with it
 	putGate     chan struct{} // PutFile waits until it is closed
+	execGate    chan struct{} // Exec waits until it is closed
 }
 
 func newFakeHerdr() *fakeHerdr {
@@ -115,6 +116,21 @@ func (f *fakeHerdr) setReadErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.readErr = err
+}
+
+// holdExec makes every Exec wait until the returned function is called.
+// A run blocked here has been stored as starting and has no pane yet.
+func (f *fakeHerdr) holdExec() (release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gate := make(chan struct{})
+	f.execGate = gate
+	return sync.OnceFunc(func() {
+		f.mu.Lock()
+		f.execGate = nil
+		f.mu.Unlock()
+		close(gate)
+	})
 }
 
 // holdPutFile makes PutFile (the prompt write, after the tab is opened)
@@ -196,6 +212,12 @@ func ok[T any](v T) ([]byte, error) {
 }
 
 func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte, error) {
+	f.mu.Lock()
+	gate := f.execGate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, slices.Clone(argv))

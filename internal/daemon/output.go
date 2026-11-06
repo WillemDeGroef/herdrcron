@@ -13,8 +13,9 @@ import (
 )
 
 // runsOutput returns an active run's pane text, ANSI kept, read live from
-// herdr (at most api.MaxOutputLines lines); for a run that has ended (or has no pane yet) it returns the
-// stored output tail.
+// herdr (at most api.MaxOutputLines lines). A run still starting, with no
+// pane yet, is live with its stored tail (usually empty) so the client
+// keeps polling. A run that has ended returns the stored output tail.
 func (d *daemon) runsOutput(ctx context.Context, params json.RawMessage) (any, error) {
 	var p api.RunsOutputParams
 	if err := decodeParams(params, &p); err != nil {
@@ -34,9 +35,21 @@ func (d *daemon) runsOutput(ctx context.Context, params json.RawMessage) (any, e
 	if err == nil {
 		return api.RunsOutputResult{RunID: run.ID, Status: run.Status, Live: true, Output: out}, nil
 	}
+	// No pane yet: the run is still starting. Say so, and stay live while
+	// the runner tracks it, instead of looking like an ended run.
+	if errors.Is(err, runner.ErrNoPane) {
+		stored, gerr := d.store.GetRun(ctx, p.RunID)
+		if errors.Is(gerr, store.ErrNotFound) {
+			return nil, api.InvalidParams(fmt.Errorf("run %s not found", p.RunID))
+		}
+		if gerr != nil {
+			return nil, gerr
+		}
+		return api.RunsOutputResult{RunID: stored.ID, Status: stored.Status, Live: d.runner.Live(p.RunID), Output: stored.OutputTail}, nil
+	}
 	// A run that ended between the lookup and the read has its tail stored;
 	// a run still tracked (active or starting) gets the read error.
-	if !errors.Is(err, runner.ErrNotActive) && !errors.Is(err, runner.ErrNoPane) && d.runner.Live(p.RunID) {
+	if !errors.Is(err, runner.ErrNotActive) && d.runner.Live(p.RunID) {
 		return nil, fmt.Errorf("read output of run %s: %w", p.RunID, err)
 	}
 	stored, err := d.store.GetRun(ctx, p.RunID)

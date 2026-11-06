@@ -120,9 +120,14 @@ func (m Model) openNewForm() (Model, tea.Cmd) {
 	return m, nil
 }
 
-// openEditForm opens the form on task id.
+// openEditForm opens the form on task id. The form shows at once, while
+// tasks.get is in flight: a load that finished later must not cover a
+// screen the user opened in the meantime, and a failed load must not
+// send them back to the list from detail or live output.
 func (m Model) openEditForm(id string) (Model, tea.Cmd) {
 	m.form = formState{seq: m.form.seq + 1}
+	m.screen = screenForm
+	m.setMessage("", nil)
 	return m, m.loadForm(id)
 }
 
@@ -431,7 +436,7 @@ func (m Model) formMsg(msg tea.Msg) (Model, tea.Cmd, bool) {
 	}
 	switch msg := msg.(type) {
 	case formLoadedMsg:
-		if msg.seq != m.form.seq {
+		if msg.seq != m.form.seq || m.screen != screenForm {
 			return m, nil, true
 		}
 		if msg.err != nil {

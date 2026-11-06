@@ -186,6 +186,12 @@ func (m Model) runOutputKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.detail.outSeq++
 		m.setMessage("", nil)
 		return m, nil
+	case "l":
+		// The title says l follows a live run. The viewport would otherwise
+		// take l as "scroll right".
+		if m.detail.outRes.Live {
+			return m.openOutput(m.detail.id)
+		}
 	}
 	m.sizeRunOutput()
 	var cmd tea.Cmd
@@ -228,7 +234,11 @@ func (m Model) runOutputView() string {
 	if m.mode == modeConfirm {
 		b.WriteString(m.footer())
 	} else {
-		b.WriteString(m.st.dim.Render(" ↑/↓ pgup/pgdn scroll  esc back"))
+		help := " ↑/↓ pgup/pgdn scroll  esc back"
+		if ds.outRes.Live {
+			help = " ↑/↓ pgup/pgdn scroll  l follow  esc back"
+		}
+		b.WriteString(m.st.dim.Render(help))
 	}
 	return b.String()
 }

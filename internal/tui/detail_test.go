@@ -161,6 +161,22 @@ func TestDetailEnterOnRunShowsItsOutput(t *testing.T) {
 	finalView(t, tm)
 }
 
+func TestDetailLiveRunLFollowsIt(t *testing.T) {
+	f := detailFixture()
+	f.set(api.MethodRunsOutput, liveOutput("from the run\n"))
+	tm := openCoordinatorDetail(t, f)
+	tm.Send(key("enter"))
+	waitText(t, tm, "l follows it")
+	tm.Send(key("l"))
+	waitText(t, tm, "a attach")
+	view := finalView(t, tm)
+	for _, s := range []string{"live output", "from the run", "a attach"} {
+		if !strings.Contains(view, s) {
+			t.Errorf("l did not open live output, view lacks %q:\n%s", s, view)
+		}
+	}
+}
+
 func TestDetailCursorMovesUpAndDown(t *testing.T) {
 	f := detailFixture()
 	f.set(api.MethodRunsOutput, api.RunsOutputResult{RunID: "r1x", Status: "done", Output: "all good"})

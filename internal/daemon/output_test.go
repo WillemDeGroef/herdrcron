@@ -53,7 +53,7 @@ func TestRunsOutputReadsTheLivePaneWithColours(t *testing.T) {
 	if got.RunID != run.ID || got.Status != store.StatusRunning || !got.Live || got.Output != "\x1b[32mworking\x1b[0m\n" {
 		t.Errorf("runs.output = %+v, want the live ANSI pane text", got)
 	}
-	want := []string{"herdr", "pane", "read", run.HerdrPane, "--source", "recent-unwrapped", "--lines", "200", "--format", "ansi"}
+	want := []string{"herdr", "pane", "read", run.HerdrPane, "--source", "recent", "--lines", "200", "--format", "ansi"}
 	if c := l.herdr.lastCall("herdr", "pane", "read"); !slices.Equal(c, want) {
 		t.Errorf("pane read = %q, want %q", c, want)
 	}
@@ -110,6 +110,45 @@ func TestRunsOutputReportsAReadErrorOfAStartingRun(t *testing.T) {
 	got, err := l.output(runID, 0)
 	if err == nil || !strings.Contains(err.Error(), "socket gone") {
 		t.Errorf("runs.output = %+v, %v; want the read error", got, err)
+	}
+	release()
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRunsOutputOfAStartingRunWithNoPaneStaysLive checks that pressing l
+// before the pane exists does not look like the run ended.
+func TestRunsOutputOfAStartingRunWithNoPaneStaysLive(t *testing.T) {
+	l := newLifecycle(t, outputNow, "timeout: 1h\n")
+	l.start()
+	release := l.herdr.holdExec()
+	defer release()
+	c2, err := api.Dial(l.p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c2.Close() }()
+	started := make(chan error, 1)
+	go func() {
+		started <- c2.Call(context.Background(), api.MethodTasksRunNow, api.RunNowParams{ID: "job"}, nil)
+	}()
+	var runID string
+	eventually(t, "a starting run with no pane", func() bool {
+		for _, r := range l.runs() {
+			if r.Status == store.StatusStarting && r.HerdrPane == "" {
+				runID = r.ID
+			}
+		}
+		return runID != ""
+	})
+
+	got, err := l.output(runID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RunID != runID || got.Status != store.StatusStarting || !got.Live {
+		t.Errorf("runs.output = %+v, want a live starting run", got)
 	}
 	release()
 	if err := <-started; err != nil {

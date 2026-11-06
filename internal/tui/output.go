@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/WillemDeGroef/herdrcron/internal/api"
 )
@@ -147,7 +148,9 @@ func (m Model) outputMsg(msg tea.Msg) (Model, tea.Cmd, bool) {
 		}
 		m.output.readErr = ""
 		m.output.res = msg.res
-		if !msg.res.Live {
+		// Live is the pane read. A run that is still starting has no pane
+		// yet: its status is active and Live is false, and polling goes on.
+		if !msg.res.Live && !activeStatus(msg.res.Status) {
 			m.output.ended = true
 			return m, nil, true
 		}
@@ -208,10 +211,15 @@ func (m Model) outputView() string {
 		body = []string{m.st.dim.Render("  loading…")}
 	case o.res.Output != "":
 		body = strings.Split(strings.TrimRight(o.res.Output, "\n"), "\n")
+	case !o.ended && activeStatus(o.res.Status):
+		body = []string{m.st.dim.Render("  waiting for output…")}
 	}
 	if o.ended {
 		body = append(body, m.st.warning.Render("run ended: "+o.res.Status))
 	}
+	// Reflow to the terminal width before keeping the last screenful, so
+	// the tail of a long line stays on screen. fit would otherwise cut it.
+	body = wrapLines(body, m.width)
 	// The last screenful: title, message and footer take three lines.
 	if n := m.height - 3; m.height > 0 && len(body) > n {
 		body = body[len(body)-max(n, 0):]
@@ -233,4 +241,18 @@ func (m Model) outputView() string {
 		b.WriteString(m.st.dim.Render(" esc back  a attach"))
 	}
 	return b.String()
+}
+
+// wrapLines reflows each line to width columns, keeping ANSI sequences.
+// width <= 0 leaves the lines alone (the terminal size is not known yet).
+func wrapLines(lines []string, width int) []string {
+	if width <= 0 {
+		return lines
+	}
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		wrapped := strings.TrimRight(ansi.Wrap(l, width, ""), "\n")
+		out = append(out, strings.Split(wrapped, "\n")...)
+	}
+	return out
 }

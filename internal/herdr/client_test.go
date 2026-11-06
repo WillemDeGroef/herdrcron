@@ -211,7 +211,7 @@ func TestPaneReadANSI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkArgv(t, f, "/opt/herdr", "pane", "read", "w15:p2", "--source", "recent-unwrapped", "--lines", "50", "--format", "ansi")
+	checkArgv(t, f, "/opt/herdr", "pane", "read", "w15:p2", "--source", "recent", "--lines", "50", "--format", "ansi")
 	if got != text {
 		t.Errorf("text = %q, want %q", got, text)
 	}

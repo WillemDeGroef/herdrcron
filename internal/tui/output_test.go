@@ -64,6 +64,36 @@ func TestLiveOutputShowsThePaneWithANSIKept(t *testing.T) {
 	}
 }
 
+func TestLiveOutputWrapsALongLine(t *testing.T) {
+	f := fixture()
+	line := strings.Repeat("a", 200) + "TAIL"
+	f.set(api.MethodRunsOutput, liveOutput(line+"\n"))
+	tm := openLiveOutput(t, f)
+	waitText(t, tm, "TAIL")
+	view := finalView(t, tm)
+	if strings.Contains(view, "…") {
+		t.Errorf("a long line was cut instead of wrapped:\n%s", view)
+	}
+	if strings.Contains(view, line) {
+		t.Errorf("a long line was left wider than the terminal:\n%s", view)
+	}
+}
+
+func TestLiveOutputKeepsPollingAStartingRun(t *testing.T) {
+	fastPoll(t)
+	f := fixture()
+	f.set(api.MethodRunsOutput, api.RunsOutputResult{RunID: "r3", Status: "starting"})
+	tm := openLiveOutput(t, f)
+	waitText(t, tm, "waiting for output")
+	waitCall(t, f, api.MethodRunsOutput, 2) // still polling: a starting run has not ended
+	f.set(api.MethodRunsOutput, liveOutput("now running\n"))
+	waitText(t, tm, "now running")
+	view := finalView(t, tm)
+	if strings.Contains(view, "run ended") {
+		t.Errorf("a starting run was treated as ended:\n%s", view)
+	}
+}
+
 func TestLiveOutputShowsTheLastScreenful(t *testing.T) {
 	f := fixture()
 	var lines []string
