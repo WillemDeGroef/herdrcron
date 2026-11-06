@@ -264,21 +264,72 @@ func TestAttachCmdErrors(t *testing.T) {
 	wantInvalidParams(t, "ended run", err, "run "+run.ID+" is not active")
 }
 
-func TestAttachCmdRefusesRemoteTargetsForNow(t *testing.T) {
-	l := newLifecycle(t, outputNow, "timeout: 1h\n")
-	l.withConfig("targets:\n  vps:\n    host: vps\n")
-	write(t, filepath.Join(l.p.TasksDir(), "job.yaml"), `id: job
+// startRemote starts the daemon with a task "job" on the SSH target vps,
+// served by the fake herdr, after config.yaml is set to yaml.
+func (l *lifecycle) startRemote(yaml string) api.RunNowResult {
+	l.t.Helper()
+	l.withConfig(yaml)
+	write(l.t, filepath.Join(l.p.TasksDir(), "job.yaml"), `id: job
 target: vps
 cwd: /tmp/repo
 schedule: "@daily"
 agent: {command: claude}
 timeout: 1h
 `)
-	l.c, l.stop = runDaemon(t, l.p, daemon.Options{
+	l.c, l.stop = runDaemon(l.t, l.p, daemon.Options{
 		Version: "test", Clock: l.clk, Targets: map[string]target.Target{"vps": l.herdr},
 	})
-	run := l.mustRunNow()
+	return l.mustRunNow()
+}
 
-	_, err := l.attachCmd(run.ID)
-	wantInvalidParams(t, "remote run", err, "comes with SSH targets")
+func TestAttachCmdOnARemoteTargetUsesSSHWithATTY(t *testing.T) {
+	l := newLifecycle(t, outputNow, "timeout: 1h\n")
+	l.herdr.setBin("/opt/herdr")
+	run := l.startRemote("targets:\n  vps:\n    host: vps-alias\n    herdr_path: /opt/herdr\n")
+
+	got, err := l.attachCmd(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"ssh", "-t",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=" + target.SSHControlSocketPath(filepath.Join(l.p.StateDir, "ssh"), "vps-alias"),
+		"-o", "ControlPersist=10m",
+		"-o", "ConnectTimeout=10",
+		"--", "vps-alias",
+		"bash -lc '/opt/herdr agent attach " + run.HerdrPane + "'",
+	}
+	if !slices.Equal(got.Argv, want) || got.Mode != api.AttachPane {
+		t.Errorf("runs.attach_cmd = %+v,\nwant argv %q in pane mode", got, want)
+	}
+}
+
+func TestAttachCmdOnARemoteTargetInFullModeUsesHerdrRemote(t *testing.T) {
+	l := newLifecycle(t, outputNow, "timeout: 1h\n")
+	l.herdr.setBin("/opt/herdr")
+	run := l.startRemote("attach_mode: full\ntargets:\n  local:\n    herdr_path: /usr/local/bin/herdr\n  vps:\n    host: vps-alias\n    herdr_path: /opt/herdr\n")
+
+	got, err := l.attachCmd(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"/usr/local/bin/herdr", "--remote", "vps-alias"}; !slices.Equal(got.Argv, want) || got.Mode != api.AttachFull {
+		t.Errorf("runs.attach_cmd = %+v, want argv %q", got, want)
+	}
+}
+
+func TestAttachCmdOnARemoteTargetFallsBackToHerdrRemote(t *testing.T) {
+	l := newLifecycle(t, outputNow, "timeout: 1h\n")
+	run := l.startRemote("targets:\n  vps: {}\n")
+	l.herdr.set(run.HerdrPane, paneNoAgent)
+
+	got, err := l.attachCmd(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The target name is the SSH alias when host is not set.
+	if want := []string{"herdr", "--remote", "vps"}; !slices.Equal(got.Argv, want) || got.Mode != api.AttachFull {
+		t.Errorf("runs.attach_cmd = %+v, want argv %q", got, want)
+	}
 }

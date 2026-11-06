@@ -4,7 +4,6 @@
 package target
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -45,14 +44,7 @@ const maxStderrInError = 200
 // env values or prompt text) and the first line of stderr.
 func (e *ExitError) Error() string {
 	name := strings.Join(e.Argv[:min(len(e.Argv), 3)], " ")
-	msg := bytes.TrimSpace(e.Stderr)
-	if i := bytes.IndexByte(msg, '\n'); i >= 0 {
-		msg = bytes.TrimSpace(msg[:i])
-	}
-	if len(msg) > maxStderrInError {
-		msg = msg[:maxStderrInError]
-	}
-	return fmt.Sprintf("%s: exit %d: %s", name, e.Code, msg)
+	return fmt.Sprintf("%s: exit %d: %s", name, e.Code, firstLine(e.Stderr))
 }
 
 // Fake is a Target that runs nothing: it records every call and answers
