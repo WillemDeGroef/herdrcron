@@ -4,17 +4,24 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
+	"os/user"
+	"path/filepath"
+	"runtime"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/api"
 	"github.com/WillemDeGroef/herdrcron/internal/daemon"
+	"github.com/WillemDeGroef/herdrcron/internal/logread"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
+	"github.com/WillemDeGroef/herdrcron/internal/service"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -23,9 +30,16 @@ var version = "dev"
 const usage = `usage: herdrcron <command>
 
 commands:
-  daemon   run the daemon in the foreground
-  list     list tasks with target, schedule and state
+  daemon            run the daemon in the foreground
+  list              list tasks with target, schedule and state
+  logs [-f] [--task <id>]
+                    print the daemon log; -f follows it, --task filters by task
+  install-service   install and start the daemon as a systemd user service
+                    (Linux) or launchd agent (macOS)
 `
+
+// serviceRunner runs systemctl/launchctl for install-service; tests swap it.
+var serviceRunner service.Runner = service.ExecRunner
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -49,6 +63,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return runDaemon(ctx, p, stderr)
 	case "list":
 		return runList(ctx, p, stdout, stderr)
+	case "logs":
+		return runLogs(ctx, p, args[1:], stdout, stderr)
+	case "install-service":
+		return runInstallService(ctx, p, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -114,4 +132,59 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+func runLogs(ctx context.Context, p paths.Paths, args []string, stdout, stderr io.Writer) int {
+	fl := flag.NewFlagSet("logs", flag.ContinueOnError)
+	fl.SetOutput(stderr)
+	follow := fl.Bool("f", false, "follow the log")
+	task := fl.String("task", "", "only lines about this task id")
+	if err := fl.Parse(args); err != nil {
+		return 2
+	}
+	if fl.NArg() > 0 {
+		fmt.Fprintf(stderr, "herdrcron logs: unexpected argument %q\n", fl.Arg(0))
+		return 2
+	}
+	err := logread.Print(ctx, p.Log(), stdout, logread.Options{TaskID: *task, Follow: *follow})
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			fmt.Fprintln(stderr, "herdrcron:", err)
+		} else {
+			fmt.Fprintln(stderr, "herdrcron logs:", err)
+		}
+		return 1
+	}
+	return 0
+}
+
+func runInstallService(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
+	bin, err := os.Executable()
+	if err == nil {
+		bin, err = filepath.EvalSymlinks(bin)
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "herdrcron: cannot find own executable:", err)
+		return 1
+	}
+	username := os.Getenv("USER")
+	if u, err := user.Current(); err == nil {
+		username = u.Username
+	}
+	_, err = service.Install(ctx, service.Options{
+		GOOS:   runtime.GOOS,
+		Binary: bin,
+		Home:   os.Getenv("HOME"),
+		Getenv: os.Getenv,
+		Paths:  p,
+		UID:    os.Getuid(),
+		User:   username,
+		Run:    serviceRunner,
+		Out:    stdout,
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, "herdrcron install-service:", err)
+		return 1
+	}
+	return 0
 }

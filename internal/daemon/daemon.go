@@ -15,6 +15,7 @@ import (
 
 	"github.com/WillemDeGroef/herdrcron/internal/api"
 	"github.com/WillemDeGroef/herdrcron/internal/config"
+	"github.com/WillemDeGroef/herdrcron/internal/logging"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
 )
 
@@ -33,15 +34,15 @@ type daemon struct {
 }
 
 // Run loads the configuration and tasks, then serves the API on the socket
-// until ctx is done. It logs JSON to daemon.log. An invalid config.yaml stops
+// until ctx is done. It logs JSON to daemon.log, rotated by size. An invalid config.yaml stops
 // startup; an invalid task file does not.
 func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	if err := os.MkdirAll(p.StateDir, 0o700); err != nil {
 		return fmt.Errorf("create state directory: %w", err)
 	}
-	logFile, err := os.OpenFile(p.Log(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	logFile, err := logging.Open(p.Log())
 	if err != nil {
-		return fmt.Errorf("open log: %w", err)
+		return err
 	}
 	defer func() { _ = logFile.Close() }()
 	log := slog.New(slog.NewJSONHandler(logFile, nil))
@@ -85,7 +86,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 // the prompt file path and the env keys.
 func logTask(log *slog.Logger, e config.TaskEntry) {
 	if e.Err != nil {
-		log.Warn("task invalid", "task_id", e.ID, "file", e.File, "err", e.Err)
+		log.Warn("task invalid", logging.KeyTaskID, e.ID, "file", e.File, "err", e.Err)
 		return
 	}
 	envKeys := make([]string, 0, len(e.Task.Env))
@@ -93,7 +94,7 @@ func logTask(log *slog.Logger, e config.TaskEntry) {
 		envKeys = append(envKeys, k)
 	}
 	sort.Strings(envKeys)
-	log.Info("task loaded", "task_id", e.ID, "target", e.Task.Target, "file", e.File,
+	log.Info("task loaded", logging.KeyTaskID, e.ID, logging.KeyTarget, e.Task.Target, "file", e.File,
 		"schedule", e.Task.Schedule, "enabled", e.Task.Enabled,
 		"prompt_file", e.Task.PromptFile, "env_keys", envKeys)
 }
