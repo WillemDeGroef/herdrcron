@@ -125,7 +125,9 @@ func (d *daemon) targetsCheck(ctx context.Context, params json.RawMessage) (any,
 		Items: make([]api.TargetCheckItem, 0, len(c.Items)),
 	}
 	for _, it := range c.Items {
-		res.Items = append(res.Items, api.TargetCheckItem{Name: it.Name, Result: it.Result, Detail: it.Detail, Tasks: it.Tasks})
+		res.Items = append(res.Items, api.TargetCheckItem{
+			Kind: it.Kind, Name: it.Name, Result: it.Result, Detail: it.Detail, Tasks: it.Tasks,
+		})
 	}
 	d.checkMu.Lock()
 	d.lastChecks[p.Name] = res

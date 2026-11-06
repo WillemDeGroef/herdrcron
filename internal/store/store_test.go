@@ -260,6 +260,31 @@ func TestLastRun(t *testing.T) {
 	assertRunEqual(t, got, newer)
 }
 
+func TestLastNonManualRun(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	if _, ok, err := s.LastNonManualRun(ctx, "a"); err != nil || ok {
+		t.Fatalf("LastNonManualRun empty = ok %v, err %v; want false, nil", ok, err)
+	}
+	base := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	scheduled := newRun("a", base)
+	scheduled.Trigger = store.TriggerSchedule
+	scheduled.Status = store.StatusHostUnreachable
+	manualNewer := newRun("a", base.Add(time.Minute))
+	manualNewer.Trigger = store.TriggerManual
+	manualNewer.Status = store.StatusDone
+	for _, r := range []store.Run{scheduled, manualNewer} {
+		if err := s.InsertRun(ctx, r); err != nil {
+			t.Fatalf("InsertRun: %v", err)
+		}
+	}
+	got, ok, err := s.LastNonManualRun(ctx, "a")
+	if err != nil || !ok {
+		t.Fatalf("LastNonManualRun = ok %v, err %v; want true, nil", ok, err)
+	}
+	assertRunEqual(t, got, scheduled)
+}
+
 func TestTaskState(t *testing.T) {
 	s := openStore(t)
 	ctx := context.Background()

@@ -79,6 +79,9 @@ func TestCheckTargetAllOK(t *testing.T) {
 		if it.Result != runner.CheckOK {
 			t.Errorf("%s = %s %q, want ok", it.Name, it.Result, it.Detail)
 		}
+		if it.Kind == "" {
+			t.Errorf("%s: empty Kind", it.Name)
+		}
 	}
 	m := items(c)
 	if got := m["agent command claude"].Tasks; !slices.Equal(got, []string{"a", "b", "c"}) {

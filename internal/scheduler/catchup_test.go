@@ -43,6 +43,35 @@ func TestHostUnreachableFiresAreCaughtUpOnceWhenTheTargetAnswers(t *testing.T) {
 	}
 }
 
+// A newer manual run after host_unreachable must not hide the missed scheduled
+// fire: catch-up uses the latest non-manual run.
+func TestCatchUpTargetIgnoresManualRunsThatWouldHideHostUnreachable(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 11, 59, 0, 0, time.UTC))
+	e.setTasks(valid(onVPS(task("hourly", "@hourly"))))
+	e.starter.setUnreachable(true)
+	e.runUntil(time.Date(2026, 11, 6, 12, 1, 0, 0, time.UTC))
+	runs := e.runs("hourly")
+	if len(runs) != 1 || runs[0].Status != store.StatusHostUnreachable {
+		t.Fatalf("runs = %+v, want one host_unreachable", runs)
+	}
+	hu := runs[0]
+	e.starter.setUnreachable(false)
+	manual := store.Run{
+		ID: store.NewRunID(hu.StartedAt.Add(time.Second)), TaskID: "hourly", Target: "vps",
+		Trigger: store.TriggerManual, ScheduledAt: time.Time{}, StartedAt: hu.StartedAt.Add(time.Minute),
+		EndedAt: hu.StartedAt.Add(2 * time.Minute), Status: store.StatusDone,
+	}
+	if err := e.store.InsertRun(e.ctx, manual); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Set(time.Date(2026, 11, 6, 12, 30, 0, 0, time.UTC))
+	e.sched.CatchUpTarget(e.ctx, "vps")
+	calls := e.starter.Calls()[1:]
+	if len(calls) != 1 || calls[0].trigger != store.TriggerCatchUp || !calls[0].scheduledAt.Equal(hu.ScheduledAt) {
+		t.Fatalf("Start calls after catch-up = %+v, want one catch_up for scheduled_at %v", calls, hu.ScheduledAt)
+	}
+}
+
 func TestCatchUpTargetFollowsTheMissedPolicyAndWindow(t *testing.T) {
 	skip := onVPS(task("skip", "@hourly"))
 	skip.Missed = "skip"

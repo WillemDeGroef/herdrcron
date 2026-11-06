@@ -27,6 +27,15 @@ const (
 	MethodTargetsCheck = "targets.check" // TargetCheckParams → TargetCheck
 )
 
+// Stable ids for TargetCheckItem.Kind (preflight rows; Name stays human-readable).
+const (
+	CheckKindReachable    = "reachable"
+	CheckKindHerdrServer  = "herdr_server"
+	CheckKindHerdrVersion = "herdr_version"
+	CheckKindAgentCommand = "agent_command"
+	CheckKindCwd          = "cwd"
+)
+
 // Event names: the "method" of the notifications a subscribed connection
 // receives after the "subscribe" result.
 const (
@@ -177,6 +186,9 @@ type TargetCheck struct {
 
 // TargetCheckItem is one line of a TargetCheck.
 type TargetCheckItem struct {
+	// Kind is a stable machine id: CheckKindReachable, CheckKindHerdrServer,
+	// CheckKindHerdrVersion, CheckKindAgentCommand or CheckKindCwd.
+	Kind string `json:"kind"`
 	// Name is what was checked: "reachable", "herdr server",
 	// "herdr version", "agent command <cmd>" or "cwd <dir>".
 	Name   string `json:"name"`

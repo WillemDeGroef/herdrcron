@@ -42,6 +42,18 @@ timeout: 1h
 			t.Errorf("%s = %s %q", it.Name, it.Result, it.Detail)
 		}
 	}
+	wantKinds := []string{
+		api.CheckKindReachable, api.CheckKindHerdrServer, api.CheckKindHerdrVersion,
+		api.CheckKindAgentCommand, api.CheckKindAgentCommand,
+		api.CheckKindCwd, api.CheckKindCwd,
+	}
+	var gotKinds []string
+	for _, it := range got.Items {
+		gotKinds = append(gotKinds, it.Kind)
+	}
+	if !slices.Equal(gotKinds, wantKinds) {
+		t.Errorf("kinds = %q\nwant    %q", gotKinds, wantKinds)
+	}
 	// nightly (/tmp, claude) and other are on local; parked is on vps and
 	// broken is invalid.
 	want := []string{"reachable", "herdr server", "herdr version", "agent command claude",

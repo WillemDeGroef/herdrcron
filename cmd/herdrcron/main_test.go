@@ -890,11 +890,11 @@ func TestCheckPrintsTheReport(t *testing.T) {
 	p := xdg(t)
 	var name string
 	stubDaemon(t, p, checkStub(t, api.TargetCheck{Target: "vps", OK: false, Items: []api.TargetCheckItem{
-		{Name: "reachable", Result: api.CheckOK},
-		{Name: "herdr server", Result: api.CheckOK},
-		{Name: "herdr version", Result: api.CheckWarn, Detail: "got 0.9.0, want 0.9.1"},
-		{Name: "agent command claude", Result: api.CheckOK, Tasks: []string{"a", "b"}},
-		{Name: "cwd ~/src/x", Result: api.CheckFail, Detail: "does not exist", Tasks: []string{"a", "b"}},
+		{Kind: api.CheckKindReachable, Name: "reachable", Result: api.CheckOK},
+		{Kind: api.CheckKindHerdrServer, Name: "herdr server", Result: api.CheckOK},
+		{Kind: api.CheckKindHerdrVersion, Name: "herdr version", Result: api.CheckWarn, Detail: "got 0.9.0, want 0.9.1"},
+		{Kind: api.CheckKindAgentCommand, Name: "agent command claude", Result: api.CheckOK, Tasks: []string{"a", "b"}},
+		{Kind: api.CheckKindCwd, Name: "cwd ~/src/x", Result: api.CheckFail, Detail: "does not exist", Tasks: []string{"a", "b"}},
 	}}, &name))
 	var out, errOut bytes.Buffer
 	if code := run(context.Background(), []string{"check", "vps"}, &out, &errOut); code != 1 {
@@ -904,11 +904,11 @@ func TestCheckPrintsTheReport(t *testing.T) {
 		t.Errorf("name = %q, want vps", name)
 	}
 	want := `target vps: FAILED
-  ok    reachable
-  ok    herdr server
-  warn  herdr version  got 0.9.0, want 0.9.1
-  ok    agent command claude  (tasks: a, b)
-  fail  cwd ~/src/x  does not exist  (tasks: a, b)
+  ok    reachable           reachable
+  ok    herdr_server        herdr server
+  warn  herdr_version       herdr version  got 0.9.0, want 0.9.1
+  ok    agent_command       agent command claude  (tasks: a, b)
+  fail  cwd                 cwd ~/src/x  does not exist  (tasks: a, b)
 `
 	if got := out.String(); got != want {
 		t.Errorf("stdout =\n%s\nwant\n%s", got, want)
@@ -919,13 +919,13 @@ func TestCheckOKExitsZero(t *testing.T) {
 	p := xdg(t)
 	var name string
 	stubDaemon(t, p, checkStub(t, api.TargetCheck{Target: "local", OK: true, Items: []api.TargetCheckItem{
-		{Name: "reachable", Result: api.CheckOK},
+		{Kind: api.CheckKindReachable, Name: "reachable", Result: api.CheckOK},
 	}}, &name))
 	var out, errOut bytes.Buffer
 	if code := run(context.Background(), []string{"check", "local"}, &out, &errOut); code != 0 {
 		t.Errorf("exit %d: %s", code, errOut.String())
 	}
-	if got, want := out.String(), "target local: ok\n  ok    reachable\n"; got != want {
+	if got, want := out.String(), "target local: ok\n  ok    reachable           reachable\n"; got != want {
 		t.Errorf("stdout = %q, want %q", got, want)
 	}
 }

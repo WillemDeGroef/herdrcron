@@ -327,6 +327,26 @@ func (s *Store) LastRun(ctx context.Context, taskID string) (r Run, ok bool, err
 	return runs[0], true, nil
 }
 
+// LastNonManualRun returns the newest run whose trigger is not manual, by
+// start time. ok is false if every run is manual or there are none.
+// Catch-up after a target outage uses this so a newer "run now" does not
+// hide a host_unreachable scheduled fire.
+func (s *Store) LastNonManualRun(ctx context.Context, taskID string) (r Run, ok bool, err error) {
+	if taskID == "" {
+		return Run{}, false, errors.New("last non-manual run: empty task id")
+	}
+	runs, err := s.ListRuns(ctx, taskID, 0)
+	if err != nil {
+		return Run{}, false, fmt.Errorf("last non-manual run of %s: %w", taskID, err)
+	}
+	for _, run := range runs {
+		if run.Trigger != TriggerManual {
+			return run, true, nil
+		}
+	}
+	return Run{}, false, nil
+}
+
 // TaskState is the scheduling state the daemon keeps per task.
 type TaskState struct {
 	TaskID     string

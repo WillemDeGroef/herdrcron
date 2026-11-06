@@ -393,10 +393,10 @@ func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now t
 
 // CatchUpTarget applies the missed policy to the fires that found the
 // target unreachable, now that it answers again. A task on the target with
-// missed: run_once whose last run is a host_unreachable fire (trigger
-// schedule or catch_up) inside catch_up_window gets one catch_up run for
-// that fire, however many fires were missed: each one after the first
-// left a newer host_unreachable run, so the last run names the latest.
+// missed: run_once whose latest non-manual run is a host_unreachable fire
+// (trigger schedule or catch_up) inside catch_up_window gets one catch_up
+// run for that fire, however many fires were missed: each one after the
+// first left a newer host_unreachable run, so that run names the latest.
 // The usual suppression applies (disabled, paused, global pause).
 func (s *Scheduler) CatchUpTarget(ctx context.Context, target string) {
 	now := s.clock.Now()
@@ -412,7 +412,7 @@ func (s *Scheduler) CatchUpTarget(ctx context.Context, target string) {
 	wctx := context.WithoutCancel(ctx)
 	for _, t := range tasks {
 		log := s.log.With(logging.KeyTaskID, t.ID, logging.KeyTarget, t.Target)
-		last, ok, err := s.store.LastRun(ctx, t.ID)
+		last, ok, err := s.store.LastNonManualRun(ctx, t.ID)
 		if err != nil {
 			log.Error("cannot read last run for catch-up", "err", err)
 			continue

@@ -23,6 +23,15 @@ const (
 	CheckSkip = "skip" // not checked: the target is unreachable
 )
 
+// Stable ids for CheckItem.Kind (same values as api.CheckKind*).
+const (
+	CheckKindReachable    = "reachable"
+	CheckKindHerdrServer  = "herdr_server"
+	CheckKindHerdrVersion = "herdr_version"
+	CheckKindAgentCommand = "agent_command"
+	CheckKindCwd          = "cwd"
+)
+
 // Check is the preflight report of one target (CheckTarget).
 type Check struct {
 	Target    string
@@ -36,8 +45,10 @@ type Check struct {
 }
 
 // CheckItem is one line of a Check. Name is "reachable", "herdr server",
-// "herdr version", "agent command <cmd>" or "cwd <dir>".
+// "herdr version", "agent command <cmd>" or "cwd <dir>". Kind is a stable
+// id (CheckKind*).
 type CheckItem struct {
+	Kind   string
 	Name   string
 	Result string // CheckOK, CheckWarn, CheckFail or CheckSkip
 	Detail string
@@ -81,21 +92,23 @@ func (r *Runner) CheckTarget(ctx context.Context, name string, tasks []config.Ta
 	// poll worker is already counting down.
 	r.observe(name, err, false)
 	if errors.Is(err, target.ErrUnreachable) {
-		c.Items = append(c.Items, CheckItem{Name: "reachable", Result: CheckFail, Detail: err.Error()})
-		for _, n := range []string{"herdr server", "herdr version"} {
-			c.Items = append(c.Items, CheckItem{Name: n, Result: CheckSkip})
+		c.Items = append(c.Items, CheckItem{Kind: CheckKindReachable, Name: "reachable", Result: CheckFail, Detail: err.Error()})
+		for _, item := range []struct {
+			kind, name string
+		}{{CheckKindHerdrServer, "herdr server"}, {CheckKindHerdrVersion, "herdr version"}} {
+			c.Items = append(c.Items, CheckItem{Kind: item.kind, Name: item.name, Result: CheckSkip})
 		}
 		for _, g := range cmds {
-			c.Items = append(c.Items, CheckItem{Name: "agent command " + g.key, Result: CheckSkip, Tasks: g.tasks})
+			c.Items = append(c.Items, CheckItem{Kind: CheckKindAgentCommand, Name: "agent command " + g.key, Result: CheckSkip, Tasks: g.tasks})
 		}
 		for _, g := range cwds {
-			c.Items = append(c.Items, CheckItem{Name: "cwd " + g.key, Result: CheckSkip, Tasks: g.tasks})
+			c.Items = append(c.Items, CheckItem{Kind: CheckKindCwd, Name: "cwd " + g.key, Result: CheckSkip, Tasks: g.tasks})
 		}
 		return c, nil
 	}
-	c.Items = append(c.Items, CheckItem{Name: "reachable", Result: CheckOK})
+	c.Items = append(c.Items, CheckItem{Kind: CheckKindReachable, Name: "reachable", Result: CheckOK})
 
-	server := CheckItem{Name: "herdr server", Result: CheckOK}
+	server := CheckItem{Kind: CheckKindHerdrServer, Name: "herdr server", Result: CheckOK}
 	switch {
 	case herdr.IsCode(err, herdr.CodeServerNotRunning):
 		server.Result, server.Detail = CheckWarn, "not running; a run starts it"
@@ -104,7 +117,7 @@ func (r *Runner) CheckTarget(ctx context.Context, name string, tasks []config.Ta
 	}
 	c.Items = append(c.Items, server)
 
-	version := CheckItem{Name: "herdr version", Result: CheckOK}
+	version := CheckItem{Kind: CheckKindHerdrVersion, Name: "herdr version", Result: CheckOK}
 	got, err := ts.herdr.Version(ctx)
 	switch {
 	case err != nil:
@@ -153,7 +166,11 @@ func groupTasks(tasks []config.Task) (cmds, cwds []taskGroup) {
 // checkScript runs script with g.key as $1 through the target's shell. An
 // exit with code missing is a fail with detail missingDetail.
 func (r *Runner) checkScript(ctx context.Context, ts *targetState, prefix, script string, g taskGroup, missing int, missingDetail string) CheckItem {
-	it := CheckItem{Name: prefix + g.key, Result: CheckOK, Tasks: g.tasks}
+	kind := CheckKindAgentCommand
+	if prefix == "cwd " {
+		kind = CheckKindCwd
+	}
+	it := CheckItem{Kind: kind, Name: prefix + g.key, Result: CheckOK, Tasks: g.tasks}
 	argv := append(slices.Clone(ts.shell), script, "herdrcron", g.key)
 	ctx, cancel := context.WithTimeout(ctx, checkCallTimeout)
 	defer cancel()

@@ -325,7 +325,7 @@ func runCheck(ctx context.Context, p paths.Paths, args []string, stdout, stderr 
 }
 
 // printCheck writes a check report: a header, then one line per item with
-// its result, name, detail and tasks.
+// its result, kind, name, detail and tasks.
 func printCheck(out io.Writer, r api.TargetCheck) {
 	verdict := "ok"
 	if !r.OK {
@@ -333,7 +333,7 @@ func printCheck(out io.Writer, r api.TargetCheck) {
 	}
 	fmt.Fprintf(out, "target %s: %s\n", r.Target, verdict)
 	for _, it := range r.Items {
-		line := fmt.Sprintf("  %-4s  %s", it.Result, it.Name)
+		line := fmt.Sprintf("  %-4s  %-18s  %s", it.Result, it.Kind, it.Name)
 		if it.Detail != "" {
 			line += "  " + it.Detail
 		}
