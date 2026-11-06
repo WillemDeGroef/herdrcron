@@ -256,6 +256,9 @@ func TestInstallServiceRejectsArguments(t *testing.T) {
 }
 
 func TestInstallServicePropagatesServiceError(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("install-service only exercises the service stack on linux and darwin")
+	}
 	xdg(t)
 	boom := errors.New("systemctl boom")
 	orig := serviceRunner
