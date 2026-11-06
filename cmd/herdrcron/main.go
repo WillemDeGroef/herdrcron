@@ -23,12 +23,18 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/logread"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
 	"github.com/WillemDeGroef/herdrcron/internal/service"
+	"github.com/WillemDeGroef/herdrcron/internal/tui"
+
+	"github.com/charmbracelet/x/term"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
-const usage = `usage: herdrcron <command>
+const usage = `usage: herdrcron [<command>]
+
+Without a command herdrcron opens the TUI (over SSH: ssh -t host herdrcron).
+Quitting it leaves the daemon and every run as they are.
 
 commands:
   daemon            run the daemon in the foreground
@@ -75,14 +81,13 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprint(stderr, usage)
-		return 2
-	}
 	p, err := paths.FromEnv()
 	if err != nil {
 		fmt.Fprintln(stderr, "herdrcron:", err)
 		return 1
+	}
+	if len(args) == 0 {
+		return runTUI(ctx, p, stderr)
 	}
 	switch args[0] {
 	case "daemon":
@@ -120,6 +125,31 @@ func runDaemon(ctx context.Context, p paths.Paths, stderr io.Writer) int {
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "herdrcron daemon:", err)
+		return 1
+	}
+	return 0
+}
+
+// isTerminal reports whether stdin and stdout are a terminal, as the TUI
+// needs; tests swap it.
+var isTerminal = func() bool {
+	return term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd())
+}
+
+// runTUI opens the TUI on the daemon. It needs a terminal and a running
+// daemon; quitting it changes nothing in the daemon.
+func runTUI(ctx context.Context, p paths.Paths, stderr io.Writer) int {
+	if !isTerminal() {
+		fmt.Fprint(stderr, "herdrcron: the TUI needs a terminal; over SSH use `ssh -t host herdrcron`, in scripts use a command\n\n"+usage)
+		return 2
+	}
+	c := dial(p, stderr)
+	if c == nil {
+		return 1
+	}
+	_ = c.Close()
+	if err := tui.Run(ctx, tui.SocketBackend{Path: p.Socket()}); err != nil {
+		fmt.Fprintln(stderr, "herdrcron:", err)
 		return 1
 	}
 	return 0

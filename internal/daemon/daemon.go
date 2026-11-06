@@ -318,7 +318,7 @@ func (d *daemon) tasksList(ctx context.Context, _ json.RawMessage) (any, error) 
 
 // summary describes one task for the API. Call it with d.mu held.
 func (d *daemon) summary(ctx context.Context, e config.TaskEntry) (api.TaskSummary, error) {
-	s := api.TaskSummary{ID: e.ID, Name: e.Task.Name, Target: e.Task.Target, Schedule: e.Task.Schedule}
+	s := api.TaskSummary{ID: e.ID, Name: e.Task.Name, Target: e.Task.Target, Schedule: e.Task.Schedule, Enabled: e.Task.Enabled}
 	var verr *config.ValidationError
 	now := d.clk.Now()
 	switch {
@@ -326,7 +326,7 @@ func (d *daemon) summary(ctx context.Context, e config.TaskEntry) (api.TaskSumma
 		s.State, s.Error = api.StateInvalid, e.Err.Error()
 		if !errors.As(e.Err, &verr) {
 			// Unreadable or unparsable file: its fields are not trustworthy.
-			s.Name, s.Target, s.Schedule = "", "", ""
+			s.Name, s.Target, s.Schedule, s.Enabled = "", "", "", false
 		}
 	case !e.Task.Enabled:
 		s.State = api.StateOff

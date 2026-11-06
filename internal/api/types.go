@@ -129,8 +129,12 @@ type TaskSummary struct {
 	Name     string `json:"name,omitempty"`
 	Target   string `json:"target,omitempty"`
 	Schedule string `json:"schedule,omitempty"`
-	State    string `json:"state"`
-	Error    string `json:"error,omitempty"`
+	// Enabled is the task file's enabled; false for an invalid task whose
+	// file could not be read. State shows running over off, so clients
+	// read the on/off flag here.
+	Enabled bool   `json:"enabled"`
+	State   string `json:"state"`
+	Error   string `json:"error,omitempty"`
 	// PausedUntil is the task file's paused_until: an RFC 3339 time or
 	// "indefinite"; empty when the task itself is not paused. A task paused
 	// only by a global pause has State paused and no PausedUntil.

@@ -165,6 +165,14 @@ func (d *daemon) setGlobalPause(ctx context.Context, params json.RawMessage, pau
 	}
 	d.log.Info("global pause changed", logging.KeyTarget, p.Target, "paused", paused,
 		"paused_all", d.globalPause.PausedAll, "paused_targets", d.globalPause.PausedTargets)
+	// The display state of the tasks covered changes (paused or idle), and
+	// subscribers learn of it only through task.changed. Invalid tasks keep
+	// their state, so they are skipped.
+	for i, e := range d.tasks {
+		if e.Err == nil {
+			d.publishTaskLocked(ctx, i)
+		}
+	}
 	return d.globalPause, nil
 }
 
