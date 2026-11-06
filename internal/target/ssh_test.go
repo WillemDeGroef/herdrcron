@@ -70,6 +70,30 @@ func TestSSHName(t *testing.T) {
 	}
 }
 
+func TestSSHControlPathIsShortHashNotPercentC(t *testing.T) {
+	argv, _ := fakeSSH(t)
+	t.Setenv("FAKE_SSH_EXIT", "0")
+	s, control := newTestSSH(t, "")
+	if _, err := s.Exec(context.Background(), []string{"true"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var cp string
+	for _, a := range argv() {
+		if after, ok := strings.CutPrefix(a, "ControlPath="); ok {
+			cp = after
+			break
+		}
+	}
+	if cp == "" {
+		t.Fatal("no ControlPath in argv")
+	}
+	base := filepath.Base(cp)
+	wantBase := filepath.Base(target.SSHControlSocketPath(control, "vps-alias"))
+	if base != wantBase || strings.Contains(cp, "%") {
+		t.Errorf("ControlPath = %q, want basename %q under %q", cp, wantBase, control)
+	}
+}
+
 func TestSSHExecArgvUsesTheSpecOptionsAndTheTargetShell(t *testing.T) {
 	argv, _ := fakeSSH(t)
 	t.Setenv("FAKE_SSH_EXIT", "0")
@@ -80,7 +104,7 @@ func TestSSHExecArgvUsesTheSpecOptionsAndTheTargetShell(t *testing.T) {
 	want := []string{
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=" + filepath.Join(control, "%C"),
+		"-o", "ControlPath=" + target.SSHControlSocketPath(control, "vps-alias"),
 		"-o", "ControlPersist=10m",
 		"-o", "ConnectTimeout=10",
 		"--", "vps-alias",
@@ -197,8 +221,13 @@ func TestSSHPutFileWritesThePromptViaStdin(t *testing.T) {
 	if err := s.PutFile(ctx, path, []byte(prompt)); err != nil {
 		t.Fatal(err)
 	}
-	if got := argv(); strings.Contains(got[len(got)-1], "PROMPT") {
-		t.Errorf("prompt text is in the ssh argv: %q", got[len(got)-1])
+	gotArgv := argv()
+	last := gotArgv[len(gotArgv)-1]
+	if strings.Contains(last, "PROMPT") {
+		t.Errorf("prompt text is in the ssh argv: %q", last)
+	}
+	if !strings.Contains(last, "||") || !strings.Contains(last, "rm -f") {
+		t.Errorf("PutFile script should remove temp on cat failure: %q", last)
 	}
 	p := filepath.Join(home, ".cache", "herdrcron", "runs", "01RUN.md")
 	data, err := os.ReadFile(p)
@@ -255,7 +284,7 @@ func TestSSHInteractiveArgv(t *testing.T) {
 	want := []string{
 		"ssh", "-t",
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=" + filepath.Join(control, "%C"),
+		"-o", "ControlPath=" + target.SSHControlSocketPath(control, "vps-alias"),
 		"-o", "ControlPersist=10m",
 		"-o", "ConnectTimeout=10",
 		"--", "vps-alias",

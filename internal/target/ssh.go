@@ -3,6 +3,8 @@ package target
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -96,7 +98,9 @@ func (s *SSH) PutFile(ctx context.Context, p string, data []byte) error {
 	dst := remotePath(p)
 	tmp := remotePath(p + ".tmp")
 	dir := remotePath(path.Dir(p))
-	script := "umask 077 && mkdir -p " + dir + " && cat > " + tmp + " && mv -f " + tmp + " " + dst
+	// On cat failure, remove the temp so we do not leave a truncated file; we
+	// avoid trap because odd paths can contain quotes that break trap parsing.
+	script := "umask 077 && mkdir -p " + dir + " && cat > " + tmp + " || { rm -f " + tmp + "; exit 1; } && mv -f " + tmp + " " + dst
 	if _, err := s.run(ctx, []string{"put-file", p}, script, bytes.NewReader(data)); err != nil {
 		return fmt.Errorf("put file: %w", err)
 	}
@@ -164,10 +168,21 @@ func (s *SSH) run(ctx context.Context, name []string, cmd string, stdin io.Reade
 func (s *SSH) options() []string {
 	return []string{
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=" + filepath.Join(s.cfg.ControlDir, "%C"),
+		"-o", "ControlPath=" + SSHControlSocketPath(s.cfg.ControlDir, s.cfg.Host),
 		"-o", "ControlPersist=10m",
 		"-o", "ConnectTimeout=10",
 	}
+}
+
+// SSHControlSocketPath is the ControlMaster socket path for host under
+// controlDir (same value ssh uses via -o ControlPath=…). OpenSSH's default
+// %C expands to a long hex string that, with a long state directory, can
+// exceed the Unix domain socket path limit (~108 bytes on Linux); we use a
+// short hash of the destination instead.
+func SSHControlSocketPath(controlDir, host string) string {
+	h := sha256.Sum256([]byte(host))
+	short := hex.EncodeToString(h[:8])
+	return filepath.Join(controlDir, "cm-"+short)
 }
 
 // commandLine is the one string ssh hands to the remote login shell: the

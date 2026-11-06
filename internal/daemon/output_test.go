@@ -294,7 +294,7 @@ func TestAttachCmdOnARemoteTargetUsesSSHWithATTY(t *testing.T) {
 	want := []string{
 		"ssh", "-t",
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=" + filepath.Join(l.p.StateDir, "ssh", "%C"),
+		"-o", "ControlPath=" + target.SSHControlSocketPath(filepath.Join(l.p.StateDir, "ssh"), "vps-alias"),
 		"-o", "ControlPersist=10m",
 		"-o", "ConnectTimeout=10",
 		"--", "vps-alias",
