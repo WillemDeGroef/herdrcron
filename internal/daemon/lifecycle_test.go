@@ -321,7 +321,12 @@ func TestRunNowOverlapQueueStartsTheQueuedRunWhenTheActiveOneEnds(t *testing.T) 
 
 	l.herdr.set(first.HerdrPane, paneIdle)
 	l.advanceUntil("the first run ends", pollStep, l.ended(first.ID))
-	eventually(t, "the queued run to start", func() bool { return len(l.runs()) == 2 })
+	// The run row appears while the launch is still going: wait for it to
+	// leave starting.
+	eventually(t, "the queued run to start", func() bool {
+		runs := l.runs()
+		return len(runs) == 2 && runs[0].Status != store.StatusStarting
+	})
 	runs := l.runs()
 	second := runs[0]
 	if second.ID == first.ID || second.Trigger != store.TriggerManual || second.Status != store.StatusRunning ||

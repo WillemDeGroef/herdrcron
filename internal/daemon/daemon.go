@@ -25,6 +25,7 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/scheduler"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
 	"github.com/WillemDeGroef/herdrcron/internal/target"
+	"github.com/WillemDeGroef/herdrcron/internal/watch"
 )
 
 // Options configures Run.
@@ -51,11 +52,32 @@ type daemon struct {
 	disp      *dispatch.Dispatcher
 	clk       clock.Clock
 	log       *slog.Logger
+	// configFile is config.yaml, re-read by "reload".
+	configFile string
+	bus        *bus
 
-	// mu guards tasks and globalPause, and serialises task file writes.
-	// Lock order: mu, then the scheduler's lock.
+	// mu guards tasks, versions, deleting and globalPause, and serialises
+	// task file writes. Lock order: mu, then the scheduler's lock. Never
+	// call into the runner or dispatcher in a way that can end or start a
+	// run with mu held: that path calls back into the daemon.
 	mu          sync.Mutex
 	globalPause api.GlobalPause
+	// versions is the version of each task's files as last loaded; a
+	// watcher event whose files still have it (the daemon's own write)
+	// changes nothing.
+	versions map[string]string
+	// deleting holds tasks being deleted; the watcher leaves them alone.
+	deleting map[string]bool
+
+	// notifier runs notify.command for configured events; wired from runChanged
+	// so run notifications share one path with subscribe run.changed.
+	notifier *notify.Notifier
+
+	// dirty holds tasks whose runs changed since their state was last
+	// published; dirtyWake wakes publishDirty.
+	dirtyMu   sync.Mutex
+	dirty     map[string]struct{}
+	dirtyWake chan struct{}
 }
 
 // Run loads the configuration and tasks, then serves the API on the socket
@@ -96,6 +118,12 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	d := &daemon{
 		version: opts.Version, started: time.Now(), configDir: p.ConfigDir,
 		cfg: cfg, tasks: tasks, store: st, clk: clk, log: log,
+		configFile: p.ConfigFile(), bus: newBus(log),
+		versions: map[string]string{}, deleting: map[string]bool{},
+		dirty: map[string]struct{}{}, dirtyWake: make(chan struct{}, 1),
+	}
+	for _, e := range tasks {
+		d.versions[e.ID] = d.fileVersion(e)
 	}
 	log.Info("config loaded", "targets", d.targetNames(), "tasks", len(tasks))
 	for _, e := range tasks {
@@ -106,14 +134,15 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		targets = realTargets(cfg)
 	}
 	notifier := notify.New(cfg.Notify, log)
+	d.notifier = notifier
 	// Let notifications already started reach the user before exiting.
 	defer notifier.Wait()
 	d.runner = runner.New(runner.Options{
 		Clock: clk, Store: st, Targets: targets, Config: cfg, ConfigDir: p.ConfigDir, Log: log,
 		OnEnd:    func(ctx context.Context, run store.Run) { d.disp.RunEnded(ctx, run) },
-		Notifier: notifier,
+		OnChange: d.runChanged,
 	})
-	d.disp = dispatch.New(dispatch.Options{Runs: d.runner, Store: st, Config: cfg, Log: log})
+	d.disp = dispatch.New(dispatch.Options{Runs: latestDef{d}, Store: st, Config: cfg, Log: log})
 	d.sched = scheduler.New(scheduler.Options{
 		Clock: clk, Store: st, Runs: d.disp, Config: cfg, Log: log,
 		OnPauseExpired: d.pauseExpired,
@@ -150,6 +179,17 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	srv.Handle(api.MethodTasksRunNow, d.tasksRunNow)
 	srv.Handle(api.MethodRunsList, d.runsList)
 	srv.Handle(api.MethodRunsStop, d.runsStop)
+	srv.Handle(api.MethodTasksGet, d.tasksGet)
+	srv.Handle(api.MethodTasksCreate, d.tasksCreate)
+	srv.Handle(api.MethodTasksUpdate, d.tasksUpdate)
+	srv.Handle(api.MethodTasksDelete, d.tasksDelete)
+	srv.Handle(api.MethodReload, d.reload)
+	srv.HandleStream(api.MethodSubscribe, d.subscribe)
+	w, err := watch.New([]string{d.tasksDir(), d.promptsDir()}, watchDebounce, log)
+	if err != nil {
+		log.Error("cannot watch task files", "err", err)
+		return err
+	}
 	log.Info("daemon listening", "socket", p.Socket())
 	if opts.OnListening != nil {
 		opts.OnListening(p.Socket())
@@ -166,10 +206,22 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		defer close(runnerDone)
 		d.runner.Run(ctx) // returns when ctx is done
 	}()
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		d.watchFiles(ctx, w) // returns when ctx is done
+	}()
+	publishDone := make(chan struct{})
+	go func() {
+		defer close(publishDone)
+		d.publishDirty(ctx)
+	}()
 	err = srv.Serve(ctx, ln)
 	cancel()
 	<-schedDone
 	<-runnerDone
+	<-watchDone
+	<-publishDone
 	log.Info("daemon stopped")
 	return err
 }
@@ -285,6 +337,12 @@ func (d *daemon) summary(ctx context.Context, e config.TaskEntry) (api.TaskSumma
 	default:
 		s.State = api.StateIdle
 	}
+	// An active run shows over off, paused and idle: a disabled or paused
+	// task can still have a manual run going. Invalid stays invalid, so
+	// the error text remains the display state; the run itself is unchanged.
+	if live := d.liveState(e.ID); live != "" && s.State != api.StateInvalid {
+		s.State = live
+	}
 	if next, ok := d.sched.NextFire(e.ID); ok {
 		s.NextFireAt = apiTime(next)
 	}
@@ -310,11 +368,18 @@ func (d *daemon) tasksRunNow(ctx context.Context, params json.RawMessage) (any, 
 	if p.ID == "" {
 		return nil, api.InvalidParams(errors.New("id is required"))
 	}
-	i := slices.IndexFunc(d.tasks, func(e config.TaskEntry) bool { return e.ID == p.ID })
+	// Copy the entry under d.mu, but submit without it: Submit may start a
+	// run, which calls back into the daemon.
+	d.mu.Lock()
+	i := d.find(p.ID)
+	var e config.TaskEntry
+	if i >= 0 {
+		e = d.tasks[i]
+	}
+	d.mu.Unlock()
 	if i < 0 {
 		return nil, api.InvalidParams(fmt.Errorf("unknown task %q", p.ID))
 	}
-	e := d.tasks[i]
 	if e.Err != nil {
 		return nil, &api.Error{Code: api.CodeInvalidParams, Message: fmt.Sprintf("task %s is invalid: %v", e.ID, e.Err)}
 	}
@@ -405,3 +470,19 @@ func apiTime(t time.Time) string {
 	}
 	return t.UTC().Format(time.RFC3339)
 }
+
+// latestDef sits between the dispatcher and the runner. A fire carries the
+// task as it was when it was scheduled or queued; latestDef starts the
+// definition as it is now, so an edit applies to the next run. A task
+// deleted or made invalid meanwhile does not start.
+type latestDef struct{ d *daemon }
+
+func (l latestDef) Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
+	cur, err := l.d.currentTask(t)
+	if err != nil {
+		return store.Run{}, err
+	}
+	return l.d.runner.Start(ctx, cur, trigger, scheduledAt)
+}
+
+func (l latestDef) ActiveRuns() []store.Run { return l.d.runner.ActiveRuns() }
