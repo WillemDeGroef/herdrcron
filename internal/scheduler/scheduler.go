@@ -417,7 +417,7 @@ func (s *Scheduler) CatchUpTarget(ctx context.Context, target string) {
 			log.Error("cannot read last run for catch-up", "err", err)
 			continue
 		}
-		if !ok || last.Status != store.StatusHostUnreachable || last.Trigger == store.TriggerManual {
+		if !ok || last.Status != store.StatusHostUnreachable {
 			continue
 		}
 		if now.Sub(last.ScheduledAt) > s.cfg.CatchUpWindow.Duration {
