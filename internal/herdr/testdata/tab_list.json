@@ -1,0 +1,35 @@
+{
+ "id": "cli:tab:list",
+ "result": {
+  "tabs": [
+   {
+    "agent_status": "idle",
+    "focused": false,
+    "label": "demo",
+    "number": 198,
+    "pane_count": 2,
+    "tab_id": "w2:t66",
+    "workspace_id": "w2"
+   },
+   {
+    "agent_status": "idle",
+    "focused": false,
+    "label": "demo",
+    "number": 14,
+    "pane_count": 1,
+    "tab_id": "w2:tE",
+    "workspace_id": "w2"
+   },
+   {
+    "agent_status": "idle",
+    "focused": false,
+    "label": "demo",
+    "number": 213,
+    "pane_count": 1,
+    "tab_id": "w2:t6N",
+    "workspace_id": "w2"
+   }
+  ],
+  "type": "tab_list"
+ }
+}

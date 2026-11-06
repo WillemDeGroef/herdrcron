@@ -1,0 +1,31 @@
+{
+ "id": "cli:tab:create",
+ "result": {
+  "root_pane": {
+   "agent_status": "unknown",
+   "cwd": "/home/user/src/demo",
+   "focused": false,
+   "foreground_cwd": "/home/user/src/demo",
+   "pane_id": "w15:p2",
+   "revision": 0,
+   "scroll": {
+    "max_offset_from_bottom": 0,
+    "offset_from_bottom": 0,
+    "viewport_rows": 69
+   },
+   "tab_id": "w15:t2",
+   "terminal_id": "term_65f9765b0d7a93be",
+   "workspace_id": "w15"
+  },
+  "tab": {
+   "agent_status": "unknown",
+   "focused": false,
+   "label": "hc-spike-0930",
+   "number": 2,
+   "pane_count": 1,
+   "tab_id": "w15:t2",
+   "workspace_id": "w15"
+  },
+  "type": "tab_created"
+ }
+}
