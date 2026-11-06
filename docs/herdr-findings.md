@@ -28,7 +28,7 @@ Finding things by label (`hc-` prefix):
 
 - Workspaces and tabs always have a `label` (a fresh tab without `--label` is labelled with its number, e.g. `"1"`). Filter `workspace list` / `tab list --workspace` on `label`.
 - Panes have a `label` only after `pane rename`. `tab create --label` labels the tab, not its pane. herdrcron does not need pane labels: it stores the root pane id from `tab_created.root_pane.pane_id`, and can find a run's panes by `tab_id` in `pane list --workspace <wid>`.
-- `WorkspaceInfo` has **no cwd field**, so the spec's "same cwd" check cannot be done on the workspace. Decision: find the workspace by label `hc-<repo-basename>` alone, and pass `--cwd` on every `tab create`, so the workspace cwd does not matter. Two repos with the same basename share one workspace; that is harmless, since each tab gets its own cwd.
+- `WorkspaceInfo` has no `cwd` field. It only has `worktree.repo_root` for workspaces herdr opened as git worktrees (`herdr worktree ...`), which `workspace create` does not set, and pane `cwd` follows the shell's `cd`, so neither is a reliable workspace cwd. Decision (a deliberate change from the spec's "same cwd" check): find the workspace by label `hc-<repo-basename>` alone, and pass `--cwd` on every `tab create`, so the workspace cwd does not matter. Two repos with the same basename share one workspace; that is harmless, since each tab gets its own cwd.
 
 Two behaviours the run logic must handle:
 
@@ -45,7 +45,7 @@ The field is **`agent_status`** on each pane in `herdr pane list` (`PaneInfo`). 
 | `blocked` | herdr recognised an approval or question UI | `blocked` (notify once on the change; `on_blocked: stop` stops the run) |
 | `idle` | Agent ready for input, completion already seen | `done` after 2 polls in a row (debounce) |
 | `done` | Agent ready for input, completion not yet seen by a client | `done` after 2 polls in a row (debounce) |
-| `unknown` | No agent detected, or herdr cannot classify it | stay `running` (timeout still applies); see below |
+| `unknown` | No agent detected, or herdr cannot classify it | stay `running` (timeout still applies), unless the shell-at-prompt rule below ends the run |
 
 Observed sequence for `claude "<prompt>"` started with `pane run`: `unknown` (agent absent, shell) → `unknown` (agent `claude`, starting) → `working` → `idle`. A question UI (`AskUserQuestion`) gave `working` → `blocked`; after `esc` the status was `done`. herdr picks `idle` or `done` from its "seen" state, so herdrcron must treat both the same.
 
@@ -53,7 +53,11 @@ Rules for the tracker:
 
 - Count `idle`/`done` towards completion only when `agent` is present. During startup the status is `unknown`, not `idle`, so a run does not finish before the agent starts.
 - Pane missing from `pane list` → `lost`.
-- `agent` absent after the agent has exited back to the shell (also what happens after a stop), or a plain command such as the integration test's `bash -c 'echo hi; sleep 5'`, gives `unknown` forever. To finish such runs, use `herdr pane process-info --pane <id>`: when `.result.process_info.foreground_process_group_id == shell_pid`, the shell is back at its prompt and the command has exited → `done`. While the command runs, the foreground group is the command's (`sleep`, `claude`, ...). Call it only for panes whose `agent` is absent, so the normal poll stays one `pane list` call per target.
+- `agent` absent gives `unknown`: before the agent starts, after it exits back to the shell, and for the whole run of a plain command such as the integration test's `bash -c 'echo hi; sleep 5'`. To tell whether the launched command has ended, use `herdr pane process-info --pane <id>`: when both `.result.process_info.shell_pid` and `foreground_process_group_id` are non-null and equal, the shell is back at its prompt. While the command runs, the foreground group is the command's (`sleep`, `claude`, ...). Call it only for panes whose `agent` is absent, so the normal poll stays one `pane list` call per target, and only once the launch has had a poll to start (the first sample after `pane run` can still show the shell).
+- Shell back at its prompt, not during a stop:
+  - no agent was ever detected in the run (plain command) → `done`;
+  - an agent was detected earlier and is now gone without herdrcron stopping it (crash, or the user typed `/exit`) → `failed` with reason `agent exited`.
+- During a stop (step 10) skip these checks; the stop decides the state (`stopped` or `timeout`).
 
 ## Launch: `herdr pane run`
 
@@ -114,4 +118,5 @@ Go types for the JSON outputs above are generated from the schema:
 - Schema copy: `internal/herdr/schema/herdr-0.9.1.json` (`herdr api schema --json`).
 - Generator: `internal/herdr/cmd/herdr-schemagen`; output `internal/herdr/types_gen.go`.
 - Regenerate: `go generate ./internal/herdr/...`. A test fails when `types_gen.go` is out of date, and another decodes real CLI output (`internal/herdr/testdata/`) into the generated types with unknown fields disallowed.
+- Generated results: `workspace_*`, `tab_*`, `pane_info`, `pane_list`, `pane_process_info` and `ok` for the calls above; `agent_info`/`agent_list` because `herdr agent get|list` add `state_change_seq` and `interactive_ready`, a possible later way to detect a finished turn; `pane_read` (`PaneReadOutputResult`) is the socket API form of `pane read` and is unused while the CLI prints text.
 - For a new herdr version: `herdr api schema --json > internal/herdr/schema/herdr-<version>.json`, point the `go:generate` line at it, regenerate, and re-check this document.

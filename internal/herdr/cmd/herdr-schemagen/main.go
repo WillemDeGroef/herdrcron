@@ -28,15 +28,7 @@ func run(args []string) error {
 	if *schemaPath == "" || *out == "" || *pkg == "" {
 		return fmt.Errorf("-schema, -out and -pkg are required")
 	}
-	version, err := schemagen.VersionFromSchemaPath(*schemaPath)
-	if err != nil {
-		return err
-	}
-	schema, err := os.ReadFile(*schemaPath)
-	if err != nil {
-		return err
-	}
-	src, err := schemagen.Generate(schema, schemagen.Options{Package: *pkg, HerdrVersion: version, Selection: schemagen.Herdrcron})
+	src, err := schemagen.GenerateFile(*schemaPath, *pkg)
 	if err != nil {
 		return err
 	}

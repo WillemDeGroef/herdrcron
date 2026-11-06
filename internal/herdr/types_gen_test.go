@@ -3,24 +3,23 @@ package herdr_test
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/WillemDeGroef/herdrcron/internal/herdr/schemagen"
 )
 
-// schemaPath must match the //go:generate line in generate.go.
-const schemaPath = "schema/herdr-0.9.1.json"
-
+// TestGeneratedTypesAreUpToDate regenerates types_gen.go from the one
+// checked-in schema (named in generate.go's //go:generate line) and compares.
 func TestGeneratedTypesAreUpToDate(t *testing.T) {
-	schema, err := os.ReadFile(schemaPath)
+	schemas, err := filepath.Glob("schema/herdr-*.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	version, err := schemagen.VersionFromSchemaPath(schemaPath)
-	if err != nil {
-		t.Fatal(err)
+	if len(schemas) != 1 {
+		t.Fatalf("want exactly one schema/herdr-*.json, got %v", schemas)
 	}
-	want, err := schemagen.Generate(schema, schemagen.Options{Package: "herdr", HerdrVersion: version, Selection: schemagen.Herdrcron})
+	want, err := schemagen.GenerateFile(schemas[0], "herdr")
 	if err != nil {
 		t.Fatal(err)
 	}

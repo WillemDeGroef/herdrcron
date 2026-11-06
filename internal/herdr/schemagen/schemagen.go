@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/format"
+	"maps"
+	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -133,14 +135,31 @@ func (t topSchema) node() (*node, error) {
 }
 
 type generator struct {
-	doc    document
-	decl   map[string]string // Go type name -> declaration
-	origin map[string]string // Go type name -> $ref it was generated from
+	doc     document
+	decl    map[string]string          // Go type name -> declaration
+	origin  map[string]string          // Go type name -> $ref it was generated from
+	defs    map[string]*node           // def name -> decoded node, for defs emitted via ref
+	results map[string]json.RawMessage // ResponseResult variant "type" const -> raw variant
+}
+
+// GenerateFile reads the schema at schemaPath, takes the herdr version from
+// its file name (herdr-<version>.json) and generates the [Herdrcron]
+// selection into package pkg.
+func GenerateFile(schemaPath, pkg string) ([]byte, error) {
+	version, err := VersionFromSchemaPath(schemaPath)
+	if err != nil {
+		return nil, err
+	}
+	schema, err := os.ReadFile(schemaPath)
+	if err != nil {
+		return nil, err
+	}
+	return Generate(schema, Options{Package: pkg, HerdrVersion: version, Selection: Herdrcron})
 }
 
 // Generate turns a herdr API schema document into gofmt'd Go source.
 func Generate(schema []byte, opts Options) ([]byte, error) {
-	g := &generator{decl: map[string]string{}, origin: map[string]string{}}
+	g := &generator{decl: map[string]string{}, origin: map[string]string{}, defs: map[string]*node{}}
 	if err := json.Unmarshal(schema, &g.doc); err != nil {
 		return nil, fmt.Errorf("parse schema: %w", err)
 	}
@@ -150,6 +169,11 @@ func Generate(schema []byte, opts Options) ([]byte, error) {
 		}
 	}
 
+	if len(opts.Selection.Results) > 0 {
+		if err := g.parseResults(); err != nil {
+			return nil, err
+		}
+	}
 	for _, r := range opts.Selection.Results {
 		if err := g.result(r); err != nil {
 			return nil, err
@@ -167,12 +191,7 @@ func Generate(schema []byte, opts Options) ([]byte, error) {
 	fmt.Fprintf(&b, "// Source: herdr %s API schema (protocol %d, schema_version %d).\n\n",
 		opts.HerdrVersion, g.doc.Protocol, g.doc.SchemaVersion)
 	fmt.Fprintf(&b, "package %s\n", opts.Package)
-	names := make([]string, 0, len(g.decl))
-	for n := range g.decl {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, n := range names {
+	for _, n := range slices.Sorted(maps.Keys(g.decl)) {
 		b.WriteString("\n" + g.decl[n])
 	}
 	out, err := format.Source(b.Bytes())
@@ -190,6 +209,12 @@ func (g *generator) ref(ref string) (string, *node, error) {
 		return "", nil, fmt.Errorf("unsupported $ref %q", ref)
 	}
 	name := parts[2]
+	if prev, seen := g.origin[name]; seen {
+		if prev != ref {
+			return "", nil, fmt.Errorf("type name %s used by both %q and %q", name, prev, ref)
+		}
+		return name, g.defs[name], nil
+	}
 	raw, ok := g.doc.Schemas[parts[0]].Defs[name]
 	if !ok {
 		return "", nil, fmt.Errorf("$ref %q: no such def", ref)
@@ -198,42 +223,65 @@ func (g *generator) ref(ref string) (string, *node, error) {
 	if err := json.Unmarshal(raw, n); err != nil {
 		return "", nil, fmt.Errorf("def %s: %w", name, err)
 	}
-	if prev, seen := g.origin[name]; seen {
-		if prev != ref {
-			return "", nil, fmt.Errorf("type name %s used by both %q and %q", name, prev, ref)
-		}
-		return name, n, nil
-	}
 	g.origin[name] = ref
+	g.defs[name] = n
 	return name, n, g.named(name, n)
 }
 
 // envelopes emits Response[T] and ErrorResponse.
 func (g *generator) envelopes() error {
-	ok, err := g.doc.Schemas["success_response"].node()
+	success, err := g.doc.Schemas["success_response"].node()
 	if err != nil {
 		return fmt.Errorf("success_response: %w", err)
 	}
-	id, result := ok.Properties["id"], ok.Properties["result"]
-	req := append([]string(nil), ok.Required...)
-	sort.Strings(req)
-	if len(ok.Properties) != 2 || id == nil || result == nil || fmt.Sprint(id.Type) != "[string]" || fmt.Sprint(req) != "[id result]" {
+	id, result := success.Properties["id"], success.Properties["result"]
+	req := slices.Sorted(slices.Values(success.Required))
+	if len(success.Properties) != 2 || id == nil || result == nil || fmt.Sprint(id.Type) != "[string]" || fmt.Sprint(req) != "[id result]" {
 		return fmt.Errorf("success_response: expected exactly required {id: string, result}, the shape Response[T] assumes")
 	}
 	g.origin["Response"] = "success_response"
 	g.decl["Response"] = "// Response is a success response; T is one of the *Result types.\n" +
 		"type Response[T any] struct {\n\tID string `json:\"id\"`\n\tResult T `json:\"result\"`\n}\n"
 
-	es, found := g.doc.Schemas["error_response"]
-	if !found || es.Title == "" {
+	errSchema, found := g.doc.Schemas["error_response"]
+	if !found || errSchema.Title == "" {
 		return fmt.Errorf("schema has no titled error_response")
 	}
-	n, err := es.node()
+	n, err := errSchema.node()
 	if err != nil {
 		return fmt.Errorf("error_response: %w", err)
 	}
-	g.origin[es.Title] = "error_response"
-	return g.named(es.Title, n)
+	g.origin[errSchema.Title] = "error_response"
+	return g.named(errSchema.Title, n)
+}
+
+// parseResults indexes success_response's ResponseResult oneOf variants by
+// their "type" const.
+func (g *generator) parseResults() error {
+	var responseResult struct {
+		OneOf []json.RawMessage `json:"oneOf"`
+	}
+	if err := json.Unmarshal(g.doc.Schemas["success_response"].Defs["ResponseResult"], &responseResult); err != nil {
+		return fmt.Errorf("ResponseResult: %w", err)
+	}
+	g.results = map[string]json.RawMessage{}
+	for i, raw := range responseResult.OneOf {
+		var probe struct {
+			Properties struct {
+				Type struct {
+					Const string `json:"const"`
+				} `json:"type"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &probe); err != nil {
+			return fmt.Errorf("ResponseResult variant %d: %w", i, err)
+		}
+		if _, dup := g.results[probe.Properties.Type.Const]; dup {
+			return fmt.Errorf("ResponseResult has two variants with type %q", probe.Properties.Type.Const)
+		}
+		g.results[probe.Properties.Type.Const] = raw
+	}
+	return nil
 }
 
 // result emits one ResponseResult variant as a named struct.
@@ -242,35 +290,20 @@ func (g *generator) result(r Result) error {
 	if name == "" {
 		name = camel(r.Type) + "Result"
 	}
-	var rr struct {
-		OneOf []json.RawMessage `json:"oneOf"`
+	raw, found := g.results[r.Type]
+	if !found {
+		return fmt.Errorf("ResponseResult has no variant with type %q", r.Type)
 	}
-	if err := json.Unmarshal(g.doc.Schemas["success_response"].Defs["ResponseResult"], &rr); err != nil {
-		return fmt.Errorf("ResponseResult: %w", err)
+	origin := "ResponseResult variant " + r.Type
+	if prev, seen := g.origin[name]; seen {
+		return fmt.Errorf("type name %s used by both %q and %q; set Result.Name", name, prev, origin)
 	}
-	for _, raw := range rr.OneOf {
-		var probe struct {
-			Properties struct {
-				Type struct {
-					Const string `json:"const"`
-				} `json:"type"`
-			} `json:"properties"`
-		}
-		if err := json.Unmarshal(raw, &probe); err != nil || probe.Properties.Type.Const != r.Type {
-			continue
-		}
-		origin := "ResponseResult variant " + r.Type
-		if prev, seen := g.origin[name]; seen {
-			return fmt.Errorf("type name %s used by both %q and %q; set Result.Name", name, prev, origin)
-		}
-		g.origin[name] = origin
-		n := new(node)
-		if err := json.Unmarshal(raw, n); err != nil {
-			return fmt.Errorf("%s: %w", name, err)
-		}
-		return g.named(name, n)
+	g.origin[name] = origin
+	n := new(node)
+	if err := json.Unmarshal(raw, n); err != nil {
+		return fmt.Errorf("%s: %w", name, err)
 	}
-	return fmt.Errorf("ResponseResult has no variant with type %q", r.Type)
+	return g.named(name, n)
 }
 
 func (g *generator) named(name string, n *node) error {
@@ -286,12 +319,7 @@ func (g *generator) named(name string, n *node) error {
 	for _, r := range n.Required {
 		required[r] = true
 	}
-	props := make([]string, 0, len(n.Properties))
-	for p := range n.Properties {
-		props = append(props, p)
-	}
-	sort.Strings(props)
-	for _, p := range props {
+	for _, p := range slices.Sorted(maps.Keys(n.Properties)) {
 		goType, err := g.goType(name+"."+p, n.Properties[p], required[p])
 		if err != nil {
 			return err
