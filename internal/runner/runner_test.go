@@ -202,6 +202,33 @@ func TestUnknownStatusStaysRunning(t *testing.T) {
 	}
 }
 
+// An unknown status after blocked is not blocked any more: the spec maps
+// unknown or no status to running.
+func TestUnknownStatusAfterBlockedIsRunning(t *testing.T) {
+	e := newEnv(t)
+	odd := sample{status: "unknown", agent: "claude"}
+	e.herdr.script(blocked, odd)
+	run := e.start(deps())
+	if got := e.statuses(run.ID, 2); !slices.Equal(got, []string{"blocked", "running"}) {
+		t.Fatalf("statuses = %v, want blocked, running", got)
+	}
+}
+
+// A poll whose context is cancelled (the daemon stopping) still stores the
+// end of a run it finishes, so no row is left running with no tracker.
+func TestRunEndIsStoredWhenPollContextIsCancelled(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.script(working, vanished)
+	run := e.start(deps())
+	e.poll(run.ID)
+	ctx, cancel := context.WithCancel(e.ctx)
+	cancel()
+	e.runner.PollTarget(ctx, "local")
+	if got := e.get(run.ID); got.Status != store.StatusLost || got.EndedAt.IsZero() {
+		t.Fatalf("run = %s ended %v, want lost with ended_at", got.Status, got.EndedAt)
+	}
+}
+
 func TestPaneVanishesRunIsLost(t *testing.T) {
 	e := newEnv(t)
 	e.herdr.script(working, working, vanished)

@@ -44,6 +44,8 @@ const (
 // promptDir holds the prompt files on the target, one per run.
 const promptDir = "~/.cache/herdrcron/runs/"
 
+func promptPath(runID string) string { return promptDir + runID + ".md" }
+
 // Options configures New.
 type Options struct {
 	Clock     clock.Clock
@@ -80,6 +82,10 @@ type targetState struct {
 	mu          sync.Mutex
 	serverUntil time.Time            // herdr server answered; valid until
 	checks      map[string]checkedAt // agent command and cwd, by key
+
+	// openMu serialises workspace lookup and creation, so two runs that
+	// start at once for the same repo share one hc- workspace.
+	openMu sync.Mutex
 }
 
 type checkedAt struct {
@@ -177,7 +183,7 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 		return err
 	}
 
-	promptPath := promptDir + a.run.ID + ".md"
+	promptPath := promptPath(a.run.ID)
 	if err := ts.t.PutFile(ctx, promptPath, data); err != nil {
 		return fmt.Errorf("write prompt file: %w", err)
 	}
@@ -186,10 +192,14 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 	if err := ts.herdr.PaneRun(ctx, a.run.HerdrPane, launchCommand(t.Agent, a.run.ID)); err != nil {
 		return fmt.Errorf("launch agent: %w", err)
 	}
-	a.run.Status = store.StatusRunning
-	if err := r.store.UpdateRun(ctx, a.run); err != nil {
+	// Until the running status is stored the run counts as starting, so a
+	// failed write still closes the tab with the agent in it.
+	running := a.run
+	running.Status = store.StatusRunning
+	if err := r.store.UpdateRun(ctx, running); err != nil {
 		return err
 	}
+	a.run = running
 	a.log.Info("run launched", "herdr_workspace", a.run.HerdrWorkspace, "herdr_tab", a.run.HerdrTab,
 		"herdr_pane", a.run.HerdrPane, "agent", t.Agent.Command, "env_keys", envKeys(t.Env))
 	return nil
@@ -201,6 +211,8 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 // looked up on every run: closing its last tab closes it.
 func (r *Runner) openTab(ctx context.Context, ts *targetState, a *activeRun, cwd, label string, env []string) error {
 	wsLabel := "hc-" + path.Base(cwd)
+	ts.openMu.Lock()
+	defer ts.openMu.Unlock()
 	workspaces, err := ts.herdr.WorkspaceList(ctx)
 	if err != nil {
 		return fmt.Errorf("list workspaces: %w", err)
@@ -322,6 +334,7 @@ func (r *Runner) checkServer(ctx context.Context, ts *targetState) error {
 	if err := ts.herdr.StartServer(ctx); err != nil {
 		return fmt.Errorf("preflight: start herdr server: %w", err)
 	}
+	// Wall time, not r.clock: this waits for a real process to come up.
 	deadline := time.Now().Add(r.waitStart)
 	step := min(250*time.Millisecond, r.waitStart/5)
 	for {
@@ -377,6 +390,8 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 		r.log.Warn("poll failed", logging.KeyTarget, name, "err", err, "active_runs", len(runs))
 		return
 	}
+	// A run that ends must be stored even when the daemon stops mid-poll.
+	ctx = context.WithoutCancel(ctx)
 	byID := make(map[string]herdr.PaneInfo, len(panes))
 	for _, p := range panes {
 		byID[p.PaneID] = p
@@ -420,9 +435,8 @@ func (r *Runner) track(ctx context.Context, ts *targetState, a *activeRun, p her
 			return
 		}
 	default:
-		// Unknown status with an agent: stay as is; the timeout still
-		// applies.
-		a.idlePolls = 0
+		// Unknown status with an agent: running, as the spec says.
+		a.idlePolls, status = 0, store.StatusRunning
 	}
 	if status == a.run.Status {
 		return
@@ -472,7 +486,7 @@ func (r *Runner) end(ctx context.Context, a *activeRun, status, reason string) (
 	r.mu.Lock()
 	delete(r.active, a.run.ID)
 	r.mu.Unlock()
-	starting := a.run.Status == store.StatusStarting
+	failedToStart := a.run.Status == store.StatusStarting
 	a.run.Status, a.run.ExitReason, a.run.EndedAt = status, reason, r.clock.Now()
 	err := r.store.UpdateRun(ctx, a.run)
 	a.log.Info("run ended", "status", status, "exit_reason", reason)
@@ -481,14 +495,15 @@ func (r *Runner) end(ctx context.Context, a *activeRun, status, reason string) (
 	if ts == nil {
 		return a.run, err
 	}
-	closeTab := status == store.StatusDone && a.task.OnDone == "close_tab" || starting
+	closeTab := failedToStart || (status == store.StatusDone && a.task.OnDone == "close_tab")
 	if closeTab && a.run.HerdrTab != "" {
 		if cerr := ts.herdr.TabClose(ctx, a.run.HerdrTab); cerr != nil && !herdr.IsCode(cerr, herdr.CodeTabNotFound) {
 			a.log.Warn("cannot close tab", "herdr_tab", a.run.HerdrTab, "err", cerr)
 		}
 	}
+	// The prompt file is written only after the tab and pane exist.
 	if a.run.HerdrPane != "" {
-		if rerr := ts.t.RemoveFile(ctx, promptDir+a.run.ID+".md"); rerr != nil {
+		if rerr := ts.t.RemoveFile(ctx, promptPath(a.run.ID)); rerr != nil {
 			a.log.Warn("cannot delete prompt file", "err", rerr)
 		}
 	}
