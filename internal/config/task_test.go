@@ -107,11 +107,11 @@ func TestScheduleDescriptorsParse(t *testing.T) {
 
 func TestValidationRules(t *testing.T) {
 	cases := []struct {
-		name    string
-		file    string
-		edit    func(string) string
-		noPrmpt bool
-		wantErr string
+		name     string
+		file     string
+		edit     func(string) string
+		noPrompt bool
+		wantErr  string
 	}{
 		{
 			name:    "id pattern: uppercase",
@@ -190,10 +190,10 @@ func TestValidationRules(t *testing.T) {
 			wantErr: "enabeld",
 		},
 		{
-			name:    "prompt file must exist",
-			noPrmpt: true,
-			edit:    func(s string) string { return s },
-			wantErr: "prompt file",
+			name:     "prompt file must exist",
+			noPrompt: true,
+			edit:     func(s string) string { return s },
+			wantErr:  "prompt file",
 		},
 		{
 			name:    "timeout must be > 0",
@@ -244,7 +244,7 @@ func TestValidationRules(t *testing.T) {
 				file = "peppol-sh-deps.yaml"
 			}
 			f.task(file, tc.edit(validTask))
-			if !tc.noPrmpt {
+			if !tc.noPrompt {
 				f.prompt("peppol-sh-deps.md")
 			}
 			e := f.only()

@@ -141,7 +141,7 @@ func TestWireProtocol(t *testing.T) {
 		`[{"jsonrpc":"2.0","id":3,"method":"echo"}]`, // batches are not supported
 	)
 	if len(resp) != 5 {
-		t.Fatalf("got %d responses, want 3: %v", len(resp), resp)
+		t.Fatalf("got %d responses, want 5: %v", len(resp), resp)
 	}
 	if resp[0]["jsonrpc"] != "2.0" || resp[0]["id"] != float64(1) {
 		t.Errorf("resp[0] = %v", resp[0])
