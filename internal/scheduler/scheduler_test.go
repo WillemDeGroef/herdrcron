@@ -25,6 +25,13 @@ type env struct {
 	local  *target.Fake
 	sched  *scheduler.Scheduler
 	config config.Config
+	// expired records OnPauseExpired calls: task id and clock time.
+	expired []expiry
+}
+
+type expiry struct {
+	id string
+	at time.Time
 }
 
 func brussels(t *testing.T) *time.Location {
@@ -51,14 +58,21 @@ func newEnv(t *testing.T, now time.Time) *env {
 		local:  target.NewFake("local"),
 		config: config.Config{Timezone: "Europe/Brussels", HistoryDays: 90},
 	}
-	e.sched = scheduler.New(scheduler.Options{
+	e.sched = e.newScheduler(map[string]target.Target{"local": e.local})
+	return e
+}
+
+func (e *env) newScheduler(targets map[string]target.Target) *scheduler.Scheduler {
+	return scheduler.New(scheduler.Options{
 		Clock:   e.clock,
-		Store:   st,
-		Targets: map[string]target.Target{"local": e.local},
+		Store:   e.store,
+		Targets: targets,
 		Config:  e.config,
 		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OnPauseExpired: func(_ context.Context, id string) {
+			e.expired = append(e.expired, expiry{id: id, at: e.clock.Now()})
+		},
 	})
-	return e
 }
 
 func task(id, schedule string) config.Task {

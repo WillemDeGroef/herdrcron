@@ -1,5 +1,6 @@
 // Package store keeps the herdrcron daemon state in SQLite: one row per run
-// in table runs, and per task scheduling state in table task_state.
+// in table runs, per task scheduling state in table task_state, and the
+// global pauses in table global_pause.
 package store
 
 import (
@@ -64,6 +65,9 @@ CREATE TABLE IF NOT EXISTS task_state (
 	last_run_id  TEXT,
 	next_fire_at TIMESTAMP,
 	last_fire_at TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS global_pause (
+	target TEXT PRIMARY KEY -- "" means all targets.
 );
 `
 
@@ -414,4 +418,46 @@ func (s *Store) DeleteRunsBefore(ctx context.Context, cutoff time.Time) (int64, 
 		return 0, fmt.Errorf("delete runs: %w", err)
 	}
 	return n, nil
+}
+
+// SetGlobalPause pauses (paused true) or resumes every task on target; ""
+// means all targets. Resuming "" clears every global pause, the per-target
+// ones included.
+func (s *Store) SetGlobalPause(ctx context.Context, target string, paused bool) error {
+	var err error
+	if paused {
+		_, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO global_pause (target) VALUES (?)`, target)
+	} else {
+		// Resuming "" deletes every row, the per-target pauses included.
+		_, err = s.db.ExecContext(ctx, `DELETE FROM global_pause WHERE ? = '' OR target = ?`, target, target)
+	}
+	if err != nil {
+		return fmt.Errorf("set global pause %q: %w", target, err)
+	}
+	return nil
+}
+
+// GlobalPause returns whether all targets are paused and the paused target
+// names, sorted.
+func (s *Store) GlobalPause(ctx context.Context) (all bool, targets []string, err error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT target FROM global_pause ORDER BY target`)
+	if err != nil {
+		return false, nil, fmt.Errorf("global pause: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var target string
+		if err := rows.Scan(&target); err != nil {
+			return false, nil, fmt.Errorf("global pause: %w", err)
+		}
+		if target == "" {
+			all = true
+		} else {
+			targets = append(targets, target)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, nil, fmt.Errorf("global pause: %w", err)
+	}
+	return all, targets, nil
 }

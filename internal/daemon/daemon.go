@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/api"
@@ -33,14 +34,20 @@ type Options struct {
 }
 
 type daemon struct {
-	version string
-	started time.Time
-	cfg     config.Config
-	tasks   []config.TaskEntry
-	store   *store.Store
-	sched   *scheduler.Scheduler
-	clk     clock.Clock
-	log     *slog.Logger
+	version   string
+	started   time.Time
+	configDir string
+	cfg       config.Config
+	store     *store.Store
+	sched     *scheduler.Scheduler
+	clk       clock.Clock
+	log       *slog.Logger
+
+	// mu guards tasks and globalPause, and serialises task file writes.
+	// Lock order: mu, then the scheduler's lock.
+	mu          sync.Mutex
+	tasks       []config.TaskEntry
+	globalPause api.GlobalPause
 }
 
 // Run loads the configuration and tasks, then serves the API on the socket
@@ -78,7 +85,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	if clk == nil {
 		clk = clock.Real()
 	}
-	d := &daemon{version: opts.Version, started: time.Now(), cfg: cfg, tasks: tasks, store: st, clk: clk, log: log}
+	d := &daemon{version: opts.Version, started: time.Now(), configDir: p.ConfigDir, cfg: cfg, tasks: tasks, store: st, clk: clk, log: log}
 	log.Info("config loaded", "targets", d.targetNames(), "tasks", len(tasks))
 	for _, e := range tasks {
 		logTask(log, e)
@@ -89,7 +96,14 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	for name := range cfg.Targets {
 		targets[name] = target.NewFake(name)
 	}
-	d.sched = scheduler.New(scheduler.Options{Clock: clk, Store: st, Targets: targets, Config: cfg, Log: log})
+	d.sched = scheduler.New(scheduler.Options{
+		Clock: clk, Store: st, Targets: targets, Config: cfg, Log: log,
+		OnPauseExpired: d.pauseExpired,
+	})
+	if err := d.loadGlobalPause(ctx); err != nil {
+		log.Error("cannot read global pause", "err", err)
+		return err
+	}
 	if err := d.sched.SetTasks(ctx, tasks); err != nil {
 		log.Error("cannot schedule tasks", "err", err)
 		return err
@@ -104,6 +118,11 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	srv := api.NewServer(log)
 	srv.Handle(api.MethodStatus, d.status)
 	srv.Handle(api.MethodTasksList, d.tasksList)
+	srv.Handle(api.MethodTasksSetEnabled, d.tasksSetEnabled)
+	srv.Handle(api.MethodTasksPause, d.tasksPause)
+	srv.Handle(api.MethodTasksResume, d.tasksResume)
+	srv.Handle(api.MethodPauseAll, d.pauseAll)
+	srv.Handle(api.MethodResumeAll, d.resumeAll)
 	log.Info("daemon listening", "socket", p.Socket())
 	if opts.OnListening != nil {
 		opts.OnListening(p.Socket())
@@ -170,41 +189,58 @@ func (d *daemon) status(context.Context, json.RawMessage) (any, error) {
 	for _, n := range d.targetNames() {
 		res.Targets = append(res.Targets, api.TargetStatus{Name: n, Reachability: "unknown"})
 	}
+	d.mu.Lock()
+	res.GlobalPause = d.globalPause
+	d.mu.Unlock()
 	return res, nil
 }
 
 func (d *daemon) tasksList(ctx context.Context, _ json.RawMessage) (any, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	res := api.TasksListResult{Tasks: make([]api.TaskSummary, 0, len(d.tasks))}
 	for _, e := range d.tasks {
-		s := api.TaskSummary{ID: e.ID, Name: e.Task.Name, Target: e.Task.Target, Schedule: e.Task.Schedule}
-		var verr *config.ValidationError
-		switch {
-		case e.Err != nil:
-			s.State, s.Error = api.StateInvalid, e.Err.Error()
-			if !errors.As(e.Err, &verr) {
-				// Unreadable or unparsable file: its fields are not trustworthy.
-				s.Name, s.Target, s.Schedule = "", "", ""
-			}
-		case !e.Task.Enabled:
-			s.State = api.StateOff
-		case e.Task.PausedAt(d.clk.Now()):
-			s.State = api.StatePaused
-		default:
-			s.State = api.StateIdle
-		}
-		if next, ok := d.sched.NextFire(e.ID); ok {
-			s.NextFireAt = apiTime(next)
-		}
-		last, ok, err := d.store.LastRun(ctx, e.ID)
+		s, err := d.summary(ctx, e)
 		if err != nil {
-			return nil, fmt.Errorf("last run of %s: %w", e.ID, err)
-		}
-		if ok {
-			s.LastRun = runSummary(last)
+			return nil, err
 		}
 		res.Tasks = append(res.Tasks, s)
 	}
 	return res, nil
+}
+
+// summary describes one task for the API. Call it with d.mu held.
+func (d *daemon) summary(ctx context.Context, e config.TaskEntry) (api.TaskSummary, error) {
+	s := api.TaskSummary{ID: e.ID, Name: e.Task.Name, Target: e.Task.Target, Schedule: e.Task.Schedule}
+	var verr *config.ValidationError
+	now := d.clk.Now()
+	switch {
+	case e.Err != nil:
+		s.State, s.Error = api.StateInvalid, e.Err.Error()
+		if !errors.As(e.Err, &verr) {
+			// Unreadable or unparsable file: its fields are not trustworthy.
+			s.Name, s.Target, s.Schedule = "", "", ""
+		}
+	case !e.Task.Enabled:
+		s.State = api.StateOff
+	case e.Task.PausedAt(now):
+		s.State, s.PausedUntil = api.StatePaused, e.Task.PausedUntil
+	case d.sched.GloballyPaused(e.Task.Target):
+		s.State = api.StatePaused
+	default:
+		s.State = api.StateIdle
+	}
+	if next, ok := d.sched.NextFire(e.ID); ok {
+		s.NextFireAt = apiTime(next)
+	}
+	last, ok, err := d.store.LastRun(ctx, e.ID)
+	if err != nil {
+		return api.TaskSummary{}, fmt.Errorf("last run of %s: %w", e.ID, err)
+	}
+	if ok {
+		s.LastRun = runSummary(last)
+	}
+	return s, nil
 }
 
 func runSummary(r store.Run) *api.RunSummary {
