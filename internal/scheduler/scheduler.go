@@ -183,19 +183,26 @@ func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now t
 	// The state must be written even when ctx is cancelled mid-fire.
 	wctx := context.WithoutCancel(ctx)
 	switch {
+	case t.PausedAt(scheduledAt):
+		// Judge the slot, not the tick. A tick that lands just after
+		// paused_until must not start a fire the pause covered. Those
+		// slots are not missed fires, so nothing catches them up.
+		log.Info("fire skipped: task paused", "scheduled_at", scheduledAt, "paused_until", t.PausedUntil)
 	case now.Sub(scheduledAt) > lateGrace:
 		// The missed policy (skip or run_once with trigger catch_up) is
 		// not implemented yet; for now a missed fire is only logged.
 		log.Warn("fire missed", "scheduled_at", scheduledAt, "late_by", now.Sub(scheduledAt).String())
-	case paused(t, now):
-		// Paused fire times pass without a run and are not caught up.
-		log.Info("fire skipped: task paused", "scheduled_at", scheduledAt, "paused_until", t.PausedUntil)
 	default:
 		run, err := s.start(ctx, t, store.TriggerSchedule, scheduledAt)
 		if err != nil {
 			log.Error("cannot start run", "err", err)
-		} else if err := s.store.RecordFire(wctx, t.ID, run.ID, scheduledAt); err != nil {
-			log.Error("cannot write task state", "err", err)
+		}
+		// Record the fire even when the finishing write failed: the row
+		// exists, and last_run_id should point at it.
+		if run.ID != "" {
+			if err := s.store.RecordFire(wctx, t.ID, run.ID, scheduledAt); err != nil {
+				log.Error("cannot write task state", "err", err)
+			}
 		}
 	}
 	// A SetTasks during the run may have replaced the entry; its next fire
@@ -208,19 +215,6 @@ func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now t
 	if err := s.store.SetNextFire(wctx, t.ID, next); err != nil {
 		log.Error("cannot write task state", "err", err)
 	}
-}
-
-// paused reports whether t is paused at now: paused_until is "indefinite"
-// or a time after now.
-func paused(t config.Task, now time.Time) bool {
-	switch t.PausedUntil {
-	case "":
-		return false
-	case "indefinite":
-		return true
-	}
-	until, err := time.Parse(time.RFC3339, t.PausedUntil)
-	return err == nil && until.After(now)
 }
 
 // start reserves a run row and launches the run on the task's target.

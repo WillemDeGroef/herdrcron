@@ -316,6 +316,35 @@ func TestTargetErrorFailsTheRun(t *testing.T) {
 	}
 }
 
+// The 13:00 slot is inside the pause. The tick runs at 13:00:50, after
+// paused_until, and must still skip that slot. 14:00 is after the pause.
+func TestPausedSlotStaysSkippedWhenTickLandsAfterPause(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
+	until := task("until", "@hourly")
+	until.PausedUntil = "2026-11-06T13:00:30Z"
+	bad := task("bad", "@hourly")
+	bad.PausedUntil = "tomorrow"
+	e.setTasks(valid(until, bad))
+
+	e.clock.Set(time.Date(2026, 11, 6, 13, 0, 50, 0, time.UTC))
+	e.sched.Tick(e.ctx)
+	if n := len(e.runs("until")); n != 0 {
+		t.Errorf("until: %d runs, want 0 (13:00 was inside the pause)", n)
+	}
+	if n := len(e.runs("bad")); n != 0 {
+		t.Errorf("bad paused_until: %d runs, want 0", n)
+	}
+
+	e.clock.Set(time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC))
+	e.sched.Tick(e.ctx)
+	if got := scheduledAt(e.runs("until"), time.UTC); !slices.Equal(got, []string{"2026-11-06 14:00 UTC"}) {
+		t.Errorf("until fires %q, want only 14:00", got)
+	}
+	if n := len(e.runs("bad")); n != 0 {
+		t.Errorf("bad paused_until fired at 14:00: %d runs", n)
+	}
+}
+
 func TestPausedTaskSkipsFireButKeepsSchedule(t *testing.T) {
 	e := newEnv(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
 	indef := task("indef", "@hourly")

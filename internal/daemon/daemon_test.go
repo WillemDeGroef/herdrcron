@@ -111,6 +111,37 @@ func startWith(t *testing.T, p paths.Paths, opts daemon.Options) *api.Client {
 	}
 }
 
+func TestTasksListShowsPausedFromTheSchedulerClock(t *testing.T) {
+	p := setup(t)
+	write(t, filepath.Join(p.ConfigDir, "prompts", "hold.md"), "x")
+	write(t, filepath.Join(p.TasksDir(), "hold.yaml"), `id: hold
+target: local
+schedule: "@hourly"
+paused_until: indefinite
+agent: {command: claude}
+timeout: 1h
+`)
+	// 2030 is after today's wall clock and before the fake clock, so a list
+	// that used time.Now would call this task paused.
+	write(t, filepath.Join(p.ConfigDir, "prompts", "resumed.md"), "x")
+	write(t, filepath.Join(p.TasksDir(), "resumed.yaml"), `id: resumed
+target: local
+schedule: "@hourly"
+paused_until: "2030-01-01T00:00:00Z"
+agent: {command: claude}
+timeout: 1h
+`)
+	clk := clock.NewFake(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clk})
+	byID := listByID(t, c)
+	if got := byID["hold"]; got.State != api.StatePaused || got.NextFireAt == "" {
+		t.Errorf("hold = %+v, want paused with a next fire", got)
+	}
+	if got := byID["resumed"]; got.State != api.StateIdle || got.NextFireAt == "" {
+		t.Errorf("resumed = %+v, want idle: the pause ended on the scheduler clock", got)
+	}
+}
+
 func TestTasksListShowsDisplayStates(t *testing.T) {
 	c := start(t, setup(t))
 	var res api.TasksListResult

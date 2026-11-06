@@ -38,6 +38,7 @@ type daemon struct {
 	tasks   []config.TaskEntry
 	store   *store.Store
 	sched   *scheduler.Scheduler
+	clk     clock.Clock
 	log     *slog.Logger
 }
 
@@ -76,7 +77,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	if clk == nil {
 		clk = clock.Real()
 	}
-	d := &daemon{version: opts.Version, started: time.Now(), cfg: cfg, tasks: tasks, store: st, log: log}
+	d := &daemon{version: opts.Version, started: time.Now(), cfg: cfg, tasks: tasks, store: st, clk: clk, log: log}
 	log.Info("config loaded", "targets", d.targetNames(), "tasks", len(tasks))
 	for _, e := range tasks {
 		logTask(log, e)
@@ -185,6 +186,8 @@ func (d *daemon) tasksList(ctx context.Context, _ json.RawMessage) (any, error) 
 			}
 		case !e.Task.Enabled:
 			s.State = api.StateOff
+		case e.Task.PausedAt(d.clk.Now()):
+			s.State = api.StatePaused
 		default:
 			s.State = api.StateIdle
 		}

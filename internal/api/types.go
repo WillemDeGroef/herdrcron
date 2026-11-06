@@ -10,7 +10,8 @@ const (
 const (
 	StateInvalid = "invalid" // the task file failed validation; see TaskSummary.Error
 	StateOff     = "off"     // enabled: false
-	StateIdle    = "idle"    // valid, enabled, no active run
+	StatePaused  = "paused"  // paused_until is indefinite or in the future
+	StateIdle    = "idle"    // valid, enabled, not paused, no active run
 )
 
 // StatusResult is the result of "status".
