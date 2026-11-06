@@ -145,6 +145,11 @@ func (s *SSH) run(ctx context.Context, name []string, cmd string, stdin io.Reade
 	switch {
 	case err == nil:
 		return stdout.Bytes(), nil
+	case errors.Is(err, exec.ErrWaitDelay):
+		// ssh exited 0 (a non-zero exit gives *exec.ExitError instead) but
+		// a ControlPersist master it forked still holds stderr: older
+		// OpenSSH does not detach it from the caller's stdio.
+		return stdout.Bytes(), nil
 	case errors.As(err, &ee) && ee.ExitCode() == sshUnreachableCode:
 		return stdout.Bytes(), &UnreachableError{Target: s.cfg.Name, Stderr: stderr.Bytes()}
 	case errors.As(err, &ee) && ee.ExitCode() >= 0:

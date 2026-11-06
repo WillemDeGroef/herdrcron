@@ -22,6 +22,11 @@ dir=$(dirname "$0")
 : > "$dir/argv"
 for a in "$@"; do printf '%s\0' "$a" >> "$dir/argv"; done
 for a in "$@"; do last=$a; done
+if [ -n "$FAKE_SSH_HOLD_STDERR" ]; then
+	# Like a ControlPersist master forked by old OpenSSH: a child keeps
+	# stderr open after ssh exits.
+	sleep "$FAKE_SSH_HOLD_STDERR" >&2 &
+fi
 if [ -n "$FAKE_SSH_EXIT" ]; then
 	cat > "$dir/stdin"
 	printf '%s' "$FAKE_SSH_STDERR" >&2
@@ -258,5 +263,18 @@ func TestSSHInteractiveArgv(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("argv =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestSSHExecSucceedsWhenAForkedMasterHoldsStderr(t *testing.T) {
+	fakeSSH(t)
+	t.Setenv("FAKE_SSH_HOLD_STDERR", "4")
+	s, _ := newTestSSH(t, "sh -c")
+	out, err := s.Exec(context.Background(), []string{"printf", "ok"}, nil)
+	if err != nil {
+		t.Fatalf("err = %v, want success", err)
+	}
+	if string(out) != "ok" {
+		t.Errorf("stdout = %q", out)
 	}
 }
