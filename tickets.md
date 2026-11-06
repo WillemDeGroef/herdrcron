@@ -31,7 +31,7 @@ Frontier at the start: 01 and 02.
 
 # 01: herdr CLI spike: answer the open questions
 
-**What to build:** A short findings document, checked into the repo, that answers the spec's open questions against the pinned herdr version (0.7.1), plus Go types generated from `herdr api schema --json`. Every later herdr call is built on these findings, not on the spec's guessed commands.
+**What to build:** A short findings document, checked into the repo, that answers the spec's open questions against the pinned herdr version (0.9.1; the spec said 0.7.1), plus Go types generated from `herdr api schema --json`. Every later herdr call is built on these findings, not on the spec's guessed commands.
 
 **Blocked by:** None (can start immediately).
 
