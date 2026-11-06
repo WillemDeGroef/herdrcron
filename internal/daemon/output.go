@@ -13,7 +13,7 @@ import (
 )
 
 // runsOutput returns an active run's pane text, ANSI kept, read live from
-// herdr; for a run that has ended (or has no pane yet) it returns the
+// herdr (at most api.MaxOutputLines lines); for a run that has ended (or has no pane yet) it returns the
 // stored output tail.
 func (d *daemon) runsOutput(ctx context.Context, params json.RawMessage) (any, error) {
 	var p api.RunsOutputParams
@@ -29,12 +29,14 @@ func (d *daemon) runsOutput(ctx context.Context, params json.RawMessage) (any, e
 	if p.Lines == 0 {
 		p.Lines = api.DefaultOutputLines
 	}
+	p.Lines = min(p.Lines, api.MaxOutputLines)
 	run, out, err := d.runner.ReadOutput(ctx, p.RunID, p.Lines)
 	if err == nil {
 		return api.RunsOutputResult{RunID: run.ID, Status: run.Status, Live: true, Output: out}, nil
 	}
-	// A run that ended between the lookup and the read has its tail stored.
-	if !errors.Is(err, runner.ErrNotActive) && !errors.Is(err, runner.ErrNoPane) && d.runner.Active(p.RunID) {
+	// A run that ended between the lookup and the read has its tail stored;
+	// a run still tracked (active or starting) gets the read error.
+	if !errors.Is(err, runner.ErrNotActive) && !errors.Is(err, runner.ErrNoPane) && d.runner.Live(p.RunID) {
 		return nil, fmt.Errorf("read output of run %s: %w", p.RunID, err)
 	}
 	stored, err := d.store.GetRun(ctx, p.RunID)

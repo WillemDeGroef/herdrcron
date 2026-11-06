@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/WillemDeGroef/herdrcron/internal/api"
+	"github.com/WillemDeGroef/herdrcron/internal/config"
 	"github.com/WillemDeGroef/herdrcron/internal/shellquote"
 )
 
@@ -69,12 +70,12 @@ type formState struct {
 	saving   bool
 }
 
-// The values the policy pickers offer, the first being the default.
+// The values the policy pickers offer: those config accepts.
 var (
-	overlapValues   = []string{"skip", "queue", "parallel"}
-	missedValues    = []string{"run_once", "skip"}
-	onDoneValues    = []string{"keep_tab", "close_tab"}
-	onBlockedValues = []string{"notify", "stop"}
+	overlapValues   = config.EnumValues("overlap")
+	missedValues    = config.EnumValues("missed")
+	onDoneValues    = config.EnumValues("on_done")
+	onBlockedValues = config.EnumValues("on_blocked")
 )
 
 // Form messages. Each carries the form's seq.
@@ -95,13 +96,16 @@ type (
 		err error
 	}
 	formCloseMsg struct{ seq int }
+	// formReloadMsg reloads the form's task from disk, edits lost.
+	formReloadMsg struct{ seq int }
 )
 
 // newTask is the definition a new task starts from: the daemon's defaults
 // (config.DefaultTask) and the first target.
 func (m Model) newTask() api.TaskDef {
-	def := api.TaskDef{Enabled: true, Overlap: overlapValues[0], Missed: missedValues[0],
-		OnDone: onDoneValues[0], OnBlocked: onBlockedValues[0], Target: "local"}
+	d := config.DefaultTask("")
+	def := api.TaskDef{Enabled: d.Enabled, Overlap: d.Overlap, Missed: d.Missed,
+		OnDone: d.OnDone, OnBlocked: d.OnBlocked, Target: config.LocalTarget}
 	if len(m.status.Targets) > 0 {
 		def.Target = m.status.Targets[0].Name
 	}
@@ -112,7 +116,7 @@ func (m Model) newTask() api.TaskDef {
 func (m Model) openNewForm() (Model, tea.Cmd) {
 	m.form = m.buildForm(m.newTask(), "", "", false)
 	m.screen = screenForm
-	m.message = ""
+	m.setMessage("", nil)
 	return m, nil
 }
 
@@ -156,7 +160,7 @@ func (m Model) buildForm(def api.TaskDef, prompt, version string, editing bool) 
 		targets = append(targets, t.Name)
 	}
 	if len(targets) == 0 {
-		targets = []string{"local"}
+		targets = []string{config.LocalTarget}
 	}
 	id := text("id", "id", def.ID)
 	id.fixed = editing
@@ -444,7 +448,7 @@ func (m Model) formMsg(msg tea.Msg) (Model, tea.Cmd, bool) {
 			m.form.initial = m.form.snapshot()
 		}
 		m.screen = screenForm
-		m.message = ""
+		m.setMessage("", nil)
 		return m, nil, true
 	case formSavedMsg:
 		if msg.seq != m.form.seq {
@@ -474,6 +478,11 @@ func (m Model) formMsg(msg tea.Msg) (Model, tea.Cmd, bool) {
 			sort.Strings(m.form.general)
 		default:
 			m.form.general = []string{msg.err.Error()}
+		}
+		return m, nil, true
+	case formReloadMsg:
+		if msg.seq == m.form.seq && m.screen == screenForm {
+			return m, m.loadForm(m.form.id), true
 		}
 		return m, nil, true
 	case formCloseMsg:
@@ -510,10 +519,15 @@ func (m Model) formKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		return m.closeForm(), nil
 	case "ctrl+r":
-		if s.editing && s.conflict {
-			return m, m.loadForm(s.id)
+		if !s.editing || !s.conflict {
+			return m, nil
 		}
-		return m, nil
+		if s.changed() {
+			seq := s.seq
+			m.ask("Reload "+s.id+" from disk and lose your edits?", func() tea.Msg { return formReloadMsg{seq} })
+			return m, nil
+		}
+		return m, m.loadForm(s.id)
 	case "tab", "down":
 		s.focus = (s.focus + 1) % len(s.fields)
 		s.focusField()
@@ -528,8 +542,10 @@ func (m Model) formKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		switch msg.String() {
 		case "right", " ", "l":
 			f.choice = (f.choice + 1) % len(f.options)
+			s.edited(f.key)
 		case "left", "h":
 			f.choice = (f.choice + len(f.options) - 1) % len(f.options)
+			s.edited(f.key)
 		case "enter":
 			return m.nextField(), nil
 		}
@@ -537,6 +553,7 @@ func (m Model) formKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		switch msg.String() {
 		case "right", "left", " ", "h", "l":
 			f.on = !f.on
+			s.edited(f.key)
 		case "enter":
 			return m.nextField(), nil
 		}
@@ -551,11 +568,21 @@ func (m Model) formKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if f.fixed {
 			return m, nil
 		}
+		before := f.input.Value()
 		var cmd tea.Cmd
 		f.input, cmd = f.input.Update(msg)
+		if f.input.Value() != before {
+			s.edited(f.key)
+		}
 		return m, cmd
 	}
 	return m, nil
+}
+
+// edited drops the problems shown for field key: they were about the
+// value the user just changed.
+func (s *formState) edited(key string) {
+	delete(s.errs, key)
 }
 
 func (m Model) nextField() Model {
@@ -702,7 +729,7 @@ func (m Model) schedulePreview() string {
 	}
 	var ts []string
 	for _, t := range fires {
-		ts = append(ts, t.In(m.loc).Format("Mon Jan 2 15:04"))
+		ts = append(ts, t.In(m.loc).Format(fireLayout))
 	}
 	return m.st.dim.Render("next: " + strings.Join(ts, " · "))
 }

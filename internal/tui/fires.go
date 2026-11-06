@@ -7,6 +7,10 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/schedule"
 )
 
+// fireLayout shows a fire time, in the TUI's zone with its label, on the
+// detail screen and in the form's schedule preview alike.
+const fireLayout = "Mon Jan 2 15:04 MST"
+
 // nextFires returns the next n fire times of expr after after, in the task
 // time zone tz, or in defaultTZ (the daemon's config timezone) when tz is
 // empty, or in fallback when both are empty. It stops early when the

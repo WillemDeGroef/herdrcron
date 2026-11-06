@@ -121,6 +121,10 @@ var enums = map[string][]string{
 	"on_blocked": {"notify", "stop"},
 }
 
+// EnumValues returns the values a task's enum field accepts (overlap,
+// missed, on_done or on_blocked), or nil for any other field.
+func EnumValues(field string) []string { return slices.Clone(enums[field]) }
+
 // LoadTasks reads every tasks/*.yaml file under configDir and validates it
 // against cfg. A missing tasks directory means no tasks. An invalid file is
 // returned as an entry with Err set; it never fails the whole load. Entries

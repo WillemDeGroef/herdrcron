@@ -46,10 +46,12 @@ type fakeHerdr struct {
 	order      []string // pane ids in creation order
 	nextID     int
 
-	unreachable bool   // pane list fails
-	output      string // pane read text
-	ansiOutput  string // pane read --format ansi text
-	bin         string // the herdr binary it answers to; "" means "herdr"
+	unreachable bool          // pane list fails
+	output      string        // pane read text
+	ansiOutput  string        // pane read --format ansi text
+	bin         string        // the herdr binary it answers to; "" means "herdr"
+	readErr     error         // pane read --format ansi fails with it
+	putGate     chan struct{} // PutFile waits until it is closed
 }
 
 func newFakeHerdr() *fakeHerdr {
@@ -62,6 +64,12 @@ func newFakeHerdr() *fakeHerdr {
 func (f *fakeHerdr) Name() string { return "local" }
 
 func (f *fakeHerdr) PutFile(_ context.Context, path string, data []byte) error {
+	f.mu.Lock()
+	gate := f.putGate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.files[path] = slices.Clone(data)
@@ -100,6 +108,23 @@ func (f *fakeHerdr) setOutput(s string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.output = s
+}
+
+// setReadErr makes pane read --format ansi fail with err.
+func (f *fakeHerdr) setReadErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readErr = err
+}
+
+// holdPutFile makes PutFile (the prompt write, after the tab is opened)
+// wait until the returned function is called.
+func (f *fakeHerdr) holdPutFile() (release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gate := make(chan struct{})
+	f.putGate = gate
+	return sync.OnceFunc(func() { close(gate) })
 }
 
 func (f *fakeHerdr) setANSIOutput(s string) {
@@ -258,6 +283,9 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		}
 		if argv[2] == "read" {
 			if flag(argv, "--format") == "ansi" {
+				if f.readErr != nil {
+					return nil, f.readErr
+				}
 				return []byte(f.ansiOutput), nil
 			}
 			return []byte(f.output), nil

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +63,57 @@ func TestRunsOutputReadsTheLivePaneWithColours(t *testing.T) {
 	}
 	if c := l.herdr.lastCall("herdr", "pane", "read"); flag(c, "--lines") != "30" {
 		t.Errorf("pane read = %q, want --lines 30", c)
+	}
+}
+
+func TestRunsOutputCapsTheLines(t *testing.T) {
+	l := newLifecycle(t, outputNow, "timeout: 1h\n")
+	l.start()
+	run := l.mustRunNow()
+	if _, err := l.output(run.ID, 1_000_000); err != nil {
+		t.Fatal(err)
+	}
+	if c := l.herdr.lastCall("herdr", "pane", "read"); flag(c, "--lines") != strconv.Itoa(api.MaxOutputLines) {
+		t.Errorf("pane read = %q, want --lines %d", c, api.MaxOutputLines)
+	}
+}
+
+// TestRunsOutputReportsAReadErrorOfAStartingRun checks that a run still
+// starting (its pane made, the agent not launched yet) gets the read error,
+// not its empty stored tail.
+func TestRunsOutputReportsAReadErrorOfAStartingRun(t *testing.T) {
+	l := newLifecycle(t, outputNow, "timeout: 1h\n")
+	l.start()
+	release := l.herdr.holdPutFile()
+	defer release()
+	// run_now blocks its connection until the run has started: use another.
+	c2, err := api.Dial(l.p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c2.Close() }()
+	started := make(chan error, 1)
+	go func() {
+		started <- c2.Call(context.Background(), api.MethodTasksRunNow, api.RunNowParams{ID: "job"}, nil)
+	}()
+	var runID string
+	eventually(t, "a starting run with a pane", func() bool {
+		for _, r := range l.runs() {
+			if r.Status == store.StatusStarting && r.HerdrPane != "" {
+				runID = r.ID
+			}
+		}
+		return runID != ""
+	})
+	l.herdr.setReadErr(errors.New("herdr: socket gone"))
+
+	got, err := l.output(runID, 0)
+	if err == nil || !strings.Contains(err.Error(), "socket gone") {
+		t.Errorf("runs.output = %+v, %v; want the read error", got, err)
+	}
+	release()
+	if err := <-started; err != nil {
+		t.Fatal(err)
 	}
 }
 

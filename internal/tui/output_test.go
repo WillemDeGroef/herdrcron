@@ -289,3 +289,29 @@ func TestAttachFromOutputAndDetail(t *testing.T) {
 		})
 	}
 }
+
+// TestLiveOutputPollKeepsOtherErrors checks that a good read clears only
+// the error a read set, not e.g. a failed attach's.
+func TestLiveOutputPollKeepsOtherErrors(t *testing.T) {
+	fastPoll(t)
+	f := fixture()
+	f.set(api.MethodRunsOutput, liveOutput("working\n"))
+	f.fail(api.MethodRunsOutput, errors.New("pane gone"))
+	f.fail(api.MethodRunsAttachCmd, errors.New("target unreachable"))
+	tm := start(t, newAttachModel(f, &execRecorder{}))
+	selectTask(t, tm, order, "factory-coordinator")
+	tm.Send(key("l"))
+	waitText(t, tm, "pane gone")
+	waitText(t, tm, "working") // the next read clears the read's error
+	tm.Send(key("a"))
+	waitText(t, tm, "target unreachable")
+	n := len(f.callsOf(api.MethodRunsOutput))
+	waitCall(t, f, api.MethodRunsOutput, n+3)
+	view := finalView(t, tm)
+	if !strings.Contains(view, "target unreachable") {
+		t.Errorf("a good read cleared the attach error:\n%s", view)
+	}
+	if strings.Contains(view, "pane gone") {
+		t.Errorf("the read error stayed after a good read:\n%s", view)
+	}
+}

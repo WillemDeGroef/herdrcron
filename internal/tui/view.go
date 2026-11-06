@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -30,8 +31,23 @@ func newStyles(r *lipgloss.Renderer) styles {
 	}
 }
 
-// keyHelp is the footer of the list.
-const keyHelp = "space on/off  p pause  r run  n new  e edit  d del  enter detail  a attach  l live  ? help  q quit"
+// keyHelp is the footer of the list, as in the spec. On a narrow terminal
+// footerKeys drops keys from the end, but always keeps help and quit.
+var keyHelp = []string{"space on/off", "p pause", "r run now", "n new", "e edit", "d delete",
+	"enter details", "a attach", "/ filter", "? help", "q quit"}
+
+// footerKeys is the key help that fits in width columns, with its leading
+// space.
+func footerKeys(width int) string {
+	keys, tail := keyHelp[:len(keyHelp)-2], keyHelp[len(keyHelp)-2:]
+	for n := len(keys); n >= 0; n-- {
+		s := strings.Join(append(slices.Clone(keys[:n]), tail...), "  ")
+		if width <= 0 || 1+len([]rune(s)) <= width {
+			return s
+		}
+	}
+	return strings.Join(tail, "  ")
+}
 
 var columns = []string{"TARGET", "TASK", "SCHEDULE", "STATE", "LAST", "NEXT"}
 
@@ -393,7 +409,7 @@ func (m Model) footer() string {
 	case modeConfirm:
 		return m.st.warning.Render(" " + m.confirm.question + " y/n")
 	}
-	help := keyHelp
+	help := footerKeys(m.width)
 	if f := m.filter.Value(); f != "" {
 		help = "filter: " + f + " (esc clears)  " + help
 	}

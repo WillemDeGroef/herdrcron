@@ -140,8 +140,77 @@ func TestEditorArgv(t *testing.T) {
 	if got := m.editorArgv(); strings.Join(got, "|") != "code|--wait" {
 		t.Errorf("$VISUAL = %q", got)
 	}
+	t.Setenv("VISUAL", `"/opt/My Editor/bin/edit" --title 'a prompt'`)
+	if got := m.editorArgv(); strings.Join(got, "|") != "/opt/My Editor/bin/edit|--title|a prompt" {
+		t.Errorf("quoted $VISUAL = %q", got)
+	}
+	t.Setenv("VISUAL", `ed 'open`) // does not parse: split on spaces
+	if got := m.editorArgv(); strings.Join(got, "|") != "ed|'open" {
+		t.Errorf("unparsable $VISUAL = %q", got)
+	}
+	t.Setenv("VISUAL", "code --wait")
 	m.editor = []string{"ed"}
 	if got := m.editorArgv(); strings.Join(got, "|") != "ed" {
 		t.Errorf("option = %q", got)
+	}
+}
+
+// TestEditorTempFileIsMadeInACmd checks that the key only schedules the
+// editor: the temp file is made by a Cmd (so a program that quits first
+// leaves none) and is removed once the editor ends.
+func TestEditorTempFileIsMadeInACmd(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	m := editorModel(fixture(), `printf 'edited\n' > "$1"`)
+	m, _ = m.openNewForm()
+	m.form.focus = fPrompt
+	m.form.focusField()
+	entries := func() []os.DirEntry {
+		t.Helper()
+		e, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	m, cmd := m.update(key("enter"))
+	if cmd == nil {
+		t.Fatal("enter on the prompt gave no command")
+	}
+	if e := entries(); len(e) != 0 {
+		t.Fatalf("the key made %d files before any Cmd ran", len(e))
+	}
+	msg := cmd()
+	if e := entries(); len(e) != 1 {
+		t.Fatalf("the Cmd made %d files, want the temp file", len(e))
+	}
+	m, cmd = m.update(msg)
+	if cmd == nil {
+		t.Fatal("no editor command")
+	}
+	m, _ = m.update(cmd())
+	if m.form.prompt != "edited\n" {
+		t.Errorf("prompt = %q", m.form.prompt)
+	}
+	if e := entries(); len(e) != 0 {
+		t.Errorf("temp file left behind: %v", e)
+	}
+}
+
+func TestEditorTempFileIsRemovedWhenTheEditorFails(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	m := editorModel(fixture(), "exit 3")
+	m, _ = m.openNewForm()
+	m.form.focus = fPrompt
+	m.form.focusField()
+	m, cmd := m.update(key("enter"))
+	m, cmd = m.update(cmd())
+	m, _ = m.update(cmd())
+	if !strings.Contains(m.message, "exit status 3") {
+		t.Errorf("message = %q", m.message)
+	}
+	if e, _ := os.ReadDir(dir); len(e) != 0 {
+		t.Errorf("temp file left behind: %v", e)
 	}
 }

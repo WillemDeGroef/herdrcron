@@ -510,6 +510,18 @@ func (r *Runner) Active(runID string) bool {
 	return ok
 }
 
+// Live reports whether the run is tracked as active or still starting:
+// the runs ReadOutput and PaneHasAgent can answer for.
+func (r *Runner) Live(runID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.active[runID]
+	if !ok {
+		_, ok = r.starting[runID]
+	}
+	return ok
+}
+
 // ReadOutput returns a snapshot of an active run and the last lines of
 // its pane with ANSI escapes kept, for a live view. A run the runner does
 // not track gives ErrNotActive; one without a pane yet gives ErrNoPane.

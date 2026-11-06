@@ -4,7 +4,7 @@
   name          peppol.sh dependency update
   target        local
   cwd           ~/src/peppol-sh
-› schedule      0 7 * * 1   next: Mon Nov 9 06:00 · Mon Nov 16 06:00 · Mon Nov 23 06:00
+› schedule      0 7 * * 1   next: Mon Nov 9 06:00 UTC · Mon Nov 16 06:00 UTC · Mon Nov 23 06:00 UTC
   timezone      Europe/Brussels
   enabled       [x]
   paused until  empty, RFC 3339 time or indefinite

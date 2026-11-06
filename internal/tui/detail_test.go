@@ -262,3 +262,19 @@ func TestDetailPageKeysScroll(t *testing.T) {
 		t.Errorf("pgdown did not scroll:\n%s", view)
 	}
 }
+
+// TestDetailRunOutputClosesColours checks that a colour the pane left open
+// does not bleed into the message line and footer.
+func TestDetailRunOutputClosesColours(t *testing.T) {
+	f := detailFixture()
+	f.set(api.MethodRunsOutput, liveOutput("plain\n\x1b[31mred and never closed\n"))
+	tm := openCoordinatorDetail(t, f)
+	tm.Send(key("enter"))
+	waitText(t, tm, "red and never closed")
+	view := finalView(t, tm)
+	_, after, _ := strings.Cut(view, "red and never closed")
+	reset := strings.Index(after, "\x1b[0m")
+	if foot := strings.Index(after, "esc back"); reset < 0 || reset > foot {
+		t.Errorf("no colour reset between the output and the footer:\n%q", view)
+	}
+}

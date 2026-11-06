@@ -22,7 +22,8 @@ type outputState struct {
 	back    screen // the screen esc goes back to
 	loading bool
 	res     api.RunsOutputResult
-	ended   bool // the run ended: res is its final output and polling stopped
+	ended   bool   // the run ended: res is its final output and polling stopped
+	readErr string // the message a failed read set, cleared by the next good read
 }
 
 // Messages of the live output screen and of attach.
@@ -44,11 +45,19 @@ type (
 	}
 )
 
-// openOutput opens the live output of task id's active run.
-func (m Model) openOutput(id string) (Model, tea.Cmd) {
+// requireActiveRun returns task id's active run, or says it has none.
+func (m *Model) requireActiveRun(id string) (api.RunSummary, bool) {
 	run, ok := m.activeRun(id)
 	if !ok {
 		m.setMessage(id+" has no active run", nil)
+	}
+	return run, ok
+}
+
+// openOutput opens the live output of task id's active run.
+func (m Model) openOutput(id string) (Model, tea.Cmd) {
+	run, ok := m.requireActiveRun(id)
+	if !ok {
 		return m, nil
 	}
 	back := m.screen
@@ -58,18 +67,27 @@ func (m Model) openOutput(id string) (Model, tea.Cmd) {
 	return m, m.pollOutput()
 }
 
-// pollOutput reads the pane of the open screen's run once.
-func (m Model) pollOutput() tea.Cmd {
-	ctx, b, gen, run := m.ctx, m.backend, m.output.gen, m.output.run
-	lines := max(api.DefaultOutputLines, m.height)
+// readOutput calls runs.output for run (lines 0: the daemon's default)
+// and hands the answer to done.
+func (m Model) readOutput(run string, lines int, done func(api.RunsOutputResult, error) tea.Msg) tea.Cmd {
+	ctx, b := m.ctx, m.backend
 	return func() tea.Msg {
 		var res api.RunsOutputResult
 		err := b.Call(ctx, api.MethodRunsOutput, api.RunsOutputParams{RunID: run, Lines: lines}, &res)
 		if err != nil {
 			err = fmt.Errorf("runs.output %s: %w", run, err)
 		}
-		return outputMsg{gen: gen, res: res, err: err}
+		return done(res, err)
 	}
+}
+
+// pollOutput reads the pane of the open screen's run once.
+func (m Model) pollOutput() tea.Cmd {
+	gen := m.output.gen
+	lines := min(max(api.DefaultOutputLines, m.height), api.MaxOutputLines)
+	return m.readOutput(m.output.run, lines, func(res api.RunsOutputResult, err error) tea.Msg {
+		return outputMsg{gen: gen, res: res, err: err}
+	})
 }
 
 // closeOutput goes back to the screen the output was opened from.
@@ -86,9 +104,8 @@ func (m Model) closeOutput() (Model, tea.Cmd) {
 
 // attach suspends the TUI and attaches to task id's active run.
 func (m Model) attach(id string) (Model, tea.Cmd) {
-	run, ok := m.activeRun(id)
+	run, ok := m.requireActiveRun(id)
 	if !ok {
-		m.setMessage(id+" has no active run", nil)
 		return m, nil
 	}
 	return m, m.attachRun(run.ID)
@@ -121,11 +138,14 @@ func (m Model) outputMsg(msg tea.Msg) (Model, tea.Cmd, bool) {
 		if msg.err != nil {
 			// Keep trying: the pane may be back at the next read.
 			m.setMessage("", msg.err)
+			m.output.readErr = m.message
 			return m, m.outputTick(), true
 		}
-		if m.msgErr {
+		// Clear the error a read set, and only that one.
+		if m.output.readErr != "" && m.msgErr && m.message == m.output.readErr {
 			m.setMessage("", nil)
 		}
+		m.output.readErr = ""
 		m.output.res = msg.res
 		if !msg.res.Live {
 			m.output.ended = true

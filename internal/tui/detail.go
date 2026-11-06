@@ -107,7 +107,7 @@ func (m Model) detailKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	if m.detail.out {
 		return m.runOutputKey(msg)
 	}
-	runs := m.detail.d.Runs[:min(len(m.detail.d.Runs), api.TaskRunsLimit)]
+	runs := m.detail.runs()
 	switch msg.String() {
 	case "esc", "q":
 		m.closeDetail()
@@ -173,15 +173,10 @@ func (m *Model) openRunOutput(id string) tea.Cmd {
 	m.detail.vp = viewport.New(0, 0)
 	m.detail.outSeq++
 	m.setMessage("", nil)
-	ctx, b, seq := m.ctx, m.backend, m.detail.outSeq
-	return func() tea.Msg {
-		var res api.RunsOutputResult
-		err := b.Call(ctx, api.MethodRunsOutput, api.RunsOutputParams{RunID: id}, &res)
-		if err != nil {
-			err = fmt.Errorf("runs.output %s: %w", id, err)
-		}
+	seq := m.detail.outSeq
+	return m.readOutput(id, 0, func(res api.RunsOutputResult, err error) tea.Msg {
 		return runOutputMsg{seq: seq, res: res, err: err}
-	}
+	})
 }
 
 func (m Model) runOutputKey(msg tea.KeyMsg) (Model, tea.Cmd) {
@@ -224,6 +219,8 @@ func (m Model) runOutputView() string {
 	default:
 		m.sizeRunOutput()
 		b.WriteString(m.detail.vp.View())
+		// Close any colour an active run's pane left open.
+		b.WriteString("\x1b[0m")
 	}
 	b.WriteByte('\n')
 	b.WriteString(m.messageLine())
@@ -285,10 +282,7 @@ func (m Model) detailBody() ([]string, int) {
 	lines = append(lines, "", m.st.header.Render(" Next fires"))
 	lines = append(lines, m.fireLines()...)
 	lines = append(lines, "", m.st.header.Render(" Runs"))
-	runs := m.detail.d.Runs
-	if len(runs) > api.TaskRunsLimit {
-		runs = runs[:api.TaskRunsLimit]
-	}
+	runs := m.detail.runs()
 	if len(runs) == 0 {
 		lines = append(lines, m.st.dim.Render("  no runs yet"))
 		return lines, len(lines) - 1
@@ -339,15 +333,19 @@ func (m Model) fireLines() []string {
 		out = append(out, m.st.dim.Render("  never fires again"))
 	}
 	for _, t := range fires {
-		out = append(out, "  "+t.In(m.loc).Format("Mon Jan 2 15:04 MST"))
+		out = append(out, "  "+t.In(m.loc).Format(fireLayout))
 	}
 	return out
 }
 
+// runs are the runs the detail shows: at most api.TaskRunsLimit.
+func (ds detailState) runs() []api.RunSummary {
+	return ds.d.Runs[:min(len(ds.d.Runs), api.TaskRunsLimit)]
+}
+
 // runCursor is the index of the selected run, clamped to the runs shown.
 func (m Model) runCursor() int {
-	n := min(len(m.detail.d.Runs), api.TaskRunsLimit)
-	for i, r := range m.detail.d.Runs[:n] {
+	for i, r := range m.detail.runs() {
 		if r.ID == m.detail.run {
 			return i
 		}

@@ -336,12 +336,16 @@ type RunIDParams struct {
 type RunsOutputParams struct {
 	RunID string `json:"run_id"`
 	// Lines is how many lines of an active run's pane to read; zero means
-	// DefaultOutputLines. Ignored for an ended run.
+	// DefaultOutputLines, and more than MaxOutputLines reads MaxOutputLines.
+	// Ignored for an ended run.
 	Lines int `json:"lines,omitempty"`
 }
 
 // DefaultOutputLines is the runs.output line count when the params give none.
 const DefaultOutputLines = 200
+
+// MaxOutputLines is the most pane lines one runs.output reads.
+const MaxOutputLines = 2000
 
 // RunsOutputResult is the result of "runs.output". For an active run
 // Output is the pane's recent text with ANSI escapes kept and Live is set;

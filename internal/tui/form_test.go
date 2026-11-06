@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -177,7 +178,17 @@ func TestFormVersionMismatchExplainsAndReloads(t *testing.T) {
 	d := peppolDetail()
 	d.Task.Name, d.Version = "renamed by hand", "v2"
 	f.set(api.MethodTasksGet, d)
+	// ctrl+r would lose the edits: it asks first.
 	tm.Send(ctrl(tea.KeyCtrlR))
+	waitText(t, tm, "Reload peppol-sh-deps from disk and lose your edits? y/n")
+	tm.Send(key("n"))
+	waitText(t, tm, "cancelled")
+	if n := len(f.callsOf(api.MethodTasksGet)); n != 1 {
+		t.Fatalf("tasks.get called %d times after declining the reload, want 1", n)
+	}
+	tm.Send(ctrl(tea.KeyCtrlR))
+	waitText(t, tm, "lose your edits? y/n")
+	tm.Send(key("y"))
 	waitText(t, tm, "renamed by hand")
 	f.set(api.MethodTasksUpdate, d)
 	tm.Send(ctrl(tea.KeyCtrlS))
@@ -222,9 +233,9 @@ func TestFormSchedulePreview(t *testing.T) {
 	for _, tc := range []struct {
 		name, defaultTZ, tz, want string
 	}{
-		{"the TUI's zone", "", "", "next: Fri Nov 6 09:00 · Sat Nov 7 09:00 · Sun Nov 8 09:00"},
-		{"config timezone", "Europe/Brussels", "", "next: Fri Nov 6 08:00 · Sat Nov 7 08:00 · Sun Nov 8 08:00"},
-		{"task timezone", "Europe/Brussels", "America/New_York", "next: Thu Nov 5 14:00 · Fri Nov 6 14:00 · Sat Nov 7 14:00"},
+		{"the TUI's zone", "", "", "next: Fri Nov 6 09:00 UTC · Sat Nov 7 09:00 UTC · Sun Nov 8 09:00 UTC"},
+		{"config timezone", "Europe/Brussels", "", "next: Fri Nov 6 08:00 UTC · Sat Nov 7 08:00 UTC · Sun Nov 8 08:00 UTC"},
+		{"task timezone", "Europe/Brussels", "America/New_York", "next: Thu Nov 5 14:00 UTC · Fri Nov 6 14:00 UTC · Sat Nov 7 14:00 UTC"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := fixture()
@@ -318,5 +329,54 @@ func TestEditFormReadErrorStaysOnTheList(t *testing.T) {
 	waitText(t, tm, "read release-notes: unknown task")
 	if v := finalView(t, tm); !strings.Contains(v, "TARGET") {
 		t.Fatalf("not on the list:\n%s", v)
+	}
+}
+
+// TestFormEditClearsThatFieldsDaemonErrors checks that editing a field
+// drops the daemon's errors for it (the schedule preview shows again),
+// while the other fields keep theirs until the next save.
+func TestFormEditClearsThatFieldsDaemonErrors(t *testing.T) {
+	f := fixture()
+	f.fail(api.MethodTasksUpdate, &api.Error{Code: api.CodeValidation, Message: "task is invalid", Data: api.ValidationErrorData{
+		Fields: map[string][]string{"schedule": {"schedule is odd"}, "agent.command": {"agent.command is missing"}}}})
+	tm := openEdit(t, f, newTestModel(f, plain()))
+	typeText(tm, "x")
+	tm.Send(ctrl(tea.KeyCtrlS))
+	waitText(t, tm, "schedule is odd")
+	tabs(tm, fSchedule-fName)
+	tm.Send(ctrl(tea.KeyBackspace))
+	typeText(tm, "2")
+	waitText(t, tm, "next: Tue Nov 10 06:00 UTC")
+	view := finalView(t, tm)
+	if strings.Contains(view, "schedule is odd") {
+		t.Errorf("the schedule's error stayed after editing it:\n%s", view)
+	}
+	if !strings.Contains(view, "agent.command is missing") {
+		t.Errorf("another field's error went away:\n%s", view)
+	}
+}
+
+func TestFormPickerEditClearsItsDaemonErrors(t *testing.T) {
+	f := fixture()
+	f.fail(api.MethodTasksUpdate, &api.Error{Code: api.CodeValidation, Message: "task is invalid", Data: api.ValidationErrorData{
+		Fields: map[string][]string{"overlap": {"overlap is odd"}}}})
+	tm := openEdit(t, f, newTestModel(f, plain()))
+	typeText(tm, "x")
+	tm.Send(ctrl(tea.KeyCtrlS))
+	waitText(t, tm, "overlap is odd")
+	tabs(tm, fOverlap-fName)
+	tm.Send(ctrl(tea.KeyRight))
+	waitText(t, tm, "‹ queue ›")
+	if view := finalView(t, tm); strings.Contains(view, "overlap is odd") {
+		t.Errorf("the overlap error stayed after changing it:\n%s", view)
+	}
+}
+
+func TestOpenNewFormResetsTheErrorFlag(t *testing.T) {
+	m := newTestModel(fixture(), plain())
+	m.setMessage("", errors.New("old failure"))
+	m, _ = m.openNewForm()
+	if m.message != "" || m.msgErr {
+		t.Errorf("message %q, msgErr %v after opening the form", m.message, m.msgErr)
 	}
 }
