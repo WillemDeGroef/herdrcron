@@ -28,6 +28,13 @@ func (d *daemon) tasksSetEnabled(ctx context.Context, params json.RawMessage) (a
 	if err := decode(params, &p); err != nil {
 		return nil, err
 	}
+	// A missing "enabled" decodes as false; never disable a task by accident.
+	var present struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(params, &present); err != nil || present.Enabled == nil {
+		return nil, api.InvalidParams(errors.New("enabled is missing"))
+	}
 	return d.editTask(ctx, p.ID, "set enabled", func(path string) error { return config.SetEnabled(path, p.Enabled) })
 }
 
@@ -101,8 +108,10 @@ func (d *daemon) editLocked(ctx context.Context, i int, action string, edit func
 	logTask(d.log, e)
 	d.log.Info("task file written", logging.KeyTaskID, e.ID, "action", action,
 		"enabled", e.Task.Enabled, "paused_until", e.Task.PausedUntil)
+	// The file is written; a failed reschedule must not report the edit
+	// as failed. The next reload schedules the task again.
 	if err := d.sched.SetTask(ctx, e); err != nil {
-		return api.TaskSummary{}, fmt.Errorf("reschedule %s: %w", e.ID, err)
+		d.log.Error("cannot reschedule task", logging.KeyTaskID, e.ID, "err", err)
 	}
 	return d.summary(ctx, e)
 }

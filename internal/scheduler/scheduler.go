@@ -129,7 +129,9 @@ func (s *Scheduler) SetTask(ctx context.Context, e config.TaskEntry) error {
 	if e.Err == nil && e.Task.Enabled {
 		en, err := s.newEntry(e.Task, now, nil)
 		if err != nil {
-			return err
+			// As in SetTasks: the task does not fire, and has no next fire.
+			s.log.Error("cannot schedule task", "task_id", e.ID, "err", err)
+			return s.store.SetNextFire(ctx, e.ID, time.Time{})
 		}
 		s.tasks[e.ID] = en
 		next = en.next

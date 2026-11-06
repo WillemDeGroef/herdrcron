@@ -85,7 +85,14 @@ func setKey(path, key string, value *yaml.Node) error {
 // in the same directory, syncs it, gives it the original file's mode and
 // renames it over path. The temp file is named .<name>.tmp-*, so LoadTasks
 // never reads it. On failure the temp file is removed and path is untouched.
+// A symlinked path is followed: the link's target is replaced and the link
+// stays. The directory is synced after the rename, so the rename survives a
+// crash.
 func writeFileAtomic(path string, data []byte) (err error) {
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -112,5 +119,18 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	if err = tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err = os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+// syncDir fsyncs a directory, making a rename in it durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	return d.Sync()
 }

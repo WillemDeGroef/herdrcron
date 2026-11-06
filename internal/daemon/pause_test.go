@@ -193,6 +193,7 @@ func TestPauseRequestErrors(t *testing.T) {
 		{"bad until", api.MethodTasksPause, api.PauseParams{ID: "nightly", Until: "tomorrow"}, "until"},
 		{"missing until", api.MethodTasksPause, api.PauseParams{ID: "nightly"}, "until"},
 		{"past until", api.MethodTasksPause, api.PauseParams{ID: "nightly", Until: "2026-11-06T11:00:00Z"}, "in the past"},
+		{"missing enabled", api.MethodTasksSetEnabled, map[string]string{"id": "nightly"}, "enabled is missing"},
 		{"unknown target", api.MethodPauseAll, api.TargetParams{Target: "mars"}, `unknown target "mars"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

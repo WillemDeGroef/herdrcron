@@ -155,3 +155,35 @@ func TestSetKeepsModeAndLeavesNoTempFiles(t *testing.T) {
 		t.Errorf("file = %q, want %q", got, want)
 	}
 }
+
+func TestSetEnabledWritesThroughASymlink(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "dotfiles", "nightly.yaml")
+	if err := os.MkdirAll(filepath.Dir(real), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(real, []byte("id: nightly\nenabled: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "tasks", "nightly.yaml")
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := config.SetEnabled(link, false); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("task file is no longer a symlink (mode %v, err %v)", info.Mode(), err)
+	}
+	data, err := os.ReadFile(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "enabled: false") {
+		t.Errorf("link target not written:\n%s", data)
+	}
+}
