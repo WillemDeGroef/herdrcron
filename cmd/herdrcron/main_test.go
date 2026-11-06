@@ -392,6 +392,7 @@ func startFakeDaemon(t *testing.T, p paths.Paths, results map[string]any) *fakeD
 	fd := &fakeDaemon{}
 	srv := api.NewServer(nil)
 	for method, res := range results {
+		method, res := method, res
 		srv.Handle(method, func(_ context.Context, params json.RawMessage) (any, error) {
 			fd.mu.Lock()
 			fd.calls = append(fd.calls, fakeCall{method: method, params: append(json.RawMessage(nil), params...)})
@@ -416,6 +417,29 @@ func startFakeDaemon(t *testing.T, p paths.Paths, results map[string]any) *fakeD
 		}
 	})
 	return fd
+}
+
+// stubDaemon serves handlers on the daemon socket of p until the test ends.
+func stubDaemon(t *testing.T, p paths.Paths, handlers map[string]api.HandlerFunc) {
+	t.Helper()
+	srv := api.NewServer(nil)
+	for m, h := range handlers {
+		srv.Handle(m, h)
+	}
+	ln, err := api.Listen(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Serve(ctx, ln)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 }
 
 // only returns the single recorded call, decoding its params into v.
@@ -709,6 +733,90 @@ func TestParseUntil(t *testing.T) {
 		}
 		if err != nil || got != tc.want {
 			t.Errorf("parseUntil(%q) = %q, %v; want %q", tc.in, got, err, tc.want)
+		}
+	}
+}
+
+func runNowStub(t *testing.T, res api.RunSummary, gotID *string) map[string]api.HandlerFunc {
+	return map[string]api.HandlerFunc{
+		api.MethodTasksRunNow: func(_ context.Context, params json.RawMessage) (any, error) {
+			var p api.RunNowParams
+			if err := json.Unmarshal(params, &p); err != nil {
+				t.Errorf("run_now params %s: %v", params, err)
+			}
+			*gotID = p.ID
+			if p.ID == "nope" {
+				return nil, api.InvalidParams(errors.New(`unknown task "nope"`))
+			}
+			return res, nil
+		},
+	}
+}
+
+func TestRunPrintsTheStartedRun(t *testing.T) {
+	p := xdg(t)
+	var gotID string
+	stubDaemon(t, p, runNowStub(t, api.RunSummary{ID: "01JRUN", TaskID: "nightly", Target: "local",
+		Trigger: "manual", Status: "running", HerdrWorkspace: "w1", HerdrTab: "w1:t2", HerdrPane: "w1:p3"}, &gotID))
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "nightly"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	if gotID != "nightly" {
+		t.Errorf("run_now id = %q, want nightly", gotID)
+	}
+	if got, want := out.String(), "run 01JRUN started for nightly: running, herdr tab w1:t2 pane w1:p3\n"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestRunThatFailsToStartExitsNonZero(t *testing.T) {
+	p := xdg(t)
+	var gotID string
+	stubDaemon(t, p, runNowStub(t, api.RunSummary{ID: "01JRUN", TaskID: "nightly", Target: "local",
+		Trigger: "manual", Status: "failed", ExitReason: "preflight: cwd /nope does not exist"}, &gotID))
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "nightly"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if got, want := out.String(), "run 01JRUN started for nightly: failed: preflight: cwd /nope does not exist\n"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestRunUnknownTaskFails(t *testing.T) {
+	p := xdg(t)
+	var gotID string
+	stubDaemon(t, p, runNowStub(t, api.RunSummary{}, &gotID))
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "nope"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if msg := errOut.String(); !strings.Contains(msg, `unknown task "nope"`) {
+		t.Errorf("stderr = %q, want the daemon's error", msg)
+	}
+}
+
+func TestRunWithoutDaemonFails(t *testing.T) {
+	xdg(t)
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "nightly"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if msg := errOut.String(); !strings.Contains(msg, "daemon is not running") || !strings.Contains(msg, "herdrcron daemon") {
+		t.Fatalf("stderr = %q, want a clear message that says how to start it", msg)
+	}
+}
+
+func TestRunNeedsOneTaskID(t *testing.T) {
+	xdg(t)
+	for _, args := range [][]string{{"run"}, {"run", "a", "b"}} {
+		var out, errOut bytes.Buffer
+		if code := run(context.Background(), args, &out, &errOut); code != 2 {
+			t.Errorf("%q: exit %d, want 2", args, code)
+		}
+		if !strings.Contains(errOut.String(), "usage") {
+			t.Errorf("%q: stderr = %q, want usage", args, errOut.String())
 		}
 	}
 }

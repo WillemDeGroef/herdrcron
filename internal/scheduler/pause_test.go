@@ -1,16 +1,13 @@
 package scheduler_test
 
 import (
-	"context"
 	"errors"
-	"io"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/config"
-	"github.com/WillemDeGroef/herdrcron/internal/target"
 )
 
 func TestPauseExpiryIsReportedOnceAtPausedUntil(t *testing.T) {
@@ -66,8 +63,7 @@ func TestGlobalPauseSkipsFiresWithoutCatchUp(t *testing.T) {
 
 func TestGlobalPauseOnOneTargetLeavesOtherTargets(t *testing.T) {
 	e := newEnv(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
-	vps := target.NewFake("vps")
-	e.sched = e.newScheduler(map[string]target.Target{"local": e.local, "vps": vps})
+	e.sched = e.newScheduler()
 	local := task("on-local", "@hourly")
 	remote := task("on-vps", "@hourly")
 	remote.Target = "vps"
@@ -172,21 +168,8 @@ func TestPauseClearFailureIsRetriedLater(t *testing.T) {
 	}
 }
 
-// execHook runs fn at the start of Exec, then the embedded fake.
-type execHook struct {
-	*target.Fake
-	fn func()
-}
-
-func (h *execHook) Exec(ctx context.Context, argv []string, stdin io.Reader) ([]byte, error) {
-	if h.fn != nil {
-		h.fn()
-	}
-	return h.Fake.Exec(ctx, argv, stdin)
-}
-
-// Two tasks come due in one tick. The first Exec applies a pause or a
-// disable; the fire still queued behind it must not start.
+// Two tasks come due in one tick. The first scheduled Start applies a pause
+// or a disable; the fire still queued behind it must not start.
 func TestQueuedFireSeesPauseThatLandsDuringTick(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -215,15 +198,14 @@ func TestQueuedFireSeesPauseThatLandsDuringTick(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
 			var once sync.Once
-			fake := target.NewFake("local")
-			hook := &execHook{Fake: fake, fn: func() { once.Do(func() { tc.fn(t, e) }) }}
-			e.local = fake
-			e.sched = e.newScheduler(map[string]target.Target{"local": hook})
+			e.starter.beforeInsert = func(config.Task) {
+				once.Do(func() { tc.fn(t, e) })
+			}
 			e.setTasks(valid(task("a", "@hourly"), task("b", "@hourly")))
 			e.clock.Set(time.Date(2026, 11, 6, 13, 0, 0, 0, time.UTC))
 			e.sched.Tick(e.ctx)
 			if n := len(e.runs("a")) + len(e.runs("b")); n != 1 {
-				t.Fatalf("%d runs, want 1 (the fire already inside Exec; the queued one stays off)", n)
+				t.Fatalf("%d runs, want 1 (the first fire started; the queued one stays off)", n)
 			}
 		})
 	}

@@ -2,8 +2,10 @@ package api
 
 // Method names served by the daemon.
 const (
-	MethodStatus    = "status"
-	MethodTasksList = "tasks.list"
+	MethodStatus      = "status"
+	MethodTasksList   = "tasks.list"
+	MethodTasksRunNow = "tasks.run_now"
+	MethodRunsList    = "runs.list"
 
 	MethodTasksSetEnabled = "tasks.set_enabled" // SetEnabledParams → TaskSummary
 	MethodTasksPause      = "tasks.pause"       // PauseParams → TaskSummary
@@ -11,6 +13,9 @@ const (
 	MethodPauseAll        = "pause_all"         // TargetParams → GlobalPause
 	MethodResumeAll       = "resume_all"        // TargetParams → GlobalPause
 )
+
+// DefaultRunsLimit is the runs.list limit when the params give none.
+const DefaultRunsLimit = 50
 
 // PauseIndefinite is the paused_until value of a pause without an end.
 const PauseIndefinite = "indefinite"
@@ -97,13 +102,39 @@ type TaskSummary struct {
 	LastRun    *RunSummary `json:"last_run,omitempty"`
 }
 
+// RunNowParams are the params of "tasks.run_now". The result is the
+// RunSummary of the started run: running, or ended as failed with the
+// reason when it could not start.
+type RunNowParams struct {
+	ID string `json:"id"`
+	// ForceParallel starts the run even if the task has an active run.
+	// Accepted but not acted on yet: overlap handling comes later.
+	ForceParallel bool `json:"force_parallel,omitempty"`
+}
+
+// RunsListParams are the params of "runs.list".
+type RunsListParams struct {
+	TaskID string `json:"task_id,omitempty"` // empty: all tasks
+	Limit  int    `json:"limit,omitempty"`   // zero: DefaultRunsLimit
+}
+
+// RunsListResult is the result of "runs.list": runs newest first.
+type RunsListResult struct {
+	Runs []RunSummary `json:"runs"`
+}
+
 // RunSummary is one run. Times are RFC 3339 in UTC; empty when not set.
 type RunSummary struct {
-	ID          string `json:"id"`
-	Trigger     string `json:"trigger"`
-	Status      string `json:"status"`
-	ScheduledAt string `json:"scheduled_at,omitempty"`
-	StartedAt   string `json:"started_at"`
-	EndedAt     string `json:"ended_at,omitempty"`
-	ExitReason  string `json:"exit_reason,omitempty"`
+	ID             string `json:"id"`
+	TaskID         string `json:"task_id"`
+	Target         string `json:"target"`
+	Trigger        string `json:"trigger"`
+	Status         string `json:"status"`
+	ScheduledAt    string `json:"scheduled_at,omitempty"`
+	StartedAt      string `json:"started_at"`
+	EndedAt        string `json:"ended_at,omitempty"`
+	ExitReason     string `json:"exit_reason,omitempty"`
+	HerdrWorkspace string `json:"herdr_workspace,omitempty"`
+	HerdrTab       string `json:"herdr_tab,omitempty"`
+	HerdrPane      string `json:"herdr_pane,omitempty"`
 }

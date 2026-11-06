@@ -1,6 +1,6 @@
 // Package scheduler fires tasks at their schedule's fire times. It keeps
 // next_fire_at per task in the store, starts a run for every fire through
-// the task's Target, and prunes run history older than history_days.
+// a Starter (runner.Runner), and prunes run history older than history_days.
 package scheduler
 
 import (
@@ -16,7 +16,6 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/logging"
 	"github.com/WillemDeGroef/herdrcron/internal/schedule"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
-	"github.com/WillemDeGroef/herdrcron/internal/target"
 )
 
 // maxWait caps one sleep of the Run loop, so a wall-clock jump (suspend,
@@ -31,13 +30,21 @@ const lateGrace = time.Minute
 // pruneEvery is how often run history is pruned.
 const pruneEvery = time.Hour
 
+// Starter starts a run of a task; runner.Runner implements it. Start
+// stores the run row and returns it. It returns an error only when the
+// run could not be stored; a run that fails to launch comes back ended.
+// It is called inside Tick, so it must return once the run is launched.
+type Starter interface {
+	Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error)
+}
+
 // Options configures New.
 type Options struct {
-	Clock   clock.Clock
-	Store   *store.Store
-	Targets map[string]target.Target // by target name
-	Config  config.Config            // as loaded: timezone fallback and history_days
-	Log     *slog.Logger
+	Clock  clock.Clock
+	Store  *store.Store
+	Runs   Starter
+	Config config.Config // as loaded: timezone fallback and history_days
+	Log    *slog.Logger
 	// OnPauseExpired is called from Tick when a task's timed paused_until
 	// has passed, including a task that is off or invalid. The daemon
 	// clears it in the task file. It may call SetTask. A non-nil error is
@@ -48,12 +55,12 @@ type Options struct {
 
 // Scheduler fires tasks. Its methods are safe for concurrent use.
 type Scheduler struct {
-	clock   clock.Clock
-	store   *store.Store
-	targets map[string]target.Target
-	cfg     config.Config
-	log     *slog.Logger
-	reload  chan struct{}
+	clock  clock.Clock
+	store  *store.Store
+	runs   Starter
+	cfg    config.Config
+	log    *slog.Logger
+	reload chan struct{}
 
 	onPauseExpired func(ctx context.Context, taskID string) error
 
@@ -82,9 +89,10 @@ const pauseClearRetry = time.Minute
 // New returns a scheduler with no tasks.
 func New(o Options) *Scheduler {
 	return &Scheduler{
-		clock: o.Clock, store: o.Store, targets: o.Targets, cfg: o.Config, log: o.Log,
-		reload: make(chan struct{}, 1),
-		tasks:  map[string]*entry{}, pausedOn: map[string]struct{}{},
+		clock: o.Clock, store: o.Store, runs: o.Runs, cfg: o.Config, log: o.Log,
+		reload:         make(chan struct{}, 1),
+		tasks:          map[string]*entry{},
+		pausedOn:       map[string]struct{}{},
 		onPauseExpired: o.OnPauseExpired,
 	}
 }
@@ -301,7 +309,7 @@ func (s *Scheduler) Tick(ctx context.Context) time.Time {
 // and records it in task_state.
 func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now time.Time, globalPause bool) {
 	t := e.task
-	log := s.log.With("task_id", t.ID, "target", t.Target)
+	log := s.log.With(logging.KeyTaskID, t.ID, logging.KeyTarget, t.Target)
 	// The state must be written even when ctx is cancelled mid-fire.
 	wctx := context.WithoutCancel(ctx)
 	switch {
@@ -318,16 +326,19 @@ func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now t
 		// not implemented yet; for now a missed fire is only logged.
 		log.Warn("fire missed", "scheduled_at", scheduledAt, "late_by", now.Sub(scheduledAt).String())
 	default:
-		// Tick queued this fire, then dropped the lock. start calls
-		// Target.Exec, so a pause or disable during an earlier fire in
-		// this tick must still suppress this one.
+		// Tick queued this fire, then dropped the lock. Runner.Start may
+		// block; a pause or disable during an earlier fire in this tick
+		// must still suppress this one.
 		if why := s.fireSuppressed(t.ID, t.Target, scheduledAt); why != "" {
 			log.Info("fire skipped: "+why, "scheduled_at", scheduledAt)
 			break
 		}
-		run, err := s.start(ctx, t, store.TriggerSchedule, scheduledAt)
+		run, err := s.runs.Start(ctx, t, store.TriggerSchedule, scheduledAt)
+		if run.ID != "" {
+			log = logging.ForRun(s.log, run.ID, t.ID, t.Target)
+		}
 		if err != nil {
-			log.Error("cannot start run", "err", err)
+			log.Error("cannot start run", "scheduled_at", scheduledAt, "err", err)
 		}
 		// Record the fire even when the finishing write failed: the row
 		// exists, and last_run_id should point at it.
@@ -383,49 +394,14 @@ func (s *Scheduler) finishPause(id string, now time.Time, err error) {
 		if due {
 			e.pauseEnd = now.Add(pauseClearRetry)
 		}
-		s.log.Error("cannot clear paused_until", "task_id", id, "err", err)
+		s.log.Error("cannot clear paused_until", logging.KeyTaskID, id, "err", err)
 	case due:
 		e.pauseEnd = time.Time{}
-		s.log.Info("pause ended", "task_id", id)
+		s.log.Info("pause ended", logging.KeyTaskID, id)
 	case e == nil || e.pauseEnd.IsZero():
 		// The callback cleared the pause and replaced or dropped the entry.
-		s.log.Info("pause ended", "task_id", id)
+		s.log.Info("pause ended", logging.KeyTaskID, id)
 	}
-}
-
-// start reserves a run row and launches the run on the task's target.
-//
-// Until the herdr adapter exists, a launch is one Target.Exec of the agent
-// argv, and the run ends when Exec returns: done on success, failed with
-// the error as exit reason. It runs inside Tick, so it must stay fast; the
-// herdr adapter launches and then tracks the run by polling.
-func (s *Scheduler) start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
-	tg, ok := s.targets[t.Target]
-	if !ok {
-		return store.Run{}, fmt.Errorf("unknown target %q", t.Target)
-	}
-	now := s.clock.Now()
-	run := store.Run{
-		ID: store.NewRunID(now), TaskID: t.ID, Target: t.Target, Trigger: trigger,
-		ScheduledAt: scheduledAt, StartedAt: now, Status: store.StatusStarting,
-	}
-	if err := s.store.InsertRun(ctx, run); err != nil {
-		return store.Run{}, err
-	}
-	log := logging.ForRun(s.log, run.ID, t.ID, t.Target)
-	log.Info("run starting", "trigger", trigger, "scheduled_at", scheduledAt)
-
-	argv := append([]string{t.Agent.Command}, t.Agent.Args...)
-	_, err := tg.Exec(ctx, argv, nil)
-	run.EndedAt, run.Status = s.clock.Now(), store.StatusDone
-	if err != nil {
-		run.Status, run.ExitReason = store.StatusFailed, err.Error()
-	}
-	if err := s.store.UpdateRun(context.WithoutCancel(ctx), run); err != nil {
-		return run, err
-	}
-	log.Info("run ended", "status", run.Status, "exit_reason", run.ExitReason)
-	return run, nil
 }
 
 // prune deletes ended runs older than history_days, at most once per
