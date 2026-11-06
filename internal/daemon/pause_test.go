@@ -201,6 +201,22 @@ func TestPauseAllLivesInDaemonStateNotTaskFiles(t *testing.T) {
 	}
 }
 
+func TestPauseAllAndResumeAllReachSubscribers(t *testing.T) {
+	p := setupUTC(t)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon)})
+	ch := subscribe(t, p)
+
+	call[api.GlobalPause](t, c, api.MethodPauseAll, api.TargetParams{Target: "local"})
+	next(t, ch, api.EventTaskChanged, 2*time.Second, func(e api.TaskChangedEvent) bool {
+		return e.ID == "nightly" && e.Task != nil && e.Task.State == api.StatePaused
+	})
+
+	call[api.GlobalPause](t, c, api.MethodResumeAll, api.TargetParams{Target: "local"})
+	next(t, ch, api.EventTaskChanged, 2*time.Second, func(e api.TaskChangedEvent) bool {
+		return e.ID == "nightly" && e.Task != nil && e.Task.State == api.StateIdle
+	})
+}
+
 func TestPauseAllSurvivesRestart(t *testing.T) {
 	p := setup(t)
 	ctx, cancel := context.WithCancel(context.Background())

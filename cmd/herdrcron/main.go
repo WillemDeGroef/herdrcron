@@ -23,12 +23,19 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/logread"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
 	"github.com/WillemDeGroef/herdrcron/internal/service"
+	"github.com/WillemDeGroef/herdrcron/internal/tui"
+	untilparse "github.com/WillemDeGroef/herdrcron/internal/until"
+
+	"github.com/charmbracelet/x/term"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
-const usage = `usage: herdrcron <command>
+const usage = `usage: herdrcron [<command>]
+
+Without a command herdrcron opens the TUI (over SSH: ssh -t host herdrcron).
+Quitting it leaves the daemon and every run as they are.
 
 commands:
   daemon            run the daemon in the foreground
@@ -75,14 +82,13 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprint(stderr, usage)
-		return 2
-	}
 	p, err := paths.FromEnv()
 	if err != nil {
 		fmt.Fprintln(stderr, "herdrcron:", err)
 		return 1
+	}
+	if len(args) == 0 {
+		return runTUI(ctx, p, stderr)
 	}
 	switch args[0] {
 	case "daemon":
@@ -120,6 +126,31 @@ func runDaemon(ctx context.Context, p paths.Paths, stderr io.Writer) int {
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "herdrcron daemon:", err)
+		return 1
+	}
+	return 0
+}
+
+// isTerminal reports whether stdin and stdout are a terminal, as the TUI
+// needs; tests swap it.
+var isTerminal = func() bool {
+	return term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd())
+}
+
+// runTUI opens the TUI on the daemon. It needs a terminal and a running
+// daemon; quitting it changes nothing in the daemon.
+func runTUI(ctx context.Context, p paths.Paths, stderr io.Writer) int {
+	if !isTerminal() {
+		fmt.Fprint(stderr, "herdrcron: the TUI needs a terminal; over SSH use `ssh -t host herdrcron`, in scripts use a command\n\n"+usage)
+		return 2
+	}
+	c := dial(p, stderr)
+	if c == nil {
+		return 1
+	}
+	_ = c.Close()
+	if err := tui.Run(ctx, tui.SocketBackend{Path: p.Socket()}); err != nil {
+		fmt.Fprintln(stderr, "herdrcron:", err)
 		return 1
 	}
 	return 0
@@ -431,7 +462,7 @@ func runPause(ctx context.Context, p paths.Paths, args []string, now time.Time, 
 	}
 	params := api.PauseParams{ID: pos[0], Until: api.PauseIndefinite}
 	if set["until"] {
-		params.Until, err = parseUntil(*until, now, time.Local)
+		params.Until, err = untilparse.Parse(*until, now, time.Local)
 		if err != nil {
 			fmt.Fprintln(stderr, "herdrcron pause: --until:", err)
 			return 2
@@ -508,34 +539,6 @@ func formatGlobalPause(gp api.GlobalPause) string {
 		return "paused targets: " + strings.Join(gp.PausedTargets, ", ")
 	}
 	return "no global pause"
-}
-
-// untilLayouts are the zone-less forms --until accepts, read in local time.
-var untilLayouts = []string{"2006-01-02T15:04", "2006-01-02T15:04:05", "2006-01-02 15:04", "2006-01-02"}
-
-// parseUntil turns a --until value into an RFC 3339 time after now. s is
-// RFC 3339 with a zone, or one of untilLayouts read in loc.
-func parseUntil(s string, now time.Time, loc *time.Location) (string, error) {
-	if s == "" {
-		return "", errors.New("empty time")
-	}
-	t, err := time.Parse(time.RFC3339, s)
-	if err != nil {
-		parsed := false
-		for _, layout := range untilLayouts {
-			if lt, lerr := time.ParseInLocation(layout, s, loc); lerr == nil {
-				t, parsed = lt, true
-				break
-			}
-		}
-		if !parsed {
-			return "", fmt.Errorf("cannot read %q as a time; use RFC 3339 (2026-11-10T08:00:00Z) or local 2026-11-10T08:00, \"2026-11-10 08:00\" or 2026-11-10", s)
-		}
-	}
-	if !t.After(now) {
-		return "", fmt.Errorf("%s is in the past", t.Format(time.RFC3339))
-	}
-	return t.Format(time.RFC3339), nil
 }
 
 func runLogs(ctx context.Context, p paths.Paths, args []string, stdout, stderr io.Writer) int {

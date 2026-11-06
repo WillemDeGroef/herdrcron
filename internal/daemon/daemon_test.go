@@ -169,10 +169,10 @@ func TestTasksListShowsDisplayStates(t *testing.T) {
 	for _, s := range res.Tasks {
 		byID[s.ID] = s
 	}
-	if got := byID["nightly"]; got.State != api.StateIdle || got.Target != "local" || got.Schedule != "@daily" || got.Name != "Nightly deps" {
+	if got := byID["nightly"]; got.State != api.StateIdle || got.Target != "local" || got.Schedule != "@daily" || got.Name != "Nightly deps" || !got.Enabled {
 		t.Errorf("nightly = %+v", got)
 	}
-	if got := byID["parked"]; got.State != api.StateOff || got.Target != "vps" {
+	if got := byID["parked"]; got.State != api.StateOff || got.Target != "vps" || got.Enabled {
 		t.Errorf("parked = %+v", got)
 	}
 	if got := byID["broken"]; got.State != api.StateInvalid || !strings.Contains(got.Error, `unknown target "mars"`) {
