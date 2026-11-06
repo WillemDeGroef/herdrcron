@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -65,25 +66,37 @@ timeout: 1h
 func start(t *testing.T, p paths.Paths) *api.Client {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	errc := make(chan error, 1)
-	go func() { errc <- daemon.Run(ctx, p, daemon.Options{Version: "test"}) }()
+	// runErr is stored before done is closed. Cleanup and the early-exit
+	// path both wait on done, so a failed start cannot leave Cleanup
+	// blocked on a second receive.
+	done := make(chan struct{})
+	var runErr error
+	go func() {
+		runErr = daemon.Run(ctx, p, daemon.Options{Version: "test"})
+		close(done)
+	}()
 	t.Cleanup(func() {
 		cancel()
-		if err := <-errc; err != nil {
-			t.Errorf("daemon.Run: %v", err)
+		select {
+		case <-done:
+			if runErr != nil {
+				t.Errorf("daemon.Run: %v", runErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not stop")
 		}
 	})
 	deadline := time.Now().Add(5 * time.Second)
 	for {
+		select {
+		case <-done:
+			t.Fatalf("daemon exited early: %v", runErr)
+		default:
+		}
 		c, err := api.Dial(p.Socket())
 		if err == nil {
 			t.Cleanup(func() { _ = c.Close() })
 			return c
-		}
-		select {
-		case err := <-errc:
-			t.Fatalf("daemon exited early: %v", err)
-		default:
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("daemon did not start: %v", err)
@@ -203,6 +216,26 @@ func TestSocketRemovedOnShutdown(t *testing.T) {
 	}
 	if _, err := os.Stat(p.Socket()); !os.IsNotExist(err) {
 		t.Fatalf("socket still present after shutdown: %v", err)
+	}
+}
+
+func TestStartFailsFastWhenConfigIsInvalid(t *testing.T) {
+	if os.Getenv("HERDRCRON_START_EARLY") == "1" {
+		p := setup(t)
+		write(t, p.ConfigFile(), "timezone: Mars/Olympus\n")
+		start(t, p)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestStartFailsFastWhenConfigIsInvalid$", "-test.count=1")
+	cmd.Env = append(os.Environ(), "HERDRCRON_START_EARLY=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("child passed, want a fast failure:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("daemon exited early")) {
+		t.Fatalf("child did not fail fast:\n%s", out)
 	}
 }
 
