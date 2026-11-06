@@ -57,3 +57,6 @@ func (p Paths) Socket() string { return filepath.Join(p.StateDir, "daemon.sock")
 
 // Log is the daemon's JSON log file.
 func (p Paths) Log() string { return filepath.Join(p.StateDir, "daemon.log") }
+
+// DB is the daemon's SQLite state database.
+func (p Paths) DB() string { return filepath.Join(p.StateDir, "herdrcron.db") }

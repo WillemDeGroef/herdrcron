@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/robfig/cron/v3"
+	"github.com/WillemDeGroef/herdrcron/internal/schedule"
 	"gopkg.in/yaml.v3"
 )
 
@@ -189,29 +189,11 @@ func Validate(t Task, fileID, configDir string, cfg Config) error {
 	return &ValidationError{Problems: p}
 }
 
-// minEvery is the shortest @every interval: a run is a whole agent session.
-const minEvery = time.Minute
-
 // checkSchedule accepts a 5-field cron expression or a descriptor (@every
-// <duration>, @daily, @hourly, ...). The time zone comes from the task's
-// timezone field, so a CRON_TZ= prefix is refused.
+// <duration>, @daily, @hourly, ...); see package schedule.
 func checkSchedule(s string) error {
-	if strings.HasPrefix(s, "CRON_TZ=") || strings.HasPrefix(s, "TZ=") {
-		return errors.New("set the time zone with the timezone field, not a CRON_TZ= prefix")
-	}
-	if _, err := cron.ParseStandard(s); err != nil {
-		return err
-	}
-	if rest, ok := strings.CutPrefix(s, "@every "); ok {
-		d, err := time.ParseDuration(strings.TrimSpace(rest))
-		if err != nil {
-			return err
-		}
-		if d < minEvery {
-			return fmt.Errorf("@every interval must be at least %v", minEvery)
-		}
-	}
-	return nil
+	_, err := schedule.Parse(s, time.UTC)
+	return err
 }
 
 // PromptPath resolves a task's prompt_file: relative paths are relative to

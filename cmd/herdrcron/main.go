@@ -24,7 +24,7 @@ const usage = `usage: herdrcron <command>
 
 commands:
   daemon   run the daemon in the foreground
-  list     list tasks with target, schedule and state
+  list     list tasks with target, schedule, state, last run and next fire
 `
 
 func main() {
@@ -93,20 +93,59 @@ func runList(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "no tasks in %s\n", p.TasksDir())
 		return 0
 	}
-	w := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tTARGET\tSCHEDULE\tSTATE")
-	for _, t := range res.Tasks {
-		state := t.State
-		if t.Error != "" {
-			state += ": " + t.Error
-		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", t.ID, orDash(t.Target), orDash(t.Schedule), state)
-	}
-	if err := w.Flush(); err != nil {
+	if err := printTasks(stdout, res.Tasks, time.Now(), time.Local); err != nil {
 		fmt.Fprintln(stderr, "herdrcron:", err)
 		return 1
 	}
 	return 0
+}
+
+// printTasks writes the task table. LAST is the last run's status and age
+// at now; NEXT is the next fire time in loc. An invalid task's error goes
+// after the last column.
+func printTasks(out io.Writer, tasks []api.TaskSummary, now time.Time, loc *time.Location) error {
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tTARGET\tSCHEDULE\tSTATE\tLAST\tNEXT")
+	for _, t := range tasks {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s", t.ID, orDash(t.Target), orDash(t.Schedule), t.State,
+			lastRun(t.LastRun, now), nextFire(t.NextFireAt, loc))
+		if t.Error != "" {
+			fmt.Fprintf(w, "\t%s", t.Error)
+		}
+		fmt.Fprintln(w)
+	}
+	return w.Flush()
+}
+
+func lastRun(r *api.RunSummary, now time.Time) string {
+	if r == nil {
+		return "-"
+	}
+	started, err := time.Parse(time.RFC3339, r.StartedAt)
+	if err != nil {
+		return r.Status
+	}
+	return r.Status + " " + ago(now.Sub(started))
+}
+
+func ago(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d/time.Minute))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d/time.Hour))
+	}
+	return fmt.Sprintf("%dd ago", int(d/(24*time.Hour)))
+}
+
+func nextFire(s string, loc *time.Location) string {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return "-"
+	}
+	return t.In(loc).Format("Mon 02 Jan 15:04")
 }
 
 func orDash(s string) string {

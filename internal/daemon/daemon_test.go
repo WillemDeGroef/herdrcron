@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/api"
+	"github.com/WillemDeGroef/herdrcron/internal/clock"
 	"github.com/WillemDeGroef/herdrcron/internal/daemon"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
 )
@@ -65,6 +66,11 @@ timeout: 1h
 // start runs the daemon until the test ends and returns a connected client.
 func start(t *testing.T, p paths.Paths) *api.Client {
 	t.Helper()
+	return startWith(t, p, daemon.Options{Version: "test"})
+}
+
+func startWith(t *testing.T, p paths.Paths, opts daemon.Options) *api.Client {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	// runErr is stored before done is closed. Cleanup and the early-exit
 	// path both wait on done, so a failed start cannot leave Cleanup
@@ -72,7 +78,7 @@ func start(t *testing.T, p paths.Paths) *api.Client {
 	done := make(chan struct{})
 	var runErr error
 	go func() {
-		runErr = daemon.Run(ctx, p, daemon.Options{Version: "test"})
+		runErr = daemon.Run(ctx, p, opts)
 		close(done)
 	}()
 	t.Cleanup(func() {
@@ -244,5 +250,59 @@ func TestBadConfigFailsStartup(t *testing.T) {
 	write(t, p.ConfigFile(), "timezone: Mars/Olympus\n")
 	if err := daemon.Run(context.Background(), p, daemon.Options{}); err == nil {
 		t.Fatal("want error for invalid config.yaml")
+	}
+}
+
+func listByID(t *testing.T, c *api.Client) map[string]api.TaskSummary {
+	t.Helper()
+	var res api.TasksListResult
+	if err := c.Call(context.Background(), api.MethodTasksList, nil, &res); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]api.TaskSummary{}
+	for _, s := range res.Tasks {
+		byID[s.ID] = s
+	}
+	return byID
+}
+
+func TestScheduledFireShowsAsLastRunAndMovesNext(t *testing.T) {
+	p := setup(t)
+	write(t, p.ConfigFile(), "timezone: Europe/Brussels\ntargets:\n  vps:\n    host: vps\n")
+	clk := clock.NewFake(time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clk})
+
+	byID := listByID(t, c)
+	// @daily in Brussels: midnight CET is 23:00 UTC.
+	if got := byID["nightly"]; got.NextFireAt != "2026-11-06T23:00:00Z" || got.LastRun != nil {
+		t.Errorf("nightly before the fire = %+v, want next 2026-11-06T23:00:00Z and no last run", got)
+	}
+	for _, id := range []string{"parked", "broken"} {
+		if got := byID[id]; got.NextFireAt != "" {
+			t.Errorf("%s next_fire_at = %q, want none", id, got.NextFireAt)
+		}
+	}
+
+	clk.Set(time.Date(2026, 11, 6, 23, 0, 1, 0, time.UTC))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := listByID(t, c)["nightly"]
+		if got.LastRun != nil {
+			if got.LastRun.Status != "done" || got.LastRun.Trigger != "schedule" ||
+				got.LastRun.ScheduledAt != "2026-11-06T23:00:00Z" || len(got.LastRun.ID) != 26 {
+				t.Errorf("last run = %+v", got.LastRun)
+			}
+			if got.NextFireAt != "2026-11-07T23:00:00Z" {
+				t.Errorf("next_fire_at after the fire = %q, want 2026-11-07T23:00:00Z", got.NextFireAt)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no run recorded after the fire time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(p.StateDir, "herdrcron.db")); err != nil {
+		t.Errorf("state database: %v", err)
 	}
 }
