@@ -13,6 +13,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -40,6 +41,16 @@ commands:
 
 // serviceRunner runs systemctl/launchctl for install-service; tests swap it.
 var serviceRunner service.Runner = service.ExecRunner
+
+// executable returns the resolved path of the running binary for
+// install-service; tests swap it (the test binary lives in a temp dir).
+var executable = func() (string, error) {
+	bin, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(bin)
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -158,13 +169,35 @@ func runLogs(ctx context.Context, p paths.Paths, args []string, stdout, stderr i
 	return 0
 }
 
-func runInstallService(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
-	bin, err := os.Executable()
-	if err == nil {
-		bin, err = filepath.EvalSymlinks(bin)
+// inTempDir reports whether path lies under os.TempDir (as given or with
+// symlinks resolved, e.g. /var -> /private/var on macOS).
+func inTempDir(path string) bool {
+	dirs := []string{os.TempDir()}
+	if d, err := filepath.EvalSymlinks(os.TempDir()); err == nil {
+		dirs = append(dirs, d)
 	}
+	for _, d := range dirs {
+		if rel, err := filepath.Rel(d, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func runInstallService(ctx context.Context, p paths.Paths, stdout, stderr io.Writer) int {
+	bin, err := executable()
 	if err != nil {
 		fmt.Fprintln(stderr, "herdrcron: cannot find own executable:", err)
+		return 1
+	}
+	if inTempDir(bin) {
+		fmt.Fprintf(stderr, "herdrcron install-service: %s is in a temporary directory (built by `go run`?); "+
+			"install the binary first (e.g. `go install`) and run install-service from the installed copy\n", bin)
+		return 1
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintln(stderr, "herdrcron install-service: cannot determine home directory:", err)
 		return 1
 	}
 	username := os.Getenv("USER")
@@ -174,7 +207,7 @@ func runInstallService(ctx context.Context, p paths.Paths, stdout, stderr io.Wri
 	_, err = service.Install(ctx, service.Options{
 		GOOS:   runtime.GOOS,
 		Binary: bin,
-		Home:   os.Getenv("HOME"),
+		Home:   home,
 		Getenv: os.Getenv,
 		Paths:  p,
 		UID:    os.Getuid(),

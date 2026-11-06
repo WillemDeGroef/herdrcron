@@ -243,3 +243,19 @@ func TestForRunAddsRunAttributes(t *testing.T) {
 		t.Fatal("attribute keys do not match the spec")
 	}
 }
+
+func TestFailedRotationKeepsLogging(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	// A non-empty directory at path.1 cannot be removed, so rotation fails.
+	if err := os.MkdirAll(filepath.Join(path+".1", "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f := openSize(t, path, 10, 2)
+	write(t, f, "aaaa\n")
+	write(t, f, "bbbb\n")
+	write(t, f, "cccc\n") // would rotate; rotation fails
+	write(t, f, "dddd\n")
+	if got := read(t, path); got != "aaaa\nbbbb\ncccc\ndddd\n" {
+		t.Fatalf("daemon.log = %q", got)
+	}
+}

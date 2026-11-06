@@ -111,8 +111,7 @@ func systemdUnit(o Options) string {
 	var b strings.Builder
 	b.WriteString("[Unit]\n")
 	b.WriteString("Description=herdrcron daemon\n")
-	b.WriteString("After=network-online.target\n")
-	b.WriteString("Wants=network-online.target\n\n")
+	b.WriteString("\n")
 	b.WriteString("[Service]\n")
 	b.WriteString("Type=simple\n")
 	fmt.Fprintf(&b, "ExecStart=%s daemon\n", systemdExecArg(o.Binary))
@@ -162,7 +161,11 @@ func installSystemd(ctx context.Context, o Options) (string, error) {
 		}
 	}
 	fmt.Fprintf(o.Out, "Enabled and started %s.\n", unitName)
-	fmt.Fprintf(o.Out, "The service stops when you log out unless lingering is enabled:\n  loginctl enable-linger %s\n", o.User)
+	user := o.User
+	if user == "" {
+		user = "$USER"
+	}
+	fmt.Fprintf(o.Out, "The service stops when you log out unless lingering is enabled:\n  loginctl enable-linger %s\n", user)
 	return unit, nil
 }
 
@@ -202,7 +205,9 @@ func launchdPlist(o Options) string {
 }
 
 // installLaunchd writes the agent plist and reloads it: bootout (whose error
-// is ignored, as the agent may not be loaded yet) then bootstrap.
+// is ignored, as the agent may not be loaded yet), enable (so a label that
+// was disabled earlier, e.g. with `launchctl disable`, starts), then
+// bootstrap.
 func installLaunchd(ctx context.Context, o Options) (string, error) {
 	if err := os.MkdirAll(o.Paths.StateDir, 0o755); err != nil {
 		return "", fmt.Errorf("creating state directory: %w", err)
@@ -213,7 +218,11 @@ func installLaunchd(ctx context.Context, o Options) (string, error) {
 	}
 	fmt.Fprintf(o.Out, "Wrote %s\n", plist)
 	domain := fmt.Sprintf("gui/%d", o.UID)
-	_ = o.Run(ctx, "launchctl", "bootout", domain+"/"+launchLabel)
+	target := domain + "/" + launchLabel
+	_ = o.Run(ctx, "launchctl", "bootout", target)
+	if err := o.Run(ctx, "launchctl", "enable", target); err != nil {
+		return plist, fmt.Errorf("launchctl enable: %w", err)
+	}
 	if err := o.Run(ctx, "launchctl", "bootstrap", domain, plist); err != nil {
 		return plist, fmt.Errorf("launchctl bootstrap: %w", err)
 	}

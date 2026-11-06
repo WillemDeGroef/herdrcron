@@ -182,6 +182,9 @@ func TestInstallServiceRunsServiceManager(t *testing.T) {
 		return nil
 	}
 	t.Cleanup(func() { serviceRunner = orig })
+	// The test binary lives under the temp dir, which install-service
+	// refuses; pretend it was installed.
+	fakeExecutable(t, "/usr/local/bin/herdrcron")
 
 	var out, errOut bytes.Buffer
 	code := run(context.Background(), []string{"install-service"}, &out, &errOut)
@@ -197,5 +200,35 @@ func TestInstallServiceRunsServiceManager(t *testing.T) {
 		if code != 1 {
 			t.Fatalf("exit %d, want 1 on %s", code, runtime.GOOS)
 		}
+	}
+}
+
+func fakeExecutable(t *testing.T, path string) {
+	t.Helper()
+	orig := executable
+	executable = func() (string, error) { return path, nil }
+	t.Cleanup(func() { executable = orig })
+}
+
+func TestInstallServiceRefusesTempDirBinary(t *testing.T) {
+	xdg(t)
+	called := false
+	orig := serviceRunner
+	serviceRunner = func(context.Context, string, ...string) error {
+		called = true
+		return nil
+	}
+	t.Cleanup(func() { serviceRunner = orig })
+	fakeExecutable(t, filepath.Join(os.TempDir(), "go-build123", "b001", "exe", "herdrcron"))
+
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"install-service"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if !strings.Contains(errOut.String(), "temporary directory") {
+		t.Errorf("stderr lacks the temp-dir explanation: %q", errOut.String())
+	}
+	if called {
+		t.Error("service manager was run for a temp-dir binary")
 	}
 }

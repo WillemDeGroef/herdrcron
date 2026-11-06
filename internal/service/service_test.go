@@ -109,8 +109,6 @@ func TestLinuxUnitContent(t *testing.T) {
 	for _, line := range []string{
 		"[Unit]",
 		"Description=herdrcron daemon",
-		"After=network-online.target",
-		"Wants=network-online.target",
 		"[Service]",
 		"Type=simple",
 		"ExecStart=/usr/local/bin/herdrcron daemon",
@@ -221,6 +219,38 @@ func TestLinuxPrintsUnitPathAndLingerHint(t *testing.T) {
 		if !strings.Contains(out.String(), s) {
 			t.Errorf("output lacks %q:\n%s", s, out.String())
 		}
+	}
+}
+
+func TestLinuxUnitHasNoNetworkOnlineTarget(t *testing.T) {
+	o, _, _ := linuxOpts(t, nil)
+	unit, err := service.Install(context.Background(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// network-online.target is a system unit, invisible to user managers.
+	if got := readFile(t, unit); strings.Contains(got, "network-online") {
+		t.Errorf("unit references network-online.target:\n%s", got)
+	}
+}
+
+func TestLinuxLingerHintWithoutUserName(t *testing.T) {
+	o, _, out := linuxOpts(t, nil)
+	o.User = ""
+	if _, err := service.Install(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "loginctl enable-linger $USER\n") {
+		t.Errorf("output lacks $USER linger hint:\n%s", out.String())
+	}
+}
+
+func TestDarwinEnableFailureIsReturned(t *testing.T) {
+	o, fr, _ := darwinOpts(t, nil)
+	boom := errors.New("boom")
+	fr.fail = map[string]error{"launchctl enable gui/501/io.github.willemdegroef.herdrcron": boom}
+	if _, err := service.Install(context.Background(), o); !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want wrapping %v", err, boom)
 	}
 }
 
@@ -344,6 +374,7 @@ func TestDarwinRunsLaunchctlAndIgnoresBootoutError(t *testing.T) {
 	}
 	want := []string{
 		"launchctl bootout gui/501/io.github.willemdegroef.herdrcron",
+		"launchctl enable gui/501/io.github.willemdegroef.herdrcron",
 		"launchctl bootstrap gui/501 " + plist,
 	}
 	if got := fr.commands(); !reflect.DeepEqual(got, want) {

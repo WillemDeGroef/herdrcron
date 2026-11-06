@@ -32,16 +32,13 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/logging"
 )
 
-// rotatedFiles is how many rotated files (<log>.1 newest … <log>.4 oldest)
-// sit next to the live log, as written by logging.RotatingFile.
-const rotatedFiles = logging.Keep - 1
-
 // DefaultPollInterval is used when Options.PollInterval is zero.
 const DefaultPollInterval = 250 * time.Millisecond
 
 // Options controls Print.
 type Options struct {
-	// TaskID, when set, keeps only records whose top-level task_id equals
+	// TaskID, when set, keeps only records whose top-level task_id
+	// (logging.KeyTaskID) equals
 	// it. Non-JSON lines are dropped when filtering.
 	TaskID string
 	// Follow keeps tailing the live log after the existing content is
@@ -56,6 +53,10 @@ type Options struct {
 // Without Follow it returns an error wrapping fs.ErrNotExist if none of the
 // files exist. With Follow it then tails the live file, surviving rotation
 // and truncation, and returns nil once ctx is done.
+//
+// The existing files are listed once up front, so a rotation that lands while
+// they are being printed can skip lines; at the 10 MB rotation size
+// this is rare.
 func Print(ctx context.Context, logPath string, w io.Writer, opts Options) error {
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = DefaultPollInterval
@@ -70,19 +71,18 @@ func Print(ctx context.Context, logPath string, w io.Writer, opts Options) error
 	}
 
 	found := false
-	for i := rotatedFiles; i >= 1; i-- {
-		ok, err := printFile(fmt.Sprintf("%s.%d", logPath, i), emit)
+	for _, path := range logging.Files(logPath) {
+		if opts.Follow && path == logPath {
+			break // the tailer prints the live file
+		}
+		ok, err := printFile(path, emit)
 		if err != nil {
 			return err
 		}
 		found = found || ok
 	}
 	if !opts.Follow {
-		ok, err := printFile(logPath, emit)
-		if err != nil {
-			return err
-		}
-		if !found && !ok {
+		if !found {
 			return fmt.Errorf("no log yet at %s: %w", logPath, fs.ErrNotExist)
 		}
 		return nil
@@ -261,7 +261,7 @@ func formatLine(line []byte, taskID string) (string, bool) {
 	if taskID != "" {
 		match := false
 		for _, a := range attrs {
-			if a.key == "task_id" {
+			if a.key == logging.KeyTaskID {
 				s, ok := jsonString(a.val)
 				match = ok && s == taskID
 				break

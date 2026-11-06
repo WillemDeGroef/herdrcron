@@ -3,6 +3,7 @@
 package logging
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -59,6 +60,11 @@ func (r *RotatingFile) open() error {
 
 // Write appends p, rotating first if p would push a non-empty file past the
 // size limit. A write larger than the limit goes whole into a fresh file.
+//
+// If rotation fails, the live file is reopened and p is appended to it anyway
+// (so it may grow past the limit); the rotation error is dropped so logging
+// keeps working, and rotation is retried on the next write. Write fails only
+// if the live file cannot be reopened.
 func (r *RotatingFile) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -66,8 +72,10 @@ func (r *RotatingFile) Write(p []byte) (int, error) {
 		return 0, os.ErrClosed
 	}
 	if r.size > 0 && r.size+int64(len(p)) > r.maxBytes {
-		if err := r.rotate(); err != nil {
-			return 0, err
+		if err := r.rotate(); err != nil && r.f == nil {
+			if oerr := r.open(); oerr != nil {
+				return 0, errors.Join(err, oerr)
+			}
 		}
 	}
 	n, err := r.f.Write(p)
@@ -75,6 +83,8 @@ func (r *RotatingFile) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// rotate shifts the files and opens a fresh live file. On error r.f may be
+// nil; Write then reopens the live path.
 func (r *RotatingFile) rotate() error {
 	if err := r.f.Close(); err != nil {
 		return fmt.Errorf("close log: %w", err)
