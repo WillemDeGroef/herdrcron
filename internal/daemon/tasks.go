@@ -96,9 +96,11 @@ func (d *daemon) detailLocked(ctx context.Context, e config.TaskEntry) (api.Task
 		t.ID = e.ID
 	}
 	det := api.TaskDetail{Summary: s, Task: taskDef(t), Version: d.versions[e.ID], Runs: []api.RunSummary{}}
-	if prompt, err := os.ReadFile(d.promptPathOf(e)); err == nil {
-		det.Prompt = string(prompt)
+	prompt, err := os.ReadFile(d.promptPathOf(e))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return api.TaskDetail{}, fmt.Errorf("read prompt of %s: %w", e.ID, err)
 	}
+	det.Prompt = string(prompt)
 	runs, err := d.store.ListRuns(ctx, e.ID, api.TaskRunsLimit)
 	if err != nil {
 		return api.TaskDetail{}, fmt.Errorf("runs of %s: %w", e.ID, err)
@@ -147,7 +149,7 @@ func (d *daemon) draft(def api.TaskDef) (config.Task, fieldErrors) {
 	} else if err != nil {
 		fe.add("task", err.Error())
 	}
-	if t.PromptFile != "" && !d.inConfigDir(config.PromptPath(t.PromptFile, d.configDir)) {
+	if t.PromptFile != "" && !d.promptInside(config.PromptPath(t.PromptFile, d.configDir)) {
 		fe.add("prompt_file", "prompt_file must be inside the config directory")
 	}
 	return t, fe
@@ -171,13 +173,16 @@ func (d *daemon) tasksCreate(ctx context.Context, params json.RawMessage) (any, 
 		return nil, err
 	}
 	promptPath := config.PromptPath(t.PromptFile, d.configDir)
+	if !d.promptInside(promptPath) {
+		return nil, fmt.Errorf("write prompt file: prompt_file must be inside the config directory")
+	}
 	_, statErr := os.Stat(promptPath)
 	newPrompt := errors.Is(statErr, fs.ErrNotExist)
 	// The prompt first: a task file that appears without it is invalid.
-	if err := config.WritePrompt(promptPath, p.Prompt); err != nil && !errors.Is(err, config.ErrReplaced) {
+	if err := d.noteWrite("prompt file", t.ID, config.WritePrompt(promptPath, p.Prompt)); err != nil {
 		return nil, fmt.Errorf("write prompt file: %w", err)
 	}
-	if err := config.WriteTask(path, t, true); err != nil && !errors.Is(err, config.ErrReplaced) {
+	if err := d.noteWrite("task file", t.ID, config.WriteTask(path, t, true)); err != nil {
 		if newPrompt {
 			_ = os.Remove(promptPath)
 		}
@@ -221,10 +226,14 @@ func (d *daemon) tasksUpdate(ctx context.Context, params json.RawMessage) (any, 
 	if err := fe.err(); err != nil {
 		return nil, err
 	}
-	if err := config.WritePrompt(config.PromptPath(t.PromptFile, d.configDir), p.Prompt); err != nil && !errors.Is(err, config.ErrReplaced) {
+	promptPath := config.PromptPath(t.PromptFile, d.configDir)
+	if !d.promptInside(promptPath) {
+		return nil, fmt.Errorf("write prompt file: prompt_file must be inside the config directory")
+	}
+	if err := d.noteWrite("prompt file", p.ID, config.WritePrompt(promptPath, p.Prompt)); err != nil {
 		return nil, fmt.Errorf("write prompt file: %w", err)
 	}
-	if err := config.WriteTask(old.File, t, false); err != nil && !errors.Is(err, config.ErrReplaced) {
+	if err := d.noteWrite("task file", p.ID, config.WriteTask(old.File, t, false)); err != nil {
 		return nil, fmt.Errorf("write task file: %w", err)
 	}
 	e := config.LoadTask(d.configDir, p.ID, d.cfg)
@@ -345,10 +354,85 @@ func (d *daemon) insertLocked(e config.TaskEntry) {
 func (d *daemon) taskPath(id string) string { return filepath.Join(d.tasksDir(), id+".yaml") }
 
 // inConfigDir reports whether path is inside the config directory. The
-// API only writes and removes prompt files there.
+// API only removes prompt files there. path is lexical: os.Remove does
+// not follow a symlink's target, so a link inside the directory is removed
+// and a path that climbs out is not.
 func (d *daemon) inConfigDir(path string) bool {
-	rel, err := filepath.Rel(d.configDir, path)
+	return withinDir(d.configDir, path)
+}
+
+// promptInside reports whether a prompt path stays inside the config
+// directory after symlinks are followed. A missing file is judged from
+// its nearest existing ancestor, so a symlinked directory cannot place a
+// new file outside. Writes use this; a link whose target is outside is
+// refused rather than followed.
+func (d *daemon) promptInside(path string) bool {
+	resolved, err := resolvePath(path)
+	if err != nil {
+		return false
+	}
+	root, err := filepath.EvalSymlinks(d.configDir)
+	if err != nil {
+		root = d.configDir
+	}
+	return withinDir(root, resolved)
+}
+
+// withinDir reports whether path is path-wise inside dir.
+func withinDir(dir, path string) bool {
+	rel, err := filepath.Rel(dir, path)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// resolvePath is path with symlinks followed. When the last component does
+// not exist yet, the existing ancestor is resolved and the missing suffix
+// is joined back on.
+func resolvePath(path string) (string, error) {
+	path = filepath.Clean(path)
+	if _, err := os.Lstat(path); err == nil {
+		return filepath.EvalSymlinks(path)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+	var missing []string
+	cur := path
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", fs.ErrNotExist
+		}
+		missing = append(missing, filepath.Base(cur))
+		_, err := os.Lstat(parent)
+		if errors.Is(err, fs.ErrNotExist) {
+			cur = parent
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		resolved, err := filepath.EvalSymlinks(parent)
+		if err != nil {
+			return "", err
+		}
+		for i := len(missing) - 1; i >= 0; i-- {
+			resolved = filepath.Join(resolved, missing[i])
+		}
+		return resolved, nil
+	}
+}
+
+// noteWrite treats a directory-sync failure after a successful replace as
+// success: the new bytes are already at the path. The failure is logged,
+// as it is for pause and enable. Any other error is returned.
+func (d *daemon) noteWrite(what, id string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, config.ErrReplaced) {
+		d.log.Error(what+" replaced but directory sync failed", logging.KeyTaskID, id, "err", err)
+		return nil
+	}
+	return err
 }
 
 // stopRunsOf stops every live run of the task, in parallel, and returns
@@ -407,14 +491,14 @@ func (d *daemon) stopRunsOf(ctx context.Context, id string) ([]store.Run, error)
 	return stopped, nil
 }
 
-// reload serves "reload": it re-reads config.yaml and every task file.
-// Tasks are validated against the config the daemon runs with; a changed
-// config.yaml is reported, and applies after a restart.
+// reload serves "reload": it re-reads every task file, and config.yaml.
+// Tasks are validated against the config the daemon runs with. A changed
+// config.yaml is not applied (the scheduler, dispatcher and runner hold
+// the config they started with); the result says restart_required. A
+// config.yaml that does not parse still lets the task files reload, and
+// the call then fails with that error.
 func (d *daemon) reload(ctx context.Context, _ json.RawMessage) (any, error) {
-	cfg, err := config.Load(d.configFile)
-	if err != nil {
-		return nil, &api.Error{Code: api.CodeInternalError, Message: "config.yaml: " + err.Error()}
-	}
+	cfg, cfgErr := config.Load(d.configFile)
 	entries, err := config.LoadTasks(d.configDir, d.cfg)
 	if err != nil {
 		return nil, err
@@ -427,7 +511,10 @@ func (d *daemon) reload(ctx context.Context, _ json.RawMessage) (any, error) {
 	}
 	d.tasks = entries
 	d.rescheduleLocked(ctx)
-	res := api.ReloadResult{Tasks: make([]api.TaskSummary, 0, len(entries)), RestartRequired: !reflect.DeepEqual(cfg, d.cfg)}
+	res := api.ReloadResult{Tasks: make([]api.TaskSummary, 0, len(entries))}
+	if cfgErr == nil {
+		res.RestartRequired = !reflect.DeepEqual(cfg, d.cfg)
+	}
 	for i, e := range entries {
 		v := d.fileVersion(e)
 		d.versions[e.ID] = v
@@ -447,6 +534,10 @@ func (d *daemon) reload(ctx context.Context, _ json.RawMessage) (any, error) {
 		d.publishDeleted(id)
 	}
 	d.log.Info("reloaded", "tasks", len(entries), "restart_required", res.RestartRequired)
+	if cfgErr != nil {
+		d.log.Error("config.yaml not applied", "err", cfgErr)
+		return nil, &api.Error{Code: api.CodeInternalError, Message: "config.yaml: " + cfgErr.Error()}
+	}
 	return res, nil
 }
 

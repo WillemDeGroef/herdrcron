@@ -328,9 +328,10 @@ func (d *daemon) summary(ctx context.Context, e config.TaskEntry) (api.TaskSumma
 	default:
 		s.State = api.StateIdle
 	}
-	// An active run shows over every state but invalid: a disabled or
-	// paused task can still have a manual run going.
-	if live := d.liveState(e.ID); live != "" {
+	// An active run shows over off, paused and idle: a disabled or paused
+	// task can still have a manual run going. Invalid stays invalid, so
+	// the error text remains the display state; the run itself is unchanged.
+	if live := d.liveState(e.ID); live != "" && s.State != api.StateInvalid {
 		s.State = live
 	}
 	if next, ok := d.sched.NextFire(e.ID); ok {

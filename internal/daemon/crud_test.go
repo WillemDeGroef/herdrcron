@@ -506,3 +506,96 @@ func TestTasksCreateRefusesAPromptFileOutsideTheConfigDirectory(t *testing.T) {
 		t.Errorf("file outside the config directory written: %v", err)
 	}
 }
+
+func TestTasksCreateRefusesAPromptSymlinkThatLeavesTheConfigDirectory(t *testing.T) {
+	p := setupUTC(t)
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "victim.md")
+	write(t, outsideFile, "keep")
+	link := filepath.Join(p.ConfigDir, "prompts", "linked.md")
+	if err := os.Symlink(outsideFile, link); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(p.ConfigDir, "prompts", "alias")
+	if err := os.Symlink(outsideDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	for _, pf := range []string{"prompts/linked.md", "prompts/alias/fresh.md"} {
+		def := newTaskDef()
+		def.PromptFile = pf
+		err := c.Call(context.Background(), api.MethodTasksCreate, api.TaskWriteParams{Task: def, Prompt: "pwned"}, nil)
+		if f := fieldErrors(t, rpcErr(t, err, api.CodeValidation)); len(f["prompt_file"]) == 0 {
+			t.Errorf("prompt_file %q: field errors = %v", pf, f)
+		}
+	}
+	if got := readFile(t, outsideFile); got != "keep" {
+		t.Errorf("symlink target = %q, want it untouched", got)
+	}
+	if _, err := os.Stat(filepath.Join(outsideDir, "fresh.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("file written through a symlinked directory: %v", err)
+	}
+}
+
+func TestTasksGetReportsAnUnreadablePrompt(t *testing.T) {
+	p := setupUTC(t)
+	path := filepath.Join(p.ConfigDir, "prompts", "nightly.md")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	err := c.Call(context.Background(), api.MethodTasksGet, api.TaskIDParams{ID: "nightly"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "read prompt") {
+		t.Fatalf("err = %v, want a prompt read error", err)
+	}
+}
+
+func TestInvalidTaskStaysInvalidWhileARunIsActive(t *testing.T) {
+	l := newLifecycle(t, noon, "timeout: 1h\n")
+	l.start()
+	run := l.mustRunNow()
+	write(t, filepath.Join(l.p.TasksDir(), "job.yaml"), "id: job\ntarget: mars\n")
+	res := call[api.ReloadResult](t, l.c, api.MethodReload, nil)
+	var got api.TaskSummary
+	for _, s := range res.Tasks {
+		if s.ID == "job" {
+			got = s
+		}
+	}
+	if got.State != api.StateInvalid || !strings.Contains(got.Error, "mars") {
+		t.Errorf("reload = %+v, want invalid with the target error", got)
+	}
+	if listed := listByID(t, l.c)["job"]; listed.State != api.StateInvalid || listed.Error == "" {
+		t.Errorf("list = %+v, want invalid with an error", listed)
+	}
+	if still := l.run(run.ID); still.Status != "running" || still.EndedAt != "" {
+		t.Errorf("active run = %+v, want it still running", still)
+	}
+}
+
+func TestReloadRereadsTasksWhenConfigYAMLDoesNotParse(t *testing.T) {
+	p := setupUTC(t)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	write(t, filepath.Join(p.TasksDir(), "broken.yaml"), strings.Replace(taskFile(t, p, "broken"), "mars", "local", 1))
+	write(t, filepath.Join(p.ConfigDir, "prompts", "broken.md"), "x")
+	write(t, p.ConfigFile(), "timezone: [\n")
+	err := c.Call(context.Background(), api.MethodReload, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "config.yaml") {
+		t.Fatalf("err = %v, want a config.yaml error", err)
+	}
+	if got := listByID(t, c)["broken"]; got.State != api.StateIdle {
+		t.Errorf("broken = %+v, want the task file applied despite the config error", got)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}

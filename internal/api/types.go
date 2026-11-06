@@ -97,7 +97,7 @@ const (
 	StateOff     = "off"     // enabled: false
 	StatePaused  = "paused"  // paused_until is indefinite or in the future, or a global pause covers the task
 	StateIdle    = "idle"    // valid, enabled, not paused, no active run
-	StateRunning = "running" // a run of the task is active (starting or running); wins over the states above
+	StateRunning = "running" // a run of the task is active (starting or running); wins over off, paused and idle. Invalid stays invalid.
 	StateBlocked = "blocked" // an active run waits for the user; wins over running
 )
 
@@ -275,6 +275,8 @@ type ReloadResult struct {
 	// RestartRequired is set when config.yaml differs from the config the
 	// daemon runs with. Tasks are always validated against the running
 	// config; a changed config.yaml takes effect after a daemon restart.
+	// A config.yaml that does not parse fails the call after the task
+	// files have been re-read.
 	RestartRequired bool `json:"restart_required,omitempty"`
 }
 
