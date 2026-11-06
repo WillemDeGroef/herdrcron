@@ -21,7 +21,7 @@ func rotateBeforeStat(t *testing.T, path, line string, n int, createNew bool) {
 				t.Errorf("append: %v", err)
 			} else if _, err := f.WriteString(line); err != nil {
 				t.Errorf("write: %v", err)
-				f.Close()
+				_ = f.Close()
 			} else if err := f.Close(); err != nil {
 				t.Errorf("close: %v", err)
 			}
