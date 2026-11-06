@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -30,7 +31,25 @@ type Options struct {
 	Location *time.Location
 	// Renderer renders the styles; nil means lipgloss's default renderer.
 	Renderer *lipgloss.Renderer
+	// Exec runs cmd in the foreground with the TUI suspended (attach, the
+	// prompt editor) and returns done's message when it ends; nil means
+	// tea.ExecProcess. Tests run cmd directly.
+	Exec func(cmd *exec.Cmd, done func(error) tea.Msg) tea.Cmd
+	// Editor is the editor argv for prompt editing (the file path is
+	// appended); nil means $VISUAL, then $EDITOR, then vi, split on spaces.
+	Editor []string
 }
+
+// screen is the screen the TUI shows. Each one beyond the main list keeps
+// its state in its own field of Model and its code in its own file.
+type screen int
+
+const (
+	screenMain   screen = iota
+	screenDetail        // detail.go: task definition, next fires, runs; a run's output tail
+	screenOutput        // output.go: live output of an active run
+	screenForm          // form.go: new or edit task
+)
 
 // mode is what the keyboard drives: the list or one of the prompts.
 type mode int
@@ -88,6 +107,13 @@ type Model struct {
 	pauseAll []pauseAllChoice
 	message  string
 	msgErr   bool
+
+	screen screen
+	exec   func(cmd *exec.Cmd, done func(error) tea.Msg) tea.Cmd
+	editor []string
+	detail detailState // screenDetail
+	output outputState // screenOutput
+	form   formState   // screenForm
 }
 
 // confirmation is a pending y/n question.
@@ -120,6 +146,13 @@ func New(o Options) Model {
 		r = lipgloss.DefaultRenderer()
 	}
 	m.st = newStyles(r)
+	m.exec = o.Exec
+	if m.exec == nil {
+		m.exec = func(cmd *exec.Cmd, done func(error) tea.Msg) tea.Cmd {
+			return tea.ExecProcess(cmd, done)
+		}
+	}
+	m.editor = o.Editor
 	m.filter = textinput.New()
 	m.filter.Prompt = "/"
 	m.dateIn = textinput.New()
@@ -248,6 +281,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
+	// Each screen handles its own result messages, whichever screen shows.
+	if m, cmd, ok := m.detailMsg(msg); ok {
+		return m, cmd
+	}
+	if m, cmd, ok := m.outputMsg(msg); ok {
+		return m, cmd
+	}
+	if m, cmd, ok := m.formMsg(msg); ok {
+		return m, cmd
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height

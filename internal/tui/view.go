@@ -87,6 +87,14 @@ func (m Model) listHeight() int {
 
 // View renders the screen.
 func (m Model) View() string {
+	switch m.screen {
+	case screenDetail:
+		return m.fit(m.detailView())
+	case screenOutput:
+		return m.fit(m.outputView())
+	case screenForm:
+		return m.fit(m.formView())
+	}
 	if m.mode == modeHelp {
 		return m.fit(m.helpView())
 	}
