@@ -78,6 +78,10 @@ type Options struct {
 	// end), with the run as stored and no runner lock held. It must not
 	// block: it may run inside a poll or a stop.
 	OnChange func(run store.Run)
+	// OnTargetChange, if set, is called when a target's reachability
+	// changes (unknown, reachable, unreachable), with no runner lock held.
+	// It must not block: it runs inside a poll or a run start.
+	OnTargetChange func(TargetState)
 }
 
 // Runner starts and tracks runs. Its methods are safe for concurrent use.
@@ -91,6 +95,8 @@ type Runner struct {
 	targets   map[string]*targetState
 	onEnd     func(context.Context, store.Run)
 	onChange  func(store.Run)
+
+	onTargetChange func(TargetState)
 
 	// stopCtx is the context of stop sequences: Run cancels it when it
 	// returns, and waits for the stops to give up (the runs stay open for
@@ -120,6 +126,10 @@ type targetState struct {
 	// openMu serialises workspace lookup and creation, so two runs that
 	// start at once for the same repo share one hc- workspace.
 	openMu sync.Mutex
+
+	changeMu sync.Mutex // serializes reachability changes and their callbacks
+	reachMu  sync.Mutex
+	reach    reach
 }
 
 type checkedAt struct {
@@ -155,7 +165,7 @@ type activeRun struct {
 func New(o Options) *Runner {
 	r := &Runner{
 		clock: o.Clock, store: o.Store, cfg: o.Config, configDir: o.ConfigDir, log: o.Log,
-		waitStart: o.ServerStartWait, onEnd: o.OnEnd, onChange: o.OnChange,
+		waitStart: o.ServerStartWait, onEnd: o.OnEnd, onChange: o.OnChange, onTargetChange: o.OnTargetChange,
 		targets:  make(map[string]*targetState, len(o.Targets)),
 		active:   map[string]*activeRun{},
 		starting: map[string]*activeRun{},
@@ -198,12 +208,21 @@ func (r *Runner) Start(ctx context.Context, t config.Task, trigger string, sched
 	a.log.Info("run starting", "trigger", trigger, "scheduled_at", scheduledAt)
 
 	err := r.launch(ctx, a)
+	if obs, ok := launchObservation(err); ok {
+		r.observe(t.Target, obs, true)
+	}
 	r.mu.Lock()
 	delete(r.starting, run.ID)
 	if err == nil {
 		r.active[run.ID] = a
 	}
 	r.mu.Unlock()
+	if errors.Is(err, target.ErrUnreachable) {
+		// Recorded so the missed policy can catch the fire up when the
+		// target answers again.
+		a.log.Warn("target unreachable at fire time", "err", err)
+		return r.end(context.WithoutCancel(ctx), a, store.StatusHostUnreachable, err.Error())
+	}
 	if err != nil {
 		a.log.Warn("run failed to start", "err", err)
 		return r.end(context.WithoutCancel(ctx), a, store.StatusFailed, err.Error())
@@ -218,6 +237,9 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 	ts, ok := r.targets[t.Target]
 	if !ok {
 		return fmt.Errorf("unknown target %q", t.Target)
+	}
+	if err := r.knownUnreachable(ts, t.Target); err != nil {
+		return err
 	}
 	cwd, err := r.preflight(ctx, ts, t, a.log)
 	if err != nil {
@@ -423,8 +445,11 @@ func (r *Runner) checkServer(ctx context.Context, ts *targetState, log *slog.Log
 		return nil
 	}
 	log.Info("herdr server not running; starting it")
+	// notRunning stays in the chain: the host answered, so a start failure
+	// is still a reachable target (launchObservation looks for this code).
+	notRunning := err
 	if err := ts.herdr.StartServer(ctx); err != nil {
-		return fmt.Errorf("preflight: start herdr server: %w", err)
+		return fmt.Errorf("preflight: start herdr server: %w", errors.Join(err, notRunning))
 	}
 	// Wall time, not r.clock: this waits for a real process to come up.
 	deadline := time.Now().Add(r.waitStart)
@@ -595,7 +620,11 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 	}
 	r.mu.Unlock()
 	ts := r.targets[name]
-	if len(runs) == 0 || ts == nil {
+	if ts == nil {
+		return
+	}
+	if len(runs) == 0 {
+		r.probe(ctx, name)
 		return
 	}
 	slices.SortFunc(runs, func(a, b *activeRun) int { return strings.Compare(a.run.ID, b.run.ID) })
@@ -616,6 +645,7 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 	}
 
 	panes, err := ts.herdr.PaneList(ctx)
+	r.observe(name, err, true)
 	if herdr.IsCode(err, herdr.CodeServerNotRunning) {
 		// The server and every pane in it are gone (a host reboot, say).
 		// The next launch must start the server again.
@@ -629,10 +659,11 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 		return
 	}
 	if err != nil {
-		// Unreachable targets and backoff are a later ticket; the runs stay
-		// open and the next poll tries again. One line per run so each
-		// carries that run's id: `herdrcron logs --task` keeps only records
-		// with task_id.
+		// The agents keep running on the target: the runs stay open, and
+		// the next poll (after the backoff, for an unreachable target)
+		// tries again. Only the timeout above ends them meanwhile. One
+		// line per run so each carries that run's id: `herdrcron logs
+		// --task` keeps only records with task_id.
 		for _, a := range runs {
 			a.log.Warn("poll failed", "err", err, "active_runs", len(runs))
 		}
@@ -986,7 +1017,7 @@ func (r *Runner) Run(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					return
-				case <-r.clock.After(interval):
+				case <-r.clock.After(r.pollWait(name, interval)):
 					r.PollTarget(ctx, name)
 				}
 			}

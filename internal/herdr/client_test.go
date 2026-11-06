@@ -420,3 +420,32 @@ func TestStartServerShell(t *testing.T) {
 		t.Error("no error from failing starter")
 	}
 }
+
+func TestVersion(t *testing.T) {
+	f := &fakeTarget{replies: []reply{ok([]byte("herdr 0.9.1\n"))}}
+	v, err := herdr.New(f, "/opt/herdr").Version(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "0.9.1" {
+		t.Errorf("Version = %q, want 0.9.1", v)
+	}
+	checkArgv(t, f, "/opt/herdr", "--version")
+}
+
+func TestVersionAfterLoginShellNoise(t *testing.T) {
+	f := &fakeTarget{replies: []reply{ok([]byte("Welcome to vps\n\nherdr 0.9.0\n"))}}
+	v, err := herdr.New(f, "").Version(context.Background())
+	if err != nil || v != "0.9.0" {
+		t.Errorf("Version = %q, %v; want 0.9.0", v, err)
+	}
+}
+
+func TestVersionUnreadable(t *testing.T) {
+	for _, r := range []reply{ok([]byte("\n")), ok([]byte("something else\n")), {err: errors.New("boom")}} {
+		f := &fakeTarget{replies: []reply{r}}
+		if v, err := herdr.New(f, "").Version(context.Background()); err == nil {
+			t.Errorf("reply %+v: Version = %q, want an error", r, v)
+		}
+	}
+}

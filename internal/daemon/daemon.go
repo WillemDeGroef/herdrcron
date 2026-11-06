@@ -71,6 +71,17 @@ type daemon struct {
 	// deleting holds tasks being deleted; the watcher leaves them alone.
 	deleting map[string]bool
 
+	// checkMu guards lastChecks and ctx. lastChecks is the last
+	// "targets.check" report per target, shown in status and
+	// target.changed. ctx is the daemon's context for work started from
+	// callbacks (catch-up after a target answers again). catchUp's
+	// bg.Add and stopCatchUps's ctx = nil share this lock, so Wait cannot
+	// race Add once the daemon is stopping.
+	checkMu    sync.Mutex
+	lastChecks map[string]api.TargetCheck
+	ctx        context.Context
+	bg         sync.WaitGroup
+
 	// notifier runs notify.command for configured events; wired from runChanged
 	// so run notifications share one path with subscribe run.changed.
 	notifier *notify.Notifier
@@ -123,6 +134,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		configFile: p.ConfigFile(), bus: newBus(log), sshControlDir: p.SSHControlDir(),
 		versions: map[string]string{}, deleting: map[string]bool{},
 		dirty: map[string]struct{}{}, dirtyWake: make(chan struct{}, 1),
+		lastChecks: map[string]api.TargetCheck{},
 	}
 	for _, e := range tasks {
 		d.versions[e.ID] = d.fileVersion(e)
@@ -141,8 +153,9 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	defer notifier.Wait()
 	d.runner = runner.New(runner.Options{
 		Clock: clk, Store: st, Targets: targets, Config: cfg, ConfigDir: p.ConfigDir, Log: log,
-		OnEnd:    func(ctx context.Context, run store.Run) { d.disp.RunEnded(ctx, run) },
-		OnChange: d.runChanged,
+		OnEnd:          func(ctx context.Context, run store.Run) { d.disp.RunEnded(ctx, run) },
+		OnChange:       d.runChanged,
+		OnTargetChange: d.targetChanged,
 	})
 	d.disp = dispatch.New(dispatch.Options{Runs: latestDef{d}, Store: st, Config: cfg, Log: log})
 	d.sched = scheduler.New(scheduler.Options{
@@ -189,6 +202,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	srv.Handle(api.MethodTasksDelete, d.tasksDelete)
 	srv.Handle(api.MethodReload, d.reload)
 	srv.HandleStream(api.MethodSubscribe, d.subscribe)
+	srv.Handle(api.MethodTargetsCheck, d.targetsCheck)
 	w, err := watch.New([]string{d.tasksDir(), d.promptsDir()}, watchDebounce, log)
 	if err != nil {
 		log.Error("cannot watch task files", "err", err)
@@ -200,6 +214,14 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	d.setCtx(ctx)
+	// Targets that answered during Recover (before the scheduler had its
+	// tasks) catch up their host_unreachable fires now.
+	for _, name := range d.targetNames() {
+		if st, ok := d.runner.TargetState(name); ok && st.Reachability == runner.ReachReachable {
+			d.catchUp(name)
+		}
+	}
 	schedDone := make(chan struct{})
 	go func() {
 		defer close(schedDone)
@@ -226,6 +248,8 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	<-runnerDone
 	<-watchDone
 	<-publishDone
+	d.stopCatchUps()
+	d.bg.Wait()
 	log.Info("daemon stopped")
 	return err
 }
@@ -307,7 +331,7 @@ func (d *daemon) status(context.Context, json.RawMessage) (any, error) {
 		Timezone:      d.cfg.Timezone,
 	}
 	for _, n := range d.targetNames() {
-		res.Targets = append(res.Targets, api.TargetStatus{Name: n, Reachability: "unknown"})
+		res.Targets = append(res.Targets, d.targetStatus(n))
 	}
 	d.mu.Lock()
 	res.GlobalPause = d.globalPause

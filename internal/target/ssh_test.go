@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/target"
 )
@@ -16,7 +17,8 @@ import (
 // (one element per NUL-terminated record) and its stdin, then acts on
 // FAKE_SSH_EXIT: unset runs the last argument (the remote command line)
 // with sh -c, as sshd would hand it to the login shell; a number exits
-// with that code after printing FAKE_SSH_STDERR to stderr.
+// with that code after printing FAKE_SSH_STDERR to stderr; FAKE_SSH_HANG
+// set hangs, as ssh over a dead ControlMaster connection does.
 const fakeSSHScript = `#!/bin/sh
 dir=$(dirname "$0")
 : > "$dir/argv"
@@ -26,6 +28,9 @@ if [ -n "$FAKE_SSH_HOLD_STDERR" ]; then
 	# Like a ControlPersist master forked by old OpenSSH: a child keeps
 	# stderr open after ssh exits.
 	sleep "$FAKE_SSH_HOLD_STDERR" >&2 &
+fi
+if [ -n "$FAKE_SSH_HANG" ]; then
+	exec sleep 60
 fi
 if [ -n "$FAKE_SSH_EXIT" ]; then
 	cat > "$dir/stdin"
@@ -45,6 +50,7 @@ func fakeSSH(t *testing.T) (argv func() []string, dir string) {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("FAKE_SSH_EXIT", "")
+	t.Setenv("FAKE_SSH_HANG", "")
 	return func() []string {
 		t.Helper()
 		data, err := os.ReadFile(filepath.Join(dir, "argv"))
@@ -172,6 +178,28 @@ func TestSSHExit255IsUnreachable(t *testing.T) {
 		if err := call(); !errors.Is(err, target.ErrUnreachable) {
 			t.Errorf("file op err = %v, want ErrUnreachable", err)
 		}
+	}
+}
+
+// ssh over a ControlMaster connection whose network dropped hangs instead
+// of exiting 255: a call that does not answer before its deadline is
+// unreachable too. A cancelled call says nothing about the target.
+func TestSSHHungCallIsUnreachable(t *testing.T) {
+	fakeSSH(t)
+	t.Setenv("FAKE_SSH_HANG", "1")
+	s, _ := newTestSSH(t, "")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := s.Exec(ctx, []string{"herdr", "pane", "list"}, nil)
+	if !errors.Is(err, target.ErrUnreachable) || !strings.Contains(err.Error(), "no answer") {
+		t.Fatalf("hung call err = %v, want ErrUnreachable saying no answer", err)
+	}
+
+	ctx, cancel = context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	_, err = s.Exec(ctx, []string{"herdr", "pane", "list"}, nil)
+	if err == nil || errors.Is(err, target.ErrUnreachable) {
+		t.Fatalf("cancelled call err = %v, want an error that is not ErrUnreachable", err)
 	}
 }
 

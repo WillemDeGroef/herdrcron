@@ -26,6 +26,9 @@ type fakeRuns struct {
 	mu    sync.Mutex
 	calls []startCall
 	err   error
+	// unreachable stores each run as host_unreachable, as the runner does
+	// for a fire at a target that does not answer.
+	unreachable bool
 	// beforeInsert runs synchronously at the start of Start, before the run
 	// row is inserted (used to simulate pause/disable mid-tick).
 	beforeInsert func(t config.Task)
@@ -46,7 +49,10 @@ func (f *fakeRuns) Start(ctx context.Context, t config.Task, trigger string, sch
 	}
 	f.mu.Lock()
 	f.calls = append(f.calls, startCall{task: t, trigger: trigger, scheduledAt: scheduledAt})
-	err := f.err
+	err, status := f.err, store.StatusDone
+	if f.unreachable {
+		status = store.StatusHostUnreachable
+	}
 	f.mu.Unlock()
 	if err != nil {
 		return store.Run{}, err
@@ -54,9 +60,15 @@ func (f *fakeRuns) Start(ctx context.Context, t config.Task, trigger string, sch
 	now := f.clock.Now()
 	run := store.Run{
 		ID: store.NewRunID(now), TaskID: t.ID, Target: t.Target, Trigger: trigger,
-		ScheduledAt: scheduledAt, StartedAt: now, EndedAt: now, Status: store.StatusDone,
+		ScheduledAt: scheduledAt, StartedAt: now, EndedAt: now, Status: status,
 	}
 	return run, f.store.InsertRun(ctx, run)
+}
+
+func (f *fakeRuns) setUnreachable(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unreachable = v
 }
 
 func (f *fakeRuns) setErr(err error) {

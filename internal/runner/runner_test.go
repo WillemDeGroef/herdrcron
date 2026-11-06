@@ -33,9 +33,10 @@ type env struct {
 	dbPath    string
 	log       *bytes.Buffer
 
-	mu    sync.Mutex
-	ended []store.Run    // runs passed to OnEnd
-	notes []notification // Notify calls
+	mu      sync.Mutex
+	ended   []store.Run          // runs passed to OnEnd
+	notes   []notification       // Notify calls
+	targets []runner.TargetState // OnTargetChange calls
 }
 
 type notification struct{ event, message string }
@@ -108,6 +109,11 @@ func (e *env) newRunner() *runner.Runner {
 		// The fake server answers at once or never.
 		ServerStartWait: 50 * time.Millisecond,
 		OnChange:        e.recordNotify,
+		OnTargetChange: func(st runner.TargetState) {
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			e.targets = append(e.targets, st)
+		},
 		OnEnd: func(_ context.Context, run store.Run) {
 			e.mu.Lock()
 			defer e.mu.Unlock()

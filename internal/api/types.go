@@ -23,6 +23,17 @@ const (
 	MethodTasksDelete = "tasks.delete" // DeleteParams → DeleteResult
 	MethodReload      = "reload"       // no params → ReloadResult
 	MethodSubscribe   = "subscribe"    // no params → SubscribeResult, then Event notifications
+
+	MethodTargetsCheck = "targets.check" // TargetCheckParams → TargetCheck
+)
+
+// Stable ids for TargetCheckItem.Kind (preflight rows; Name stays human-readable).
+const (
+	CheckKindReachable    = "reachable"
+	CheckKindHerdrServer  = "herdr_server"
+	CheckKindHerdrVersion = "herdr_version"
+	CheckKindAgentCommand = "agent_command"
+	CheckKindCwd          = "cwd"
 )
 
 // Event names: the "method" of the notifications a subscribed connection
@@ -117,11 +128,75 @@ type StatusResult struct {
 	GlobalPause
 }
 
-// TargetStatus is one target in StatusResult.
+// Target reachability: TargetStatus.Reachability.
+const (
+	ReachUnknown     = "unknown"     // the daemon has not talked to the target yet
+	ReachReachable   = "reachable"   // the target answered the last call
+	ReachUnreachable = "unreachable" // ssh could not reach the target; retried with backoff
+)
+
+// TargetStatus is one target in StatusResult, and the params of
+// "target.changed".
 type TargetStatus struct {
 	Name string `json:"name"`
-	// Reachability is "unknown" until target checks exist.
+	// Reachability is ReachUnknown, ReachReachable or ReachUnreachable.
 	Reachability string `json:"reachability"`
+	// UnreachableSince is when the target stopped answering (RFC 3339);
+	// set only while it is unreachable.
+	UnreachableSince string `json:"unreachable_since,omitempty"`
+	// NextRetryAt is when the daemon next tries an unreachable target
+	// (RFC 3339): 30 s after it stopped answering, doubling to 5 min.
+	NextRetryAt string `json:"next_retry_at,omitempty"`
+	// LastError is the error that made the target unreachable.
+	LastError string `json:"last_error,omitempty"`
+	// LastSeenAt is when the target last answered (RFC 3339).
+	LastSeenAt string `json:"last_seen_at,omitempty"`
+	// LastCheck is the last "targets.check" report; nil if none ran since
+	// the daemon started.
+	LastCheck *TargetCheck `json:"last_check,omitempty"`
+}
+
+// TargetCheckParams are the params of "targets.check".
+type TargetCheckParams struct {
+	Name string `json:"name"`
+}
+
+// Check item results: TargetCheckItem.Result.
+const (
+	CheckOK   = "ok"
+	CheckWarn = "warn" // worth a look, does not stop runs (herdr version mismatch)
+	CheckFail = "fail" // runs on the target fail
+	CheckSkip = "skip" // not checked: the target is unreachable
+)
+
+// TargetCheck is the result of "targets.check": the preflight report of
+// one target.
+type TargetCheck struct {
+	Target    string `json:"target"`
+	CheckedAt string `json:"checked_at"` // RFC 3339
+	// OK is true when no item failed; warnings are allowed.
+	OK bool `json:"ok"`
+	// HerdrVersion is the version `herdr --version` printed on the
+	// target; empty if it could not be read.
+	HerdrVersion string `json:"herdr_version,omitempty"`
+	// WantHerdrVersion is config.yaml's herdr_version.
+	WantHerdrVersion string            `json:"want_herdr_version,omitempty"`
+	Items            []TargetCheckItem `json:"items"`
+}
+
+// TargetCheckItem is one line of a TargetCheck.
+type TargetCheckItem struct {
+	// Kind is a stable machine id: CheckKindReachable, CheckKindHerdrServer,
+	// CheckKindHerdrVersion, CheckKindAgentCommand or CheckKindCwd.
+	Kind string `json:"kind"`
+	// Name is what was checked: "reachable", "herdr server",
+	// "herdr version", "agent command <cmd>" or "cwd <dir>".
+	Name   string `json:"name"`
+	Result string `json:"result"` // CheckOK, CheckWarn, CheckFail or CheckSkip
+	Detail string `json:"detail,omitempty"`
+	// Tasks are the ids of the tasks the item applies to (agent command
+	// and cwd items).
+	Tasks []string `json:"tasks,omitempty"`
 }
 
 // TasksListResult is the result of "tasks.list".

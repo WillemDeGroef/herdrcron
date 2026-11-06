@@ -20,12 +20,14 @@ import (
 )
 
 // ErrUnreachable is (wrapped by) the error of a call on an SSH target that
-// ssh could not reach: ssh exited 255.
+// ssh could not reach: ssh exited 255, or the call hung until its deadline.
 var ErrUnreachable = errors.New("target unreachable")
 
-// UnreachableError is returned when ssh exits 255: it could not connect or
-// authenticate, so the remote command did not run (or its result is
-// unknown). It matches ErrUnreachable with errors.Is.
+// UnreachableError is returned when ssh could not reach the target: it
+// exited 255, or it was still running when the deadline fired and had to
+// be killed. A command that already exited is a result, not this error,
+// even when the deadline has also fired. It matches ErrUnreachable with
+// errors.Is.
 type UnreachableError struct {
 	Target string
 	Stderr []byte
@@ -145,21 +147,45 @@ func (s *SSH) run(ctx context.Context, name []string, cmd string, stdin io.Reade
 	c.Stdout = &stdout
 	c.Stderr = &stderr
 	err := c.Run()
-	var ee *exec.ExitError
+	return sshCallResult(ctx, s.cfg.Name, name, c.ProcessState, err, &stdout, &stderr)
+}
+
+// sshCallResult classifies one ssh invocation. A process that already
+// exited keeps that exit code: CommandContext's deadline can also be
+// exceeded (Wait prefers a non-zero exit, and a successful exit can be
+// rewritten as the context error when Kill wins a race against it), and
+// that must not become "unreachable". Only ssh exiting 255, or a call
+// that never exited before the deadline, means the target did not answer.
+func sshCallResult(ctx context.Context, targetName string, argv []string, ps *os.ProcessState, err error, stdout, stderr *bytes.Buffer) ([]byte, error) {
+	code := -1
+	if ps != nil && ps.Exited() {
+		code = ps.ExitCode()
+	}
 	switch {
-	case err == nil:
+	case err == nil || errors.Is(err, exec.ErrWaitDelay):
+		// WaitDelay: ssh exited 0 but a ControlPersist master it forked
+		// still holds stderr; older OpenSSH does not detach it from the
+		// caller's stdio.
 		return stdout.Bytes(), nil
-	case errors.Is(err, exec.ErrWaitDelay):
-		// ssh exited 0 (a non-zero exit gives *exec.ExitError instead) but
-		// a ControlPersist master it forked still holds stderr: older
-		// OpenSSH does not detach it from the caller's stdio.
-		return stdout.Bytes(), nil
-	case errors.As(err, &ee) && ee.ExitCode() == sshUnreachableCode:
-		return stdout.Bytes(), &UnreachableError{Target: s.cfg.Name, Stderr: stderr.Bytes()}
-	case errors.As(err, &ee) && ee.ExitCode() >= 0:
-		return stdout.Bytes(), &ExitError{Argv: slices.Clone(name), Code: ee.ExitCode(), Stderr: stderr.Bytes()}
+	case code == sshUnreachableCode:
+		return stdout.Bytes(), &UnreachableError{Target: targetName, Stderr: stderr.Bytes()}
+	case code > 0:
+		return stdout.Bytes(), &ExitError{Argv: slices.Clone(argv), Code: code, Stderr: stderr.Bytes()}
+	case code == 0:
+		// The command exited 0. A deadline or cancel here is Kill racing
+		// a process that had already finished; any other error (a stdio
+		// copy failure) is that error, not an unreachable target.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return stdout.Bytes(), nil
+		}
+		return stdout.Bytes(), fmt.Errorf("ssh %s: %w", targetName, err)
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		// ssh over a ControlMaster connection whose network dropped hangs
+		// rather than exiting 255; killed at the deadline with no exit
+		// code, it did not answer.
+		return stdout.Bytes(), &UnreachableError{Target: targetName, Stderr: []byte("ssh: no answer before the deadline\n")}
 	default:
-		return stdout.Bytes(), fmt.Errorf("ssh %s: %w", s.cfg.Name, err)
+		return stdout.Bytes(), fmt.Errorf("ssh %s: %w", targetName, err)
 	}
 }
 

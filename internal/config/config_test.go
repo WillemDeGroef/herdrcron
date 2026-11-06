@@ -234,3 +234,21 @@ func TestLoadRejectsUnknownAttachMode(t *testing.T) {
 		t.Fatal("want error for attach_mode: window")
 	}
 }
+
+func TestLoadHerdrVersion(t *testing.T) {
+	cfg, err := config.Load(filepath.Join(t.TempDir(), "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HerdrVersion != config.DefaultHerdrVersion || config.DefaultHerdrVersion != "0.9.1" {
+		t.Errorf("default HerdrVersion = %q (DefaultHerdrVersion %q), want 0.9.1", cfg.HerdrVersion, config.DefaultHerdrVersion)
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, "herdr_version: \"0.10.0\"\n")
+	if cfg, err = config.Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HerdrVersion != "0.10.0" {
+		t.Errorf("HerdrVersion = %q, want 0.10.0", cfg.HerdrVersion)
+	}
+}

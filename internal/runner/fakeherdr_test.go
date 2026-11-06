@@ -1,11 +1,14 @@
 package runner_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"os/exec"
 	"slices"
 	"strings"
 	"sync"
@@ -83,6 +86,11 @@ type fakeHerdr struct {
 	output       string // pane read text
 	failRun      bool   // pane run fails
 	failPut      bool   // PutFile fails
+	version      string // `herdr --version` prints "herdr <version>"; "" = 0.9.1
+	// hostEnv, when set, makes the shell-script calls (preflight and
+	// target check) run for real in a local sh with this environment
+	// (a temp HOME and PATH), instead of the canned answers above.
+	hostEnv []string
 }
 
 func newFakeHerdr() *fakeHerdr {
@@ -172,7 +180,14 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 	}
 	cmd := strings.Join(argv[1:min(3, len(argv))], " ")
 	if f.unreachable {
-		return nil, &target.ExitError{Argv: argv, Code: 255, Stderr: []byte("ssh: connect to host: Connection refused\n")}
+		return nil, &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connect to host: Connection refused\n")}
+	}
+	if cmd == "--version" {
+		v := f.version
+		if v == "" {
+			v = "0.9.1"
+		}
+		return []byte("herdr " + v + "\n"), nil
 	}
 	if f.serverDown {
 		return nil, herdrErr(herdr.CodeServerNotRunning)
@@ -302,6 +317,9 @@ func (f *fakeHerdr) preflightCheck(argv []string) ([]byte, error) {
 		}
 		return nil, nil
 	}
+	if f.hostEnv != nil {
+		return f.runScript(argv)
+	}
 	if f.preflight != "" {
 		return nil, &target.ExitError{Argv: argv, Code: 3, Stderr: []byte(f.preflight + "\n")}
 	}
@@ -310,6 +328,26 @@ func (f *fakeHerdr) preflightCheck(argv []string) ([]byte, error) {
 		cwd = argv[len(argv)-1]
 	}
 	return []byte(cwd + "\n"), nil
+}
+
+// runScript runs a shell-script call, argv <shell...> <script> herdrcron
+// <args...>, in a local sh with hostEnv; a non-zero exit is an ExitError
+// with the script's stderr, as a target gives it.
+func (f *fakeHerdr) runScript(argv []string) ([]byte, error) {
+	i := slices.Index(argv, "herdrcron")
+	if i < 1 {
+		return nil, fmt.Errorf("fake herdr: unexpected argv %q", argv)
+	}
+	cmd := exec.Command("/bin/sh", append([]string{"-c", argv[i-1]}, argv[i:]...)...)
+	cmd.Env = f.hostEnv
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return out, &target.ExitError{Argv: argv, Code: ee.ExitCode(), Stderr: stderr.Bytes()}
+	}
+	return out, err
 }
 
 func flag(argv []string, name string) string {

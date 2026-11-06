@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/shellquote"
@@ -124,6 +125,24 @@ func (c *Client) PaneReadANSI(ctx context.Context, paneID string, lines int) (st
 func (c *Client) PaneProcessInfo(ctx context.Context, paneID string) (PaneProcessInfo, error) {
 	r, err := call[PaneProcessInfoResult](ctx, c, "pane_process_info", "pane", "process-info", "--pane", paneID)
 	return r.ProcessInfo, err
+}
+
+// Version runs `herdr --version` and returns the version it prints
+// ("0.9.1" from "herdr 0.9.1"). Output before the last line (a login
+// shell's greeting) is ignored.
+func (c *Client) Version(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	out, err := c.t.Exec(ctx, []string{c.bin, "--version"}, nil)
+	if err != nil {
+		return "", fmt.Errorf("herdr --version: %w", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	f := strings.Fields(lines[len(lines)-1])
+	if len(f) != 2 || f[0] != "herdr" {
+		return "", fmt.Errorf("herdr --version: unexpected output %q", lines[len(lines)-1])
+	}
+	return f[1], nil
 }
 
 // StartServer starts a headless `herdr server` in its own session and does
