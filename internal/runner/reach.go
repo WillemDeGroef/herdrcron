@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/WillemDeGroef/herdrcron/internal/herdr"
 	"github.com/WillemDeGroef/herdrcron/internal/target"
 )
 
@@ -64,8 +65,10 @@ func (e *errKnownUnreachable) Is(t error) bool { return t == target.ErrUnreachab
 // launchObservation is what a launch result says about the target's
 // reachability, and whether it says anything. A launch that succeeded
 // reached the target; one that got an unreachable answer did not, unless
-// it was not tried. Other errors may be local (a prompt file, a context),
-// so they leave the state alone.
+// it was not tried. server_not_running is an answer too: the host is up
+// and the herdr server is a failed preflight, not an unreachable target.
+// Other errors may be local (a prompt file, a context), so they leave
+// the state alone.
 func launchObservation(err error) (error, bool) {
 	var skipped *errKnownUnreachable
 	switch {
@@ -75,6 +78,8 @@ func launchObservation(err error) (error, bool) {
 		return nil, false
 	case errors.Is(err, target.ErrUnreachable):
 		return err, true
+	case herdr.IsCode(err, herdr.CodeServerNotRunning):
+		return nil, true
 	default:
 		return nil, false
 	}
@@ -82,9 +87,11 @@ func launchObservation(err error) (error, bool) {
 
 // observe feeds the result of a call on the target into its reachability.
 // An error matching target.ErrUnreachable marks it unreachable and backs
-// off: 30 s, doubling to 5 min. Anything else, nil or another error, means
-// the target answered. A change of reachability calls OnTargetChange.
-func (r *Runner) observe(name string, err error) {
+// off: 30 s, doubling to 5 min, when advanceBackoff is set. A manual check
+// passes false so a failure during an outage does not push the next retry
+// further out. Anything else, nil or another error, means the target
+// answered. A change of reachability calls OnTargetChange.
+func (r *Runner) observe(name string, err error, advanceBackoff bool) {
 	ts := r.targets[name]
 	if ts == nil {
 		return
@@ -103,11 +110,12 @@ func (r *Runner) observe(name string, err error) {
 	if errors.Is(err, target.ErrUnreachable) {
 		if rs.state != ReachUnreachable {
 			rs.state, rs.since, rs.backoff = ReachUnreachable, now, backoffMin
-		} else {
+			rs.nextRetry = now.Add(rs.backoff)
+		} else if advanceBackoff {
 			rs.backoff = min(2*rs.backoff, backoffMax)
+			rs.nextRetry = now.Add(rs.backoff)
 		}
 		rs.lastErr = err.Error()
-		rs.nextRetry = now.Add(rs.backoff)
 	} else {
 		rs.state, rs.lastSeen, rs.backoff = ReachReachable, now, 0
 		rs.since, rs.nextRetry, rs.lastErr = time.Time{}, time.Time{}, ""
@@ -195,5 +203,5 @@ func (r *Runner) probe(ctx context.Context, name string) {
 		return
 	}
 	_, err := ts.herdr.PaneList(ctx)
-	r.observe(name, err)
+	r.observe(name, err, true)
 }

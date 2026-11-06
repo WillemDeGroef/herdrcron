@@ -180,6 +180,31 @@ func TestFireAtUnreachableTargetIsHostUnreachable(t *testing.T) {
 	}
 }
 
+// A launch whose herdr server is not running still reached the host. The
+// run fails (the server did not come up); the target, previously
+// unreachable, is reachable again so catch-up can apply.
+func TestServerNotRunningOnLaunchMarksTheTargetReachable(t *testing.T) {
+	e := newEnv(t)
+	e.setUnreachable(true)
+	e.runner.PollTarget(e.ctx, "local")
+	if e.targetState().Reachability != runner.ReachUnreachable {
+		t.Fatalf("target = %+v, want unreachable", e.targetState())
+	}
+	e.clock.Advance(30 * time.Second)
+	e.setUnreachable(false)
+	e.herdr.mu.Lock()
+	e.herdr.serverDown = true
+	e.herdr.mu.Unlock()
+
+	run := e.start(deps())
+	if run.Status != store.StatusFailed || !strings.Contains(run.ExitReason, "server") {
+		t.Fatalf("run = %s %q, want failed because the herdr server is not running", run.Status, run.ExitReason)
+	}
+	if st := e.targetState(); st.Reachability != runner.ReachReachable || !st.LastSeenAt.Equal(e.clock.Now()) {
+		t.Errorf("target = %+v, want reachable, seen now", st)
+	}
+}
+
 // A target with no runs is probed so its reachability is known: at once
 // while unknown, then every 5 minutes while it answers.
 func TestIdleTargetIsProbed(t *testing.T) {

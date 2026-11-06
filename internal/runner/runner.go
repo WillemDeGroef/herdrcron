@@ -209,7 +209,7 @@ func (r *Runner) Start(ctx context.Context, t config.Task, trigger string, sched
 
 	err := r.launch(ctx, a)
 	if obs, ok := launchObservation(err); ok {
-		r.observe(t.Target, obs)
+		r.observe(t.Target, obs, true)
 	}
 	r.mu.Lock()
 	delete(r.starting, run.ID)
@@ -445,8 +445,11 @@ func (r *Runner) checkServer(ctx context.Context, ts *targetState, log *slog.Log
 		return nil
 	}
 	log.Info("herdr server not running; starting it")
+	// notRunning stays in the chain: the host answered, so a start failure
+	// is still a reachable target (launchObservation looks for this code).
+	notRunning := err
 	if err := ts.herdr.StartServer(ctx); err != nil {
-		return fmt.Errorf("preflight: start herdr server: %w", err)
+		return fmt.Errorf("preflight: start herdr server: %w", errors.Join(err, notRunning))
 	}
 	// Wall time, not r.clock: this waits for a real process to come up.
 	deadline := time.Now().Add(r.waitStart)
@@ -642,7 +645,7 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 	}
 
 	panes, err := ts.herdr.PaneList(ctx)
-	r.observe(name, err)
+	r.observe(name, err, true)
 	if herdr.IsCode(err, herdr.CodeServerNotRunning) {
 		// The server and every pane in it are gone (a host reboot, say).
 		// The next launch must start the server again.

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/config"
 	"github.com/WillemDeGroef/herdrcron/internal/runner"
@@ -184,6 +185,33 @@ func TestCheckTargetUnreachableSkipsTheRest(t *testing.T) {
 	}
 	if st, _ := e.runner.TargetState("local"); st.Reachability != runner.ReachUnreachable {
 		t.Errorf("reachability = %s, want unreachable", st.Reachability)
+	}
+}
+
+// A check that finds an outage starts the 30 s backoff, but another check
+// while the target is already unreachable leaves the next retry where the
+// poll worker expects it. The following poll is what doubles the backoff.
+func TestCheckTargetDoesNotStretchBackoff(t *testing.T) {
+	e := newEnv(t)
+	e.runner.PollTarget(e.ctx, "local")
+	e.setUnreachable(true)
+	if _, err := e.runner.CheckTarget(e.ctx, "local", nil); err != nil {
+		t.Fatal(err)
+	}
+	st := e.targetState()
+	if st.Reachability != runner.ReachUnreachable || st.NextRetryAt.Sub(e.clock.Now()) != 30*time.Second {
+		t.Fatalf("after the check that finds the outage: %+v, want unreachable, retry in 30s", st)
+	}
+	next := st.NextRetryAt
+	if _, err := e.runner.CheckTarget(e.ctx, "local", nil); err != nil {
+		t.Fatal(err)
+	}
+	if st = e.targetState(); !st.NextRetryAt.Equal(next) {
+		t.Fatalf("second check moved next retry to %v, want %v", st.NextRetryAt, next)
+	}
+	e.runner.PollTarget(e.ctx, "local")
+	if d := e.targetState().NextRetryAt.Sub(e.clock.Now()); d != time.Minute {
+		t.Fatalf("poll after the checks backs off by %v, want 1m", d)
 	}
 }
 

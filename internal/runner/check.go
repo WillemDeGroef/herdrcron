@@ -77,7 +77,9 @@ func (r *Runner) CheckTarget(ctx context.Context, name string, tasks []config.Ta
 	cmds, cwds := groupTasks(tasks)
 
 	_, err := ts.herdr.PaneList(ctx)
-	r.observe(name, err)
+	// A check discovers an outage, but it must not stretch a backoff the
+	// poll worker is already counting down.
+	r.observe(name, err, false)
 	if errors.Is(err, target.ErrUnreachable) {
 		c.Items = append(c.Items, CheckItem{Name: "reachable", Result: CheckFail, Detail: err.Error()})
 		for _, n := range []string{"herdr server", "herdr version"} {

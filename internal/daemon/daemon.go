@@ -71,15 +71,16 @@ type daemon struct {
 	// deleting holds tasks being deleted; the watcher leaves them alone.
 	deleting map[string]bool
 
-	// checkMu guards lastChecks: the last "targets.check" report per
-	// target, shown in status and target.changed.
+	// checkMu guards lastChecks and ctx. lastChecks is the last
+	// "targets.check" report per target, shown in status and
+	// target.changed. ctx is the daemon's context for work started from
+	// callbacks (catch-up after a target answers again). catchUp's
+	// bg.Add and stopCatchUps's ctx = nil share this lock, so Wait cannot
+	// race Add once the daemon is stopping.
 	checkMu    sync.Mutex
 	lastChecks map[string]api.TargetCheck
-
-	// ctx is the daemon's context, for work started from callbacks
-	// (catch-up after a target answers again); bg tracks that work.
-	ctx context.Context
-	bg  sync.WaitGroup
+	ctx        context.Context
+	bg         sync.WaitGroup
 
 	// notifier runs notify.command for configured events; wired from runChanged
 	// so run notifications share one path with subscribe run.changed.
