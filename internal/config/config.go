@@ -27,10 +27,20 @@ type Config struct {
 	PollInterval Duration `yaml:"poll_interval"`
 	// CatchUpWindow is how old a missed fire may be and still be caught
 	// up (missed: run_once); default 24h.
-	CatchUpWindow Duration          `yaml:"catch_up_window"`
-	Notify        Notify            `yaml:"notify"`
-	Targets       map[string]Target `yaml:"targets"`
+	CatchUpWindow Duration `yaml:"catch_up_window"`
+	// AttachMode is how the TUI attaches to a run: AttachPane (default)
+	// or AttachFull.
+	AttachMode string            `yaml:"attach_mode"`
+	Notify     Notify            `yaml:"notify"`
+	Targets    map[string]Target `yaml:"targets"`
 }
+
+// Attach modes, the valid attach_mode values (the same strings as
+// api.AttachPane and api.AttachFull).
+const (
+	AttachPane = "pane"
+	AttachFull = "full"
+)
 
 // Notify is the notify section of config.yaml.
 type Notify struct {
@@ -119,6 +129,13 @@ func Load(path string) (Config, error) {
 		cfg.CatchUpWindow.Duration = DefaultCatchUpWindow
 	case cfg.CatchUpWindow.Duration < 0:
 		return Config{}, fmt.Errorf("catch_up_window must be > 0, got %s", cfg.CatchUpWindow.Duration)
+	}
+	switch cfg.AttachMode {
+	case "":
+		cfg.AttachMode = AttachPane
+	case AttachPane, AttachFull:
+	default:
+		return Config{}, fmt.Errorf("attach_mode must be %s or %s, got %q", AttachPane, AttachFull, cfg.AttachMode)
 	}
 	if len(cfg.Notify.Command) > 0 && cfg.Notify.Command[0] == "" {
 		return Config{}, errors.New("notify.command: the first element (the program) is empty")

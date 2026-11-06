@@ -204,6 +204,19 @@ func TestPaneRead(t *testing.T) {
 	}
 }
 
+func TestPaneReadANSI(t *testing.T) {
+	text := "\x1b[32mgreen\x1b[0m\n$ "
+	f := &fakeTarget{replies: []reply{ok([]byte(text))}}
+	got, err := herdr.New(f, "/opt/herdr").PaneReadANSI(context.Background(), "w15:p2", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkArgv(t, f, "/opt/herdr", "pane", "read", "w15:p2", "--source", "recent", "--lines", "50", "--format", "ansi")
+	if got != text {
+		t.Errorf("text = %q, want %q", got, text)
+	}
+}
+
 func TestPaneProcessInfo(t *testing.T) {
 	f := &fakeTarget{replies: []reply{ok(readFixture(t, "pane_process_info.json"))}}
 	pi, err := herdr.New(f, "").PaneProcessInfo(context.Background(), "w16:p1")

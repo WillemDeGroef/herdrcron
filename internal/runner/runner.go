@@ -45,8 +45,13 @@ const (
 	stopGrace  = 10 * time.Second
 )
 
-// ErrNotActive is returned by Stop for a run the runner does not track.
+// ErrNotActive is returned by Stop, ReadOutput and PaneHasAgent for a run
+// the runner does not track.
 var ErrNotActive = errors.New("run is not active")
+
+// ErrNoPane is returned by ReadOutput and PaneHasAgent for a run that is
+// still starting and has no herdr pane yet.
+var ErrNoPane = errors.New("run has no pane yet")
 
 // promptDir holds the prompt files on the target, one per run.
 const promptDir = "~/.cache/herdrcron/runs/"
@@ -503,6 +508,77 @@ func (r *Runner) Active(runID string) bool {
 	defer r.mu.Unlock()
 	_, ok := r.active[runID]
 	return ok
+}
+
+// Live reports whether the run is tracked as active or still starting:
+// the runs ReadOutput and PaneHasAgent can answer for.
+func (r *Runner) Live(runID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.active[runID]
+	if !ok {
+		_, ok = r.starting[runID]
+	}
+	return ok
+}
+
+// ReadOutput returns a snapshot of an active run and the last lines of
+// its pane with ANSI escapes kept, for a live view. A run the runner does
+// not track gives ErrNotActive; one without a pane yet gives ErrNoPane.
+func (r *Runner) ReadOutput(ctx context.Context, runID string, lines int) (store.Run, string, error) {
+	run, ts, err := r.livePane(runID)
+	if err != nil {
+		return store.Run{}, "", err
+	}
+	out, err := ts.herdr.PaneReadANSI(ctx, run.HerdrPane, lines)
+	return run, out, err
+}
+
+// PaneHasAgent returns a snapshot of an active run and whether herdr
+// still detects an agent in its pane: false once the agent has exited to
+// the shell, or the pane is gone. Errors are those of ReadOutput, or the
+// pane list's.
+func (r *Runner) PaneHasAgent(ctx context.Context, runID string) (store.Run, bool, error) {
+	run, ts, err := r.livePane(runID)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	panes, err := ts.herdr.PaneList(ctx)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	for _, p := range panes {
+		if p.PaneID == run.HerdrPane {
+			return run, p.Agent != nil, nil
+		}
+	}
+	return run, false, nil
+}
+
+// livePane returns a snapshot of a tracked run (active, or starting with
+// its pane created) and its target.
+func (r *Runner) livePane(runID string) (store.Run, *targetState, error) {
+	r.mu.Lock()
+	a, ok := r.active[runID]
+	if !ok {
+		a, ok = r.starting[runID]
+	}
+	var run store.Run
+	if ok {
+		run = a.run
+	}
+	r.mu.Unlock()
+	switch {
+	case !ok:
+		return store.Run{}, nil, fmt.Errorf("run %s: %w", runID, ErrNotActive)
+	case run.HerdrPane == "":
+		return store.Run{}, nil, fmt.Errorf("run %s: %w", runID, ErrNoPane)
+	}
+	ts := r.targets[run.Target]
+	if ts == nil {
+		return store.Run{}, nil, fmt.Errorf("run %s: unknown target %q", runID, run.Target)
+	}
+	return run, ts, nil
 }
 
 // PollTarget runs step 7 once for every active run on the target: one

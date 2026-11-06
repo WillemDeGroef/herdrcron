@@ -8,6 +8,9 @@ const (
 	MethodRunsList    = "runs.list"
 	MethodRunsStop    = "runs.stop"
 
+	MethodRunsOutput    = "runs.output"     // RunsOutputParams → RunsOutputResult
+	MethodRunsAttachCmd = "runs.attach_cmd" // RunIDParams → AttachCmdResult
+
 	MethodTasksSetEnabled = "tasks.set_enabled" // SetEnabledParams → TaskSummary
 	MethodTasksPause      = "tasks.pause"       // PauseParams → TaskSummary
 	MethodTasksResume     = "tasks.resume"      // TaskIDParams → TaskSummary
@@ -107,6 +110,10 @@ type StatusResult struct {
 	StartedAt     string         `json:"started_at"` // RFC 3339
 	UptimeSeconds int64          `json:"uptime_seconds"`
 	Targets       []TargetStatus `json:"targets"`
+	// Timezone is config.yaml's default timezone (IANA name), used for a
+	// task without a timezone of its own; empty means the daemon's local
+	// zone.
+	Timezone string `json:"timezone,omitempty"`
 	GlobalPause
 }
 
@@ -312,4 +319,52 @@ type RunChangedEvent struct {
 // TargetChangedEvent is the params of "target.changed".
 type TargetChangedEvent struct {
 	Target TargetStatus `json:"target"`
+}
+
+// Attach modes: config.yaml attach_mode, and AttachCmdResult.Mode.
+const (
+	AttachPane = "pane" // attach to the run's agent pane only
+	AttachFull = "full" // open the full herdr UI
+)
+
+// RunIDParams name one run.
+type RunIDParams struct {
+	RunID string `json:"run_id"`
+}
+
+// RunsOutputParams are the params of "runs.output".
+type RunsOutputParams struct {
+	RunID string `json:"run_id"`
+	// Lines is how many lines of an active run's pane to read; zero means
+	// DefaultOutputLines, and more than MaxOutputLines reads MaxOutputLines.
+	// Ignored for an ended run.
+	Lines int `json:"lines,omitempty"`
+}
+
+// DefaultOutputLines is the runs.output line count when the params give none.
+const DefaultOutputLines = 200
+
+// MaxOutputLines is the most pane lines one runs.output reads.
+const MaxOutputLines = 2000
+
+// RunsOutputResult is the result of "runs.output". For an active run
+// Output is the pane's recent text with ANSI escapes kept and Live is set.
+// A run still starting, with no pane yet, is live too (Output is the stored
+// tail, usually empty). For an ended run Output is its stored output_tail
+// (plain text) and Live is false.
+type RunsOutputResult struct {
+	RunID  string `json:"run_id"`
+	Status string `json:"status"`
+	Live   bool   `json:"live"`
+	Output string `json:"output"`
+}
+
+// AttachCmdResult is the result of "runs.attach_cmd": the argv the TUI
+// runs in the foreground (suspending itself) to attach to an active run.
+// Mode is AttachFull when attach_mode is full, or when the run's pane has
+// no agent left to attach to; Note then says why in a few words.
+type AttachCmdResult struct {
+	Argv []string `json:"argv"`
+	Mode string   `json:"mode"`
+	Note string   `json:"note,omitempty"`
 }

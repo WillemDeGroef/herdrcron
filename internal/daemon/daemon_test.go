@@ -201,6 +201,19 @@ func TestStatus(t *testing.T) {
 	}
 }
 
+func TestStatusReportsTheConfigTimezone(t *testing.T) {
+	p := setup(t)
+	write(t, p.ConfigFile(), "timezone: Europe/Brussels\n")
+	c := startWith(t, p, daemon.Options{Version: "test", Targets: fakeTargets()})
+	var res api.StatusResult
+	if err := c.Call(context.Background(), api.MethodStatus, nil, &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Timezone != "Europe/Brussels" {
+		t.Errorf("timezone = %q, want Europe/Brussels", res.Timezone)
+	}
+}
+
 func TestLocalTargetWithoutConfigFile(t *testing.T) {
 	p := setup(t)
 	if err := os.Remove(p.ConfigFile()); err != nil {

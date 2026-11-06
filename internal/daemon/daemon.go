@@ -179,6 +179,8 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	srv.Handle(api.MethodTasksRunNow, d.tasksRunNow)
 	srv.Handle(api.MethodRunsList, d.runsList)
 	srv.Handle(api.MethodRunsStop, d.runsStop)
+	srv.Handle(api.MethodRunsOutput, d.runsOutput)
+	srv.Handle(api.MethodRunsAttachCmd, d.runsAttachCmd)
 	srv.Handle(api.MethodTasksGet, d.tasksGet)
 	srv.Handle(api.MethodTasksCreate, d.tasksCreate)
 	srv.Handle(api.MethodTasksUpdate, d.tasksUpdate)
@@ -292,6 +294,7 @@ func (d *daemon) status(context.Context, json.RawMessage) (any, error) {
 		Version:       d.version,
 		StartedAt:     d.started.Format(time.RFC3339),
 		UptimeSeconds: int64(time.Since(d.started) / time.Second),
+		Timezone:      d.cfg.Timezone,
 	}
 	for _, n := range d.targetNames() {
 		res.Targets = append(res.Targets, api.TargetStatus{Name: n, Reachability: "unknown"})

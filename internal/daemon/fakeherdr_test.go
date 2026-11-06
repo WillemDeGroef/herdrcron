@@ -22,7 +22,8 @@ const (
 	paneIdle
 	paneDone
 	paneBlocked
-	paneGone // the pane no longer exists
+	paneNoAgent // the agent exited: no agent, status unknown, shell busy
+	paneGone    // the pane no longer exists
 )
 
 type fakePane struct {
@@ -45,8 +46,13 @@ type fakeHerdr struct {
 	order      []string // pane ids in creation order
 	nextID     int
 
-	unreachable bool   // pane list fails
-	output      string // pane read text
+	unreachable bool          // pane list fails
+	output      string        // pane read text
+	ansiOutput  string        // pane read --format ansi text
+	bin         string        // the herdr binary it answers to; "" means "herdr"
+	readErr     error         // pane read --format ansi fails with it
+	putGate     chan struct{} // PutFile waits until it is closed
+	execGate    chan struct{} // Exec waits until it is closed
 }
 
 func newFakeHerdr() *fakeHerdr {
@@ -59,6 +65,12 @@ func newFakeHerdr() *fakeHerdr {
 func (f *fakeHerdr) Name() string { return "local" }
 
 func (f *fakeHerdr) PutFile(_ context.Context, path string, data []byte) error {
+	f.mu.Lock()
+	gate := f.putGate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.files[path] = slices.Clone(data)
@@ -97,6 +109,64 @@ func (f *fakeHerdr) setOutput(s string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.output = s
+}
+
+// setReadErr makes pane read --format ansi fail with err.
+func (f *fakeHerdr) setReadErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readErr = err
+}
+
+// holdExec makes every Exec wait until the returned function is called.
+// A run blocked here has been stored as starting and has no pane yet.
+func (f *fakeHerdr) holdExec() (release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gate := make(chan struct{})
+	f.execGate = gate
+	return sync.OnceFunc(func() {
+		f.mu.Lock()
+		f.execGate = nil
+		f.mu.Unlock()
+		close(gate)
+	})
+}
+
+// holdPutFile makes PutFile (the prompt write, after the tab is opened)
+// wait until the returned function is called.
+func (f *fakeHerdr) holdPutFile() (release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gate := make(chan struct{})
+	f.putGate = gate
+	return sync.OnceFunc(func() { close(gate) })
+}
+
+func (f *fakeHerdr) setANSIOutput(s string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ansiOutput = s
+}
+
+// setBin makes the fake answer to bin (a target's herdr_path) as herdr.
+func (f *fakeHerdr) setBin(bin string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bin = bin
+}
+
+// lastCall returns the last call that started with prefix, or nil.
+func (f *fakeHerdr) lastCall(prefix ...string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.calls) - 1; i >= 0; i-- {
+		c := f.calls[i]
+		if len(c) >= len(prefix) && slices.Equal(c[:len(prefix)], prefix) {
+			return slices.Clone(c)
+		}
+	}
+	return nil
 }
 
 func (f *fakeHerdr) tabOpen(id string) bool {
@@ -143,9 +213,19 @@ func ok[T any](v T) ([]byte, error) {
 
 func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte, error) {
 	f.mu.Lock()
+	gate := f.execGate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, slices.Clone(argv))
-	if argv[0] != "herdr" {
+	bin := f.bin
+	if bin == "" {
+		bin = "herdr"
+	}
+	if argv[0] != bin {
 		// The preflight script: argv ends with <command> <cwd>; print the cwd.
 		return []byte(argv[len(argv)-1] + "\n"), nil
 	}
@@ -164,6 +244,9 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 			agent := "claude"
 			info.Agent = &agent
 			switch p.state {
+			case paneNoAgent:
+				info.Agent = nil
+				info.AgentStatus = herdr.AgentStatusUnknown
 			case paneWorking:
 				info.AgentStatus = herdr.AgentStatusWorking
 			case paneIdle:
@@ -221,6 +304,12 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 			return nil, herdrErr(herdr.CodePaneNotFound)
 		}
 		if argv[2] == "read" {
+			if flag(argv, "--format") == "ansi" {
+				if f.readErr != nil {
+					return nil, f.readErr
+				}
+				return []byte(f.ansiOutput), nil
+			}
 			return []byte(f.output), nil
 		}
 		return nil, nil

@@ -111,6 +111,15 @@ func (c *Client) PaneRead(ctx context.Context, paneID string, lines int) (string
 	return string(out), err
 }
 
+// PaneReadANSI returns the last lines of the pane as the pane rendered
+// them, colours kept, for a live view. Soft wraps stay as rows
+// (--source recent): that is the last screen. The stored output tail uses
+// PaneRead, which joins those wraps (--source recent-unwrapped).
+func (c *Client) PaneReadANSI(ctx context.Context, paneID string, lines int) (string, error) {
+	out, err := c.exec(ctx, "pane", "read", paneID, "--source", "recent", "--lines", strconv.Itoa(lines), "--format", "ansi")
+	return string(out), err
+}
+
 // PaneProcessInfo runs `herdr pane process-info`.
 func (c *Client) PaneProcessInfo(ctx context.Context, paneID string) (PaneProcessInfo, error) {
 	r, err := call[PaneProcessInfoResult](ctx, c, "pane_process_info", "pane", "process-info", "--pane", paneID)

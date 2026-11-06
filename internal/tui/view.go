@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -30,8 +31,23 @@ func newStyles(r *lipgloss.Renderer) styles {
 	}
 }
 
-// keyHelp is the footer of the list.
-const keyHelp = "space on/off  p pause  P pause all  r run now  s stop  / filter  g group  ? help  q quit"
+// keyHelp is the footer of the list, as in the spec. On a narrow terminal
+// footerKeys drops keys from the end, but always keeps help and quit.
+var keyHelp = []string{"space on/off", "p pause", "r run now", "n new", "e edit", "d delete",
+	"enter details", "a attach", "/ filter", "? help", "q quit"}
+
+// footerKeys is the key help that fits in width columns, with its leading
+// space.
+func footerKeys(width int) string {
+	keys, tail := keyHelp[:len(keyHelp)-2], keyHelp[len(keyHelp)-2:]
+	for n := len(keys); n >= 0; n-- {
+		s := strings.Join(append(slices.Clone(keys[:n]), tail...), "  ")
+		if width <= 0 || 1+len([]rune(s)) <= width {
+			return s
+		}
+	}
+	return strings.Join(tail, "  ")
+}
 
 var columns = []string{"TARGET", "TASK", "SCHEDULE", "STATE", "LAST", "NEXT"}
 
@@ -87,6 +103,14 @@ func (m Model) listHeight() int {
 
 // View renders the screen.
 func (m Model) View() string {
+	switch m.screen {
+	case screenDetail:
+		return m.fit(m.detailView())
+	case screenOutput:
+		return m.fit(m.outputView())
+	case screenForm:
+		return m.fit(m.formView())
+	}
 	if m.mode == modeHelp {
 		return m.fit(m.helpView())
 	}
@@ -385,7 +409,7 @@ func (m Model) footer() string {
 	case modeConfirm:
 		return m.st.warning.Render(" " + m.confirm.question + " y/n")
 	}
-	help := keyHelp
+	help := footerKeys(m.width)
 	if f := m.filter.Value(); f != "" {
 		help = "filter: " + f + " (esc clears)  " + help
 	}
@@ -400,6 +424,13 @@ func (m Model) helpView() string {
 		{"P", "pause or resume all on the selected task's target, or on all targets"},
 		{"r", "run now (asks before a parallel run)"},
 		{"s", "stop the active run (asks first)"},
+		{"enter", "task detail: definition, next fires, last runs; enter on a run shows its output"},
+		{"l", "live output of the active run"},
+		{"a", "attach to the active run's agent (detach with ctrl+b q)"},
+		{"n", "new task (form)"},
+		{"e", "edit the task (form)"},
+		{"E", "edit the prompt in $EDITOR"},
+		{"d", "delete the task (asks first; offers stop and delete with an active run)"},
 		{"/", "filter by text; esc clears"},
 		{"g", "group by target"},
 		{"?", "this help"},

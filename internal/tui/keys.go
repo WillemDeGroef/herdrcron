@@ -22,6 +22,17 @@ func (m Model) key(msg tea.KeyMsg) (Model, tea.Cmd) {
 	if msg.String() == "ctrl+c" {
 		return m, tea.Quit
 	}
+	if m.mode == modeConfirm {
+		return m.confirmKey(msg)
+	}
+	switch m.screen {
+	case screenDetail:
+		return m.detailKey(msg)
+	case screenOutput:
+		return m.outputKey(msg)
+	case screenForm:
+		return m.formKey(msg)
+	}
 	switch m.mode {
 	case modeHelp:
 		m.mode = modeList
@@ -34,18 +45,21 @@ func (m Model) key(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m.pauseDateKey(msg)
 	case modePauseAll:
 		return m.pauseAllKey(msg)
-	case modeConfirm:
-		switch msg.String() {
-		case "y", "Y":
-			m.mode = modeList
-			return m, m.confirm.yes
-		case "n", "N", "esc", "q":
-			m.mode = modeList
-			m.setMessage("cancelled", nil)
-		}
-		return m, nil
 	}
 	return m.listKey(msg)
+}
+
+// confirmKey answers the pending y/n question, on any screen.
+func (m Model) confirmKey(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		m.mode = modeList
+		return m, m.confirm.yes
+	case "n", "N", "esc", "q":
+		m.mode = modeList
+		m.setMessage("cancelled", nil)
+	}
+	return m, nil
 }
 
 func (m Model) listKey(msg tea.KeyMsg) (Model, tea.Cmd) {
@@ -78,6 +92,8 @@ func (m Model) listKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case "P":
 		m.pauseAll = m.pauseAllChoices()
 		m.mode = modePauseAll
+	case "n":
+		return m.openNewForm()
 	}
 	t, ok := m.current()
 	if !ok {
@@ -105,6 +121,18 @@ func (m Model) listKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.ask(fmt.Sprintf("Stop run %s of %s?", run.ID, t.ID), m.stop(t.ID, run.ID))
+	case "enter":
+		return m.openDetail(t.ID)
+	case "l":
+		return m.openOutput(t.ID)
+	case "a":
+		return m.attach(t.ID)
+	case "e":
+		return m.openEditForm(t.ID)
+	case "E":
+		return m.editPrompt(t.ID)
+	case "d":
+		return m.deleteTask(t.ID)
 	}
 	return m, nil
 }
