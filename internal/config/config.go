@@ -21,12 +21,17 @@ const LocalTarget = "local"
 type Config struct {
 	Timezone string `yaml:"timezone"`
 	// HistoryDays is how long run history is kept; default 90.
-	HistoryDays int               `yaml:"history_days"`
-	Targets     map[string]Target `yaml:"targets"`
+	HistoryDays int `yaml:"history_days"`
+	// PollInterval is how often active runs are polled; default 15s.
+	PollInterval Duration          `yaml:"poll_interval"`
+	Targets      map[string]Target `yaml:"targets"`
 }
 
 // DefaultHistoryDays is the history_days default.
 const DefaultHistoryDays = 90
+
+// DefaultPollInterval is the poll_interval default.
+const DefaultPollInterval = 15 * time.Second
 
 // Location is the time zone of task t: its timezone field, or the config
 // timezone when the task has none.
@@ -72,6 +77,12 @@ func Load(path string) (Config, error) {
 		cfg.HistoryDays = DefaultHistoryDays
 	case cfg.HistoryDays < 0:
 		return Config{}, fmt.Errorf("history_days must be > 0, got %d", cfg.HistoryDays)
+	}
+	switch {
+	case cfg.PollInterval.Duration == 0:
+		cfg.PollInterval.Duration = DefaultPollInterval
+	case cfg.PollInterval.Duration < 0:
+		return Config{}, fmt.Errorf("poll_interval must be > 0, got %s", cfg.PollInterval.Duration)
 	}
 	if _, err := time.LoadLocation(cfg.Timezone); err != nil {
 		return Config{}, fmt.Errorf("config timezone %q: %w", cfg.Timezone, err)

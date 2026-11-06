@@ -4,9 +4,12 @@
 package target
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"sync"
 )
 
@@ -17,11 +20,44 @@ type Target interface {
 	Exec(ctx context.Context, argv []string, stdin io.Reader) (stdout []byte, err error)
 	// PutFile writes data to remotePath on the target.
 	PutFile(ctx context.Context, remotePath string, data []byte) error
+	// RemoveFile removes the file; a missing file is not an error.
+	RemoveFile(ctx context.Context, path string) error
+}
+
+// Spawner starts long-lived processes on a target.
+type Spawner interface {
+	// Spawn starts argv detached in a new session, with stdio to /dev/null,
+	// and does not wait for it to exit. Used to start `herdr server`.
+	Spawn(argv []string) error
+}
+
+// ExitError is returned by Exec when the command ran and exited non-zero.
+type ExitError struct {
+	Argv   []string
+	Code   int
+	Stderr []byte
+}
+
+// maxStderrInError caps how much stderr ExitError.Error includes.
+const maxStderrInError = 200
+
+// Error names at most the first three argv elements (later ones can hold
+// env values or prompt text) and the first line of stderr.
+func (e *ExitError) Error() string {
+	name := strings.Join(e.Argv[:min(len(e.Argv), 3)], " ")
+	msg := bytes.TrimSpace(e.Stderr)
+	if i := bytes.IndexByte(msg, '\n'); i >= 0 {
+		msg = bytes.TrimSpace(msg[:i])
+	}
+	if len(msg) > maxStderrInError {
+		msg = msg[:maxStderrInError]
+	}
+	return fmt.Sprintf("%s: exit %d: %s", name, e.Code, msg)
 }
 
 // Fake is a Target that runs nothing: it records every call and answers
-// with the error set by SetErr. Until the herdr adapter exists, the daemon
-// fires runs through a Fake. It is safe for concurrent use.
+// with the error set by SetErr. Tests use it where no real herdr is needed.
+// It is safe for concurrent use.
 type Fake struct {
 	name  string
 	mu    sync.Mutex
@@ -50,6 +86,16 @@ func (f *Fake) PutFile(_ context.Context, remotePath string, data []byte) error 
 	defer f.mu.Unlock()
 	if f.err == nil {
 		f.files[remotePath] = slices.Clone(data)
+	}
+	return f.err
+}
+
+// RemoveFile forgets the file and returns the error set by SetErr.
+func (f *Fake) RemoveFile(_ context.Context, path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err == nil {
+		delete(f.files, path)
 	}
 	return f.err
 }
