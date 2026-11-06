@@ -185,6 +185,10 @@ func mergeStatusTargets(local, incoming []api.TargetStatus, gen map[string]int, 
 		prev[t.Name] = t
 	}
 	out := slices.Clone(incoming)
+	inSnapshot := make(map[string]bool, len(out))
+	for _, t := range out {
+		inSnapshot[t.Name] = true
+	}
 	for i, t := range out {
 		old, ok := prev[t.Name]
 		if !ok {
@@ -198,6 +202,16 @@ func mergeStatusTargets(local, incoming []api.TargetStatus, gen map[string]int, 
 			out[i].LastSeenAt = old.LastSeenAt
 		}
 		out[i].LastCheck = newerCheck(old.LastCheck, t.LastCheck)
+	}
+	// A target.changed can append a row before an older status snapshot returns.
+	// That snapshot may omit the new name; keep the newer row, do not drop it.
+	for _, old := range local {
+		if inSnapshot[old.Name] {
+			continue
+		}
+		if gen[old.Name] > readRev {
+			out = append(out, old)
+		}
 	}
 	return out
 }

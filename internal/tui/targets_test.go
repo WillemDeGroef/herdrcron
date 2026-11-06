@@ -386,3 +386,23 @@ func TestTargetsCheckResultStaysOffOtherScreens(t *testing.T) {
 		t.Errorf("message on the main screen = %q, want none", got)
 	}
 }
+
+func TestMergeStatusTargetsKeepsTargetAppendedAfterReadStarted(t *testing.T) {
+	local := []api.TargetStatus{
+		{Name: "local", Reachability: api.ReachReachable, LastSeenAt: ts(-time.Minute)},
+		{Name: "newbox", Reachability: api.ReachReachable, LastSeenAt: ts(0)},
+	}
+	incoming := []api.TargetStatus{
+		{Name: "local", Reachability: api.ReachReachable, LastSeenAt: ts(-2 * time.Minute)},
+	}
+	gen := map[string]int{"newbox": 5}
+	readRev := 3
+	out := mergeStatusTargets(local, incoming, gen, readRev)
+	names := make([]string, len(out))
+	for i, t := range out {
+		names[i] = t.Name
+	}
+	if len(out) != 2 || out[0].Name != "local" || out[1].Name != "newbox" {
+		t.Fatalf("merge = %v, want [local newbox]", names)
+	}
+}

@@ -160,9 +160,9 @@ func (m Model) titleLine() string {
 
 func (m Model) targetBadge(t api.TargetStatus) string {
 	switch t.Reachability {
-	case "reachable":
+	case api.ReachReachable:
 		return t.Name + " ●"
-	case "unreachable":
+	case api.ReachUnreachable:
 		return t.Name + " " + m.st.critical.Render("○ unreachable")
 	}
 	return t.Name + " " + m.st.dim.Render("?")
