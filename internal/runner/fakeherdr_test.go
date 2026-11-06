@@ -40,6 +40,8 @@ type fakePane struct {
 	polls       int // pane lists since pane run
 	command     string
 	closed      bool
+	// interrupted: ctrl+c reached the agent, which exited to the shell.
+	interrupted bool
 }
 
 // current is the sample of the latest pane list; the last sample repeats.
@@ -47,6 +49,8 @@ func (p *fakePane) current() sample {
 	switch {
 	case p.closed:
 		return vanished
+	case p.interrupted:
+		return shell
 	case p.polls == 0 || len(p.script) == 0:
 		return starting
 	}
@@ -72,6 +76,7 @@ type fakeHerdr struct {
 	nextID     int
 
 	serverDown   bool   // herdr calls fail with server_not_running
+	unreachable  bool   // herdr calls fail as an ssh target that does not answer
 	serverStarts bool   // starting the server brings it up
 	preflight    string // stderr line of a failing preflight; "" = ok
 	resolvedCwd  string // what the preflight prints; "" = the cwd as given
@@ -166,6 +171,9 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		return f.preflightCheck(argv)
 	}
 	cmd := strings.Join(argv[1:min(3, len(argv))], " ")
+	if f.unreachable {
+		return nil, &target.ExitError{Argv: argv, Code: 255, Stderr: []byte("ssh: connect to host: Connection refused\n")}
+	}
 	if f.serverDown {
 		return nil, herdrErr(herdr.CodeServerNotRunning)
 	}
@@ -238,6 +246,15 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 			return nil, &target.ExitError{Code: 1, Stderr: []byte("boom")}
 		}
 		p.command = argv[4]
+		return nil, nil
+	case "pane send-keys":
+		p, found := f.panes[argv[3]]
+		if !found {
+			return nil, herdrErr(herdr.CodePaneNotFound)
+		}
+		if slices.Contains(argv[4:], "ctrl+c") {
+			p.interrupted = true
+		}
 		return nil, nil
 	case "pane read":
 		if _, found := f.panes[argv[3]]; !found {

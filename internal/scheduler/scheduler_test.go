@@ -115,8 +115,14 @@ func newEnv(t *testing.T, now time.Time) *env {
 		config: config.Config{Timezone: "Europe/Brussels", HistoryDays: 90},
 	}
 	e.starter = &fakeRuns{clock: e.clock, store: st}
-	e.sched = e.newScheduler()
+	e.restart()
 	return e
+}
+
+// restart replaces the scheduler with a new one on the same store, clock
+// and starter, with e.config: a daemon restart.
+func (e *env) restart() {
+	e.sched = e.newScheduler()
 }
 
 func (e *env) newScheduler() *scheduler.Scheduler {
@@ -326,15 +332,18 @@ func TestSlightlyLateTickStillFires(t *testing.T) {
 	}
 }
 
-// A fire time that passed long ago (the host slept) is a missed fire: it
-// does not start a scheduled run. The missed policy owns it.
-func TestFireTimeLongPastIsMissedNotRun(t *testing.T) {
+// A fire time that passed long ago while the daemon ran (the host slept)
+// is a missed fire: it does not start a scheduled run. With missed:
+// run_once it starts one catch_up run for the latest missed fire.
+func TestFireMissedWhileRunningIsCaughtUpOnce(t *testing.T) {
 	e := newEnv(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
 	e.setTasks(valid(task("hourly", "@hourly")))
 	e.clock.Set(time.Date(2026, 11, 6, 17, 30, 0, 0, time.UTC))
 	e.sched.Tick(e.ctx)
-	if n := len(e.runs("hourly")); n != 0 {
-		t.Errorf("%d runs, want 0", n)
+	runs := e.runs("hourly")
+	if len(runs) != 1 || runs[0].Trigger != store.TriggerCatchUp ||
+		!runs[0].ScheduledAt.Equal(time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)) {
+		t.Errorf("runs = %+v, want one catch_up run scheduled at 17:00", runs)
 	}
 	want := time.Date(2026, 11, 6, 18, 0, 0, 0, time.UTC)
 	if got, _ := e.sched.NextFire("hourly"); !got.Equal(want) {
@@ -549,4 +558,194 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// The daemon is down from 12:10 to 17:30 across five hourly fires. On
+// start it catches up once, for the latest missed fire.
+func TestRestartCatchesUpMissedFiresOnce(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 12, 10, 0, 0, time.UTC))
+	e.setTasks(valid(task("hourly", "@hourly")))
+
+	e.clock.Set(time.Date(2026, 11, 6, 17, 30, 0, 0, time.UTC))
+	e.restart()
+	e.setTasks(valid(task("hourly", "@hourly")))
+	wake := e.sched.Tick(e.ctx)
+
+	latest := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	calls := e.starter.Calls()
+	if len(calls) != 1 || calls[0].trigger != store.TriggerCatchUp || !calls[0].scheduledAt.Equal(latest) {
+		t.Fatalf("Start calls = %+v, want one catch_up at %v", calls, latest)
+	}
+	runs := e.runs("hourly")
+	if len(runs) != 1 || runs[0].Trigger != store.TriggerCatchUp {
+		t.Fatalf("runs = %+v, want one catch_up run", runs)
+	}
+	next := time.Date(2026, 11, 6, 18, 0, 0, 0, time.UTC)
+	if !wake.Equal(next) {
+		t.Errorf("Tick wake = %v, want %v", wake, next)
+	}
+	st := e.state("hourly")
+	if st.LastRunID != runs[0].ID || !st.LastFireAt.Equal(latest) || !st.NextFireAt.Equal(next) {
+		t.Errorf("task_state = %+v, want last_run_id %s, last_fire_at %v, next_fire_at %v", st, runs[0].ID, latest, next)
+	}
+	// Later ticks do not catch up again.
+	e.sched.Tick(e.ctx)
+	if n := len(e.starter.Calls()); n != 1 {
+		t.Errorf("%d Start calls after a second tick, want 1", n)
+	}
+}
+
+func TestMissedSkipStartsNothing(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 12, 10, 0, 0, time.UTC))
+	tk := task("hourly", "@hourly")
+	tk.Missed = "skip"
+	e.setTasks(valid(tk))
+
+	e.clock.Set(time.Date(2026, 11, 6, 17, 30, 0, 0, time.UTC))
+	e.restart()
+	e.setTasks(valid(tk))
+	e.sched.Tick(e.ctx) // missed on restart
+	e.clock.Set(time.Date(2026, 11, 6, 20, 30, 0, 0, time.UTC))
+	e.sched.Tick(e.ctx) // missed while running
+	if calls := e.starter.Calls(); len(calls) != 0 {
+		t.Errorf("Start calls = %+v, want none", calls)
+	}
+	want := time.Date(2026, 11, 6, 21, 0, 0, 0, time.UTC)
+	if got := e.state("hourly").NextFireAt; !got.Equal(want) {
+		t.Errorf("next_fire_at = %v, want %v", got, want)
+	}
+}
+
+// The daemon is down from Friday 6 Nov to Saturday 14 Nov 12:00. Only a
+// missed fire in the last 24h (catch_up_window) is caught up: the daily
+// 07:00 fire is, the weekly Friday 07:00 fire (29h old) is not.
+func TestMissedFiresOlderThanCatchUpWindowAreIgnored(t *testing.T) {
+	start := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC) // Friday
+	e := newEnv(t, start)
+	weekly := task("weekly", "0 7 * * 5") // Fridays 07:00
+	weekly.Timezone = "UTC"
+	daily := task("daily", "0 7 * * *")
+	daily.Timezone = "UTC"
+	e.setTasks(valid(weekly, daily))
+	if got, _ := e.sched.NextFire("weekly"); !got.Equal(time.Date(2026, 11, 13, 7, 0, 0, 0, time.UTC)) {
+		t.Fatalf("weekly NextFire = %v", got)
+	}
+
+	e.clock.Set(time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC))
+	e.restart()
+	e.setTasks(valid(weekly, daily))
+	e.sched.Tick(e.ctx)
+
+	if n := len(e.runs("weekly")); n != 0 {
+		t.Errorf("weekly: %d runs, want 0 (missed fire older than 24h)", n)
+	}
+	runs := e.runs("daily")
+	if len(runs) != 1 || runs[0].Trigger != store.TriggerCatchUp ||
+		!runs[0].ScheduledAt.Equal(time.Date(2026, 11, 14, 7, 0, 0, 0, time.UTC)) {
+		t.Errorf("daily runs = %+v, want one catch_up at Saturday 07:00", runs)
+	}
+	if got, _ := e.sched.NextFire("weekly"); !got.Equal(time.Date(2026, 11, 20, 7, 0, 0, 0, time.UTC)) {
+		t.Errorf("weekly NextFire = %v, want next Friday 07:00", got)
+	}
+}
+
+func TestCustomCatchUpWindow(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 12, 10, 0, 0, time.UTC))
+	daily := task("daily", "0 7 * * *")
+	daily.Timezone = "UTC"
+	e.setTasks(valid(daily))
+
+	// Down until Saturday 12:00: the 07:00 fire is 5h old.
+	e.clock.Set(time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC))
+	e.config.CatchUpWindow = config.Duration{Duration: 4 * time.Hour}
+	e.restart()
+	e.setTasks(valid(daily))
+	e.sched.Tick(e.ctx)
+	if n := len(e.runs("daily")); n != 0 {
+		t.Errorf("window 4h: %d runs, want 0", n)
+	}
+
+	// Same outage with a 6h window: caught up.
+	e2 := newEnv(t, time.Date(2026, 11, 6, 12, 10, 0, 0, time.UTC))
+	e2.setTasks(valid(daily))
+	e2.clock.Set(time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC))
+	e2.config.CatchUpWindow = config.Duration{Duration: 6 * time.Hour}
+	e2.restart()
+	e2.setTasks(valid(daily))
+	e2.sched.Tick(e2.ctx)
+	if runs := e2.runs("daily"); len(runs) != 1 || runs[0].Trigger != store.TriggerCatchUp {
+		t.Errorf("window 6h: runs = %+v, want one catch_up", runs)
+	}
+}
+
+// The latest missed fire (17:00) is inside the pause; no catch-up.
+func TestPausedMissedFireIsNotCaughtUp(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 12, 10, 0, 0, time.UTC))
+	tk := task("hourly", "@hourly")
+	e.setTasks(valid(tk))
+
+	e.clock.Set(time.Date(2026, 11, 6, 17, 30, 0, 0, time.UTC))
+	tk.PausedUntil = "2026-11-06T17:15:00Z"
+	e.restart()
+	e.setTasks(valid(tk))
+	e.sched.Tick(e.ctx)
+	if calls := e.starter.Calls(); len(calls) != 0 {
+		t.Errorf("Start calls = %+v, want none", calls)
+	}
+	if got, _ := e.sched.NextFire("hourly"); !got.Equal(time.Date(2026, 11, 6, 18, 0, 0, 0, time.UTC)) {
+		t.Errorf("NextFire = %v, want 18:00", got)
+	}
+}
+
+func TestRestartWithoutMissedFireKeepsStoredNext(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC))
+	every := task("every", "@every 2h")
+	e.setTasks(valid(every))
+	stored := time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)
+
+	e.clock.Set(time.Date(2026, 11, 6, 13, 0, 0, 0, time.UTC))
+	e.restart()
+	e.setTasks(valid(every))
+	wake := e.sched.Tick(e.ctx)
+	if calls := e.starter.Calls(); len(calls) != 0 {
+		t.Errorf("Start calls = %+v, want none", calls)
+	}
+	if !wake.Equal(stored) {
+		t.Errorf("Tick wake = %v, want stored %v (not now+2h)", wake, stored)
+	}
+	if got := e.state("every").NextFireAt; !got.Equal(stored) {
+		t.Errorf("next_fire_at = %v, want %v", got, stored)
+	}
+}
+
+// A Starter that returns a zero run (overlap skipped or queued it) gets
+// nothing recorded for the catch-up.
+func TestCatchUpNotStartedRecordsNothing(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 12, 10, 0, 0, time.UTC))
+	e.setTasks(valid(task("hourly", "@hourly")))
+	e.clock.Set(time.Date(2026, 11, 6, 17, 30, 0, 0, time.UTC))
+	skip := &skipRuns{}
+	e.sched = scheduler.New(scheduler.Options{Clock: e.clock, Store: e.store, Runs: skip,
+		Config: e.config, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	e.setTasks(valid(task("hourly", "@hourly")))
+	e.sched.Tick(e.ctx)
+	if skip.n != 1 {
+		t.Fatalf("%d Start calls, want 1", skip.n)
+	}
+	st := e.state("hourly")
+	if st.LastRunID != "" || !st.LastFireAt.IsZero() {
+		t.Errorf("task_state = %+v, want no last run", st)
+	}
+	if !st.NextFireAt.Equal(time.Date(2026, 11, 6, 18, 0, 0, 0, time.UTC)) {
+		t.Errorf("next_fire_at = %v, want 18:00", st.NextFireAt)
+	}
+}
+
+// skipRuns is a Starter that never starts a run, like a dispatcher whose
+// overlap policy skipped the fire.
+type skipRuns struct{ n int }
+
+func (s *skipRuns) Start(context.Context, config.Task, string, time.Time) (store.Run, error) {
+	s.n++
+	return store.Run{}, nil
 }

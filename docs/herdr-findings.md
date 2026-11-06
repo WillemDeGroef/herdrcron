@@ -88,6 +88,8 @@ Verified on a blocked Claude Code run:
 
 Stop sequence for step 10: `send-keys <pane> esc`, then `send-keys <pane> ctrl+c ctrl+c`, wait 10 s, then `tab close <tab_id>`. Closing the tab kills whatever still runs in it, so the keys are only for a clean exit.
 
+herdrcron sends `ctrl+c ctrl+c` a second time 2 s after the first (the spec's "Ctrl-C twice, 2 s apart"), then waits 10 s, reads the output tail and closes the tab. If the agent already exited, the second pair lands on the shell prompt and does nothing. A stop takes about 12 s.
+
 ## Headless herdr server
 
 - API commands never start a server. With none running they fail with `server_not_running`, exit 1, JSON on stderr.

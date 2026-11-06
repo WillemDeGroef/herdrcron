@@ -820,3 +820,88 @@ func TestRunNeedsOneTaskID(t *testing.T) {
 		}
 	}
 }
+
+func TestRunParallelSetsForceParallel(t *testing.T) {
+	p := xdg(t)
+	var got api.RunNowParams
+	stubDaemon(t, p, map[string]api.HandlerFunc{
+		api.MethodTasksRunNow: func(_ context.Context, params json.RawMessage) (any, error) {
+			if err := json.Unmarshal(params, &got); err != nil {
+				t.Errorf("params %s: %v", params, err)
+			}
+			return api.RunNowResult{RunSummary: api.RunSummary{ID: "01JRUN", TaskID: "nightly", Status: "running"}}, nil
+		},
+	})
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "--parallel", "nightly"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	if got.ID != "nightly" || !got.ForceParallel {
+		t.Errorf("params = %+v, want id nightly with force_parallel", got)
+	}
+}
+
+func TestRunWithActiveRunSuggestsParallel(t *testing.T) {
+	p := xdg(t)
+	stubDaemon(t, p, map[string]api.HandlerFunc{
+		api.MethodTasksRunNow: func(context.Context, json.RawMessage) (any, error) {
+			return nil, &api.Error{Code: api.CodeRunActive, Message: "task nightly has an active run"}
+		},
+	})
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "nightly"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if msg := errOut.String(); !strings.Contains(msg, "active run") || !strings.Contains(msg, "--parallel") {
+		t.Errorf("stderr = %q, want the reason and the --parallel hint", msg)
+	}
+}
+
+func TestRunQueuedSaysSo(t *testing.T) {
+	p := xdg(t)
+	stubDaemon(t, p, map[string]api.HandlerFunc{
+		api.MethodTasksRunNow: func(context.Context, json.RawMessage) (any, error) {
+			return api.RunNowResult{RunSummary: api.RunSummary{TaskID: "nightly"}, Queued: true}, nil
+		},
+	})
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "nightly"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	if got, want := out.String(), "run of nightly queued: it starts when the active run ends or a slot on the target is free\n"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestStopPrintsTheStoppedRun(t *testing.T) {
+	p := xdg(t)
+	var got api.RunsStopParams
+	stubDaemon(t, p, map[string]api.HandlerFunc{
+		api.MethodRunsStop: func(_ context.Context, params json.RawMessage) (any, error) {
+			if err := json.Unmarshal(params, &got); err != nil {
+				t.Errorf("params %s: %v", params, err)
+			}
+			return api.RunSummary{ID: "01JRUN", TaskID: "nightly", Status: "stopped", ExitReason: "stopped by user"}, nil
+		},
+	})
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"stop", "01JRUN"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	if got.RunID != "01JRUN" {
+		t.Errorf("run_id = %q, want 01JRUN", got.RunID)
+	}
+	if got, want := out.String(), "run 01JRUN of nightly: stopped: stopped by user\n"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestStopNeedsOneRunID(t *testing.T) {
+	xdg(t)
+	for _, args := range [][]string{{"stop"}, {"stop", "a", "b"}} {
+		var out, errOut bytes.Buffer
+		if code := run(context.Background(), args, &out, &errOut); code != 2 {
+			t.Errorf("%q: exit %d, want 2", args, code)
+		}
+	}
+}

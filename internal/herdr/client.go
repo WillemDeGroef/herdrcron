@@ -98,6 +98,13 @@ func (c *Client) PaneRun(ctx context.Context, paneID, command string) error {
 	return err
 }
 
+// PaneSendKeys presses keys in the pane, in order, in one call (for
+// example "esc", or "ctrl+c", "ctrl+c"). herdr prints nothing on success.
+func (c *Client) PaneSendKeys(ctx context.Context, paneID string, keys ...string) error {
+	_, err := c.exec(ctx, "pane", "send-keys", append([]string{paneID}, keys...)...)
+	return err
+}
+
 // PaneRead returns the last lines of the pane's text, soft wraps joined.
 func (c *Client) PaneRead(ctx context.Context, paneID string, lines int) (string, error) {
 	out, err := c.exec(ctx, "pane", "read", paneID, "--source", "recent-unwrapped", "--lines", strconv.Itoa(lines))

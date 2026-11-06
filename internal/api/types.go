@@ -6,6 +6,7 @@ const (
 	MethodTasksList   = "tasks.list"
 	MethodTasksRunNow = "tasks.run_now"
 	MethodRunsList    = "runs.list"
+	MethodRunsStop    = "runs.stop"
 
 	MethodTasksSetEnabled = "tasks.set_enabled" // SetEnabledParams → TaskSummary
 	MethodTasksPause      = "tasks.pause"       // PauseParams → TaskSummary
@@ -13,6 +14,11 @@ const (
 	MethodPauseAll        = "pause_all"         // TargetParams → GlobalPause
 	MethodResumeAll       = "resume_all"        // TargetParams → GlobalPause
 )
+
+// CodeRunActive is the error code of "tasks.run_now" for a task with
+// overlap skip and an active run, when force_parallel is not set. Clients
+// ask the user to confirm a parallel run and call again with it set.
+const CodeRunActive = -32001
 
 // DefaultRunsLimit is the runs.list limit when the params give none.
 const DefaultRunsLimit = 50
@@ -102,14 +108,29 @@ type TaskSummary struct {
 	LastRun    *RunSummary `json:"last_run,omitempty"`
 }
 
-// RunNowParams are the params of "tasks.run_now". The result is the
-// RunSummary of the started run: running, or ended as failed with the
-// reason when it could not start.
+// RunNowParams are the params of "tasks.run_now". The run follows the
+// task's overlap: with skip and an active run the call fails with
+// CodeRunActive unless ForceParallel is set.
 type RunNowParams struct {
 	ID string `json:"id"`
-	// ForceParallel starts the run even if the task has an active run.
-	// Accepted but not acted on yet: overlap handling comes later.
+	// ForceParallel starts the run in parallel even if the task has overlap
+	// skip and an active run.
 	ForceParallel bool `json:"force_parallel,omitempty"`
+}
+
+// RunNowResult is the result of "tasks.run_now": the started run (running,
+// or ended as failed with the reason when it could not start), or, with
+// Queued set, only TaskID: the fire waits for the task's active run
+// (overlap queue) or for a free slot on the target (max_parallel).
+type RunNowResult struct {
+	RunSummary
+	Queued bool `json:"queued,omitempty"`
+}
+
+// RunsStopParams are the params of "runs.stop". The result is the
+// RunSummary of the stopped run.
+type RunsStopParams struct {
+	RunID string `json:"run_id"`
 }
 
 // RunsListParams are the params of "runs.list".

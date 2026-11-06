@@ -174,6 +174,23 @@ func TestPaneRun(t *testing.T) {
 	checkArgv(t, f, "herdr", "pane", "run", "w15:p2", cmd)
 }
 
+func TestPaneSendKeys(t *testing.T) {
+	f := &fakeTarget{replies: []reply{ok(nil)}}
+	if err := herdr.New(f, "").PaneSendKeys(context.Background(), "w15:p2", "ctrl+c", "ctrl+c"); err != nil {
+		t.Fatal(err)
+	}
+	checkArgv(t, f, "herdr", "pane", "send-keys", "w15:p2", "ctrl+c", "ctrl+c")
+}
+
+func TestPaneSendKeysPaneNotFound(t *testing.T) {
+	argv := []string{"herdr", "pane", "send-keys", "w1:p9", "esc"}
+	f := &fakeTarget{replies: []reply{exitErr(argv, 1, []byte(`{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"},"id":"cli"}`))}}
+	err := herdr.New(f, "").PaneSendKeys(context.Background(), "w1:p9", "esc")
+	if !herdr.IsCode(err, herdr.CodePaneNotFound) {
+		t.Errorf("err = %v, want pane_not_found", err)
+	}
+}
+
 func TestPaneRead(t *testing.T) {
 	text := "line 1\n  line 2 {\"not\": json}\n$ "
 	f := &fakeTarget{replies: []reply{ok([]byte(text))}}

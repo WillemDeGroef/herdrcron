@@ -215,6 +215,29 @@ func TestListRuns(t *testing.T) {
 	}
 }
 
+func TestListOpenRuns(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	newer := newRun("a", base.Add(time.Hour))
+	older := newRun("b", base.Add(100*time.Millisecond))
+	ended := newRun("a", base)
+	ended.EndedAt, ended.Status = base.Add(time.Minute), store.StatusDone
+	for _, r := range []store.Run{newer, ended, older} {
+		if err := s.InsertRun(ctx, r); err != nil {
+			t.Fatalf("InsertRun: %v", err)
+		}
+	}
+	got, err := s.ListOpenRuns(ctx)
+	if err != nil {
+		t.Fatalf("ListOpenRuns: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != older.ID || got[1].ID != newer.ID {
+		t.Fatalf("ListOpenRuns = %v, want %s then %s", got, older.ID, newer.ID)
+	}
+	assertRunEqual(t, got[0], older)
+}
+
 func TestLastRun(t *testing.T) {
 	s := openStore(t)
 	ctx := context.Background()

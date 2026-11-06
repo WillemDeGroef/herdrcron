@@ -23,8 +23,11 @@ type Config struct {
 	// HistoryDays is how long run history is kept; default 90.
 	HistoryDays int `yaml:"history_days"`
 	// PollInterval is how often active runs are polled; default 15s.
-	PollInterval Duration          `yaml:"poll_interval"`
-	Targets      map[string]Target `yaml:"targets"`
+	PollInterval Duration `yaml:"poll_interval"`
+	// CatchUpWindow is how old a missed fire may be and still be caught
+	// up (missed: run_once); default 24h.
+	CatchUpWindow Duration          `yaml:"catch_up_window"`
+	Targets       map[string]Target `yaml:"targets"`
 }
 
 // DefaultHistoryDays is the history_days default.
@@ -32,6 +35,9 @@ const DefaultHistoryDays = 90
 
 // DefaultPollInterval is the poll_interval default.
 const DefaultPollInterval = 15 * time.Second
+
+// DefaultCatchUpWindow is the catch_up_window default.
+const DefaultCatchUpWindow = 24 * time.Hour
 
 // Location is the time zone of task t: its timezone field, or the config
 // timezone when the task has none.
@@ -83,6 +89,12 @@ func Load(path string) (Config, error) {
 		cfg.PollInterval.Duration = DefaultPollInterval
 	case cfg.PollInterval.Duration < 0:
 		return Config{}, fmt.Errorf("poll_interval must be > 0, got %s", cfg.PollInterval.Duration)
+	}
+	switch {
+	case cfg.CatchUpWindow.Duration == 0:
+		cfg.CatchUpWindow.Duration = DefaultCatchUpWindow
+	case cfg.CatchUpWindow.Duration < 0:
+		return Config{}, fmt.Errorf("catch_up_window must be > 0, got %s", cfg.CatchUpWindow.Duration)
 	}
 	if _, err := time.LoadLocation(cfg.Timezone); err != nil {
 		return Config{}, fmt.Errorf("config timezone %q: %w", cfg.Timezone, err)

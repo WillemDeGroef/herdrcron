@@ -275,23 +275,40 @@ func (s *Store) ListRuns(ctx context.Context, taskID string, limit int) ([]Run, 
 		query += ` LIMIT ?`
 		args = append(args, limit)
 	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	runs, err := s.queryRuns(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
+	}
+	return runs, nil
+}
+
+// ListOpenRuns returns every run that has not ended (no ended_at), oldest
+// first. The daemon recovers them at start.
+func (s *Store) ListOpenRuns(ctx context.Context) ([]Run, error) {
+	runs, err := s.queryRuns(ctx, `SELECT `+runColumns+` FROM runs
+		WHERE ended_at IS NULL ORDER BY started_at, id`)
+	if err != nil {
+		return nil, fmt.Errorf("list open runs: %w", err)
+	}
+	return runs, nil
+}
+
+// queryRuns runs a query that selects runColumns.
+func (s *Store) queryRuns(ctx context.Context, query string, args ...any) ([]Run, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	var runs []Run
 	for rows.Next() {
 		r, err := scanRun(rows)
 		if err != nil {
-			return nil, fmt.Errorf("list runs: %w", err)
+			return nil, err
 		}
 		runs = append(runs, r)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list runs: %w", err)
-	}
-	return runs, nil
+	return runs, rows.Err()
 }
 
 // LastRun returns the newest run of the task by start time. ok is false if

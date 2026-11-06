@@ -39,7 +39,14 @@ const (
 	// defaultServerStartWait is how long a run waits for a herdr server it
 	// started to answer.
 	defaultServerStartWait = 5 * time.Second
+	// stopKeyGap is the wait between the two Ctrl-C pairs of a stop, and
+	// stopGrace the wait after them before the tab is closed.
+	stopKeyGap = 2 * time.Second
+	stopGrace  = 10 * time.Second
 )
+
+// ErrNotActive is returned by Stop for a run the runner does not track.
+var ErrNotActive = errors.New("run is not active")
 
 // promptDir holds the prompt files on the target, one per run.
 const promptDir = "~/.cache/herdrcron/runs/"
@@ -57,6 +64,10 @@ type Options struct {
 	// ServerStartWait is how long to wait for a herdr server the runner
 	// started; zero means 5 s.
 	ServerStartWait time.Duration
+	// OnEnd, if set, is called after a run's end is stored, on every end
+	// path (done, lost, failed, stopped, timeout, failed to start), with no
+	// runner lock held.
+	OnEnd func(ctx context.Context, run store.Run)
 }
 
 // Runner starts and tracks runs. Its methods are safe for concurrent use.
@@ -68,9 +79,18 @@ type Runner struct {
 	log       *slog.Logger
 	waitStart time.Duration
 	targets   map[string]*targetState
+	onEnd     func(context.Context, store.Run)
+
+	// stopCtx is the context of stop sequences: Run cancels it when it
+	// returns, and waits for the stops to give up (the runs stay open for
+	// Recover).
+	stopCtx    context.Context
+	cancelStop context.CancelFunc
+	stops      sync.WaitGroup
 
 	mu     sync.Mutex
 	active map[string]*activeRun // by run id
+	closed bool                  // Run has returned; no new stops
 }
 
 // targetState is a target with its herdr client and preflight cache.
@@ -94,10 +114,23 @@ type checkedAt struct {
 }
 
 // activeRun is the tracking state of a run that has not ended.
+//
+// mu is held by whoever acts on the run (a poll tracking it, or its stop
+// sequence), so a poll and a stop never end it both. Fields of run change
+// with Runner.mu held as well, so ActiveRuns can copy run under Runner.mu
+// alone.
 type activeRun struct {
+	mu   sync.Mutex
 	run  store.Run
 	task config.Task
 	log  *slog.Logger
+
+	// Under Runner.mu.
+	stopping bool          // a stop sequence was started; polls skip the run
+	ended    bool          // the run's end was stored
+	stopDone chan struct{} // closed when the stop sequence returns
+	stopRun  store.Run     // the result of the stop, valid after stopDone
+	stopErr  error
 
 	idlePolls     int  // polls in a row with idle or done
 	sawAgent      bool // herdr detected an agent in the pane at some point
@@ -108,10 +141,11 @@ type activeRun struct {
 func New(o Options) *Runner {
 	r := &Runner{
 		clock: o.Clock, store: o.Store, cfg: o.Config, configDir: o.ConfigDir, log: o.Log,
-		waitStart: o.ServerStartWait,
-		targets:   make(map[string]*targetState, len(o.Targets)),
-		active:    map[string]*activeRun{},
+		waitStart: o.ServerStartWait, onEnd: o.OnEnd,
+		targets: make(map[string]*targetState, len(o.Targets)),
+		active:  map[string]*activeRun{},
 	}
+	r.stopCtx, r.cancelStop = context.WithCancel(context.Background())
 	if r.waitStart <= 0 {
 		r.waitStart = defaultServerStartWait
 	}
@@ -380,6 +414,59 @@ func lastLine(s string) string {
 	return strings.TrimSpace(lines[len(lines)-1])
 }
 
+// Recover takes over the runs a previous daemon left open (no ended_at),
+// as the spec's recovery says: a run whose pane still exists is tracked
+// again from step 7, a run whose pane is gone is lost, and a run on a
+// target that does not answer stays open for the next poll. A run on a
+// target that is no longer configured is lost; a run still starting (the
+// daemon stopped during its launch, before the agent ran) failed. Only reading the open runs
+// can fail Recover. tasks gives each run's task by
+// id; a run of a task that is gone is tracked with no timeout.
+func (r *Runner) Recover(ctx context.Context, tasks []config.Task) error {
+	runs, err := r.store.ListOpenRuns(ctx)
+	if err != nil {
+		return fmt.Errorf("recover: %w", err)
+	}
+	byID := make(map[string]config.Task, len(tasks))
+	for _, t := range tasks {
+		byID[t.ID] = t
+	}
+	var targets []string
+	for _, run := range runs {
+		if r.Active(run.ID) {
+			continue
+		}
+		t, ok := byID[run.TaskID]
+		if !ok {
+			t = config.Task{ID: run.TaskID, Target: run.Target}
+		}
+		a := &activeRun{run: run, task: t, log: logging.ForRun(r.log, run.ID, run.TaskID, run.Target)}
+		a.log.Info("recovering run", "status", run.Status, "started_at", run.StartedAt, "herdr_pane", run.HerdrPane)
+		var err error
+		switch {
+		case r.targets[run.Target] == nil:
+			_, err = r.end(ctx, a, store.StatusLost, "target "+run.Target+" not configured")
+		case run.Status == store.StatusStarting:
+			// The agent was never launched; end closes the tab if there is one.
+			_, err = r.end(ctx, a, store.StatusFailed, "daemon stopped during launch")
+		default:
+			r.mu.Lock()
+			r.active[run.ID] = a
+			r.mu.Unlock()
+			if !slices.Contains(targets, run.Target) {
+				targets = append(targets, run.Target)
+			}
+		}
+		if err != nil {
+			a.log.Error("cannot store run end", "err", err)
+		}
+	}
+	for _, name := range targets {
+		r.PollTarget(ctx, name)
+	}
+	return nil
+}
+
 // Active reports whether the run is being tracked.
 func (r *Runner) Active(runID string) bool {
 	r.mu.Lock()
@@ -390,12 +477,13 @@ func (r *Runner) Active(runID string) bool {
 
 // PollTarget runs step 7 once for every active run on the target: one
 // `herdr pane list` covers them all. Panes without an agent get one
-// `pane process-info` each, to see whether the command has ended.
+// `pane process-info` each, to see whether the command has ended. Runs
+// being stopped are skipped: the stop decides their end.
 func (r *Runner) PollTarget(ctx context.Context, name string) {
 	r.mu.Lock()
 	var runs []*activeRun
 	for _, a := range r.active {
-		if a.run.Target == name {
+		if a.run.Target == name && !a.stopping {
 			runs = append(runs, a)
 		}
 	}
@@ -406,7 +494,34 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 	}
 	slices.SortFunc(runs, func(a, b *activeRun) int { return strings.Compare(a.run.ID, b.run.ID) })
 
+	// Step 8, before the pane list: the timeout counts while the target
+	// does not answer.
+	now := r.clock.Now()
+	runs = slices.DeleteFunc(runs, func(a *activeRun) bool {
+		d := a.task.Timeout.Duration
+		if d <= 0 || now.Before(a.run.StartedAt.Add(d)) {
+			return false
+		}
+		r.beginStop(a, store.StatusTimeout, "timeout after "+formatDuration(d))
+		return true
+	})
+	if len(runs) == 0 {
+		return
+	}
+
 	panes, err := ts.herdr.PaneList(ctx)
+	if herdr.IsCode(err, herdr.CodeServerNotRunning) {
+		// The server and every pane in it are gone (a host reboot, say).
+		// The next launch must start the server again.
+		ts.mu.Lock()
+		ts.serverUntil = time.Time{}
+		ts.mu.Unlock()
+		ctx = context.WithoutCancel(ctx)
+		for _, a := range runs {
+			r.pollRun(a, func() { r.finish(ctx, ts, a, store.StatusLost, "herdr server not running") })
+		}
+		return
+	}
 	if err != nil {
 		// Unreachable targets and backoff are a later ticket; the runs stay
 		// open and the next poll tries again. One line per run so each
@@ -424,13 +539,29 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 		byID[p.PaneID] = p
 	}
 	for _, a := range runs {
-		p, ok := byID[a.run.HerdrPane]
-		if !ok {
-			r.finish(ctx, ts, a, store.StatusLost, "pane gone")
-			continue
-		}
-		r.track(ctx, ts, a, p)
+		r.pollRun(a, func() {
+			p, ok := byID[a.run.HerdrPane]
+			if !ok {
+				r.finish(ctx, ts, a, store.StatusLost, "pane gone")
+				return
+			}
+			r.track(ctx, ts, a, p)
+		})
 	}
+}
+
+// pollRun applies the poll's result to one run with a.mu held, unless a
+// stop started since the poll began or the run has ended.
+func (r *Runner) pollRun(a *activeRun, apply func()) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	r.mu.Lock()
+	skip := a.stopping || a.ended
+	r.mu.Unlock()
+	if skip {
+		return
+	}
+	apply()
 }
 
 // track maps one pane sample to the run's state.
@@ -465,13 +596,20 @@ func (r *Runner) track(ctx context.Context, ts *targetState, a *activeRun, p her
 		// Unknown status with an agent: running, as the spec says.
 		a.idlePolls, status = 0, store.StatusRunning
 	}
-	if status == a.run.Status {
-		return
+	if status != a.run.Status {
+		a.log.Info("run status changed", "from", a.run.Status, "to", status, "agent_status", p.AgentStatus)
+		r.mu.Lock()
+		a.run.Status = status
+		r.mu.Unlock()
+		if err := r.store.UpdateRun(ctx, a.run); err != nil {
+			a.log.Error("cannot store run status", "err", err)
+		}
 	}
-	a.log.Info("run status changed", "from", a.run.Status, "to", status, "agent_status", p.AgentStatus)
-	a.run.Status = status
-	if err := r.store.UpdateRun(ctx, a.run); err != nil {
-		a.log.Error("cannot store run status", "err", err)
+	// On every blocked sample, not only on the change: a run recovered as
+	// blocked has no change. Polls skip a run being stopped, and beginStop
+	// starts at most one stop. Notifying on blocked is a later ticket.
+	if status == store.StatusBlocked && a.task.OnBlocked == "stop" {
+		r.beginStop(a, store.StatusStopped, "blocked (on_blocked: stop)")
 	}
 }
 
@@ -499,7 +637,9 @@ func (r *Runner) finish(ctx context.Context, ts *targetState, a *activeRun, stat
 		if err != nil {
 			a.log.Warn("cannot read pane output", "err", err)
 		}
+		r.mu.Lock()
 		a.run.OutputTail = tail
+		r.mu.Unlock()
 	}
 	if _, err := r.end(ctx, a, status, reason); err != nil {
 		a.log.Error("cannot store run end", "err", err)
@@ -512,13 +652,18 @@ func (r *Runner) finish(ctx context.Context, ts *targetState, a *activeRun, stat
 func (r *Runner) end(ctx context.Context, a *activeRun, status, reason string) (store.Run, error) {
 	r.mu.Lock()
 	delete(r.active, a.run.ID)
+	a.ended = true
 	r.mu.Unlock()
+	// Out of the active map, a.run is no longer read by ActiveRuns.
 	failedToStart := a.run.Status == store.StatusStarting
 	a.run.Status, a.run.ExitReason, a.run.EndedAt = status, reason, r.clock.Now()
 	err := r.store.UpdateRun(ctx, a.run)
 	a.log.Info("run ended", "status", status, "exit_reason", reason)
+	if r.onEnd != nil {
+		defer r.onEnd(ctx, a.run)
+	}
 
-	ts := r.targets[a.task.Target]
+	ts := r.targets[a.run.Target]
 	if ts == nil {
 		return a.run, err
 	}
@@ -537,9 +682,157 @@ func (r *Runner) end(ctx context.Context, a *activeRun, status, reason string) (
 	return a.run, err
 }
 
+// Stop stops an active run at the user's request (step 10): status
+// stopped, reason "stopped by user". It blocks until the stop sequence has
+// finished and returns the ended run. A run already being stopped is not
+// stopped twice: Stop waits for that stop and returns its result. A run the
+// runner does not track gives ErrNotActive.
+func (r *Runner) Stop(ctx context.Context, runID string) (store.Run, error) {
+	r.mu.Lock()
+	a, ok := r.active[runID]
+	if !ok {
+		r.mu.Unlock()
+		return store.Run{}, fmt.Errorf("stop %s: %w", runID, ErrNotActive)
+	}
+	started := r.beginStopLocked(a, store.StatusStopped, "stopped by user")
+	r.mu.Unlock()
+	if !started {
+		return store.Run{}, fmt.Errorf("stop %s: runner is shutting down", runID)
+	}
+	select {
+	case <-a.stopDone:
+		return a.stopRun, a.stopErr
+	case <-ctx.Done():
+		return store.Run{}, ctx.Err()
+	}
+}
+
+// beginStop starts the stop sequence of a in its own goroutine, unless one
+// is already running.
+func (r *Runner) beginStop(a *activeRun, status, reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.beginStopLocked(a, status, reason)
+}
+
+// beginStopLocked is beginStop with r.mu held. It reports whether a stop
+// is running for a: false once Run has returned.
+func (r *Runner) beginStopLocked(a *activeRun, status, reason string) bool {
+	if a.stopping {
+		return true
+	}
+	if r.closed {
+		return false
+	}
+	a.stopping = true
+	a.stopDone = make(chan struct{})
+	r.stops.Add(1)
+	go func() {
+		defer r.stops.Done()
+		run, err := r.stop(r.stopCtx, a, status, reason)
+		r.mu.Lock()
+		a.stopRun, a.stopErr = run, err
+		r.mu.Unlock()
+		close(a.stopDone)
+	}()
+	return true
+}
+
+// stop runs step 10 as adapted in docs/herdr-findings.md: esc (dismisses a
+// question dialog), Ctrl-C twice in one call (exits Claude Code), again
+// after 2 s, then after 10 s the output tail is read and the tab closed,
+// whatever on_done says. Key, read and close errors are logged and do not
+// keep the run from ending. If ctx ends during a wait (the daemon stops),
+// the run stays open for Recover.
+func (r *Runner) stop(ctx context.Context, a *activeRun, status, reason string) (store.Run, error) {
+	// Wait for a poll that is tracking the run; it may have ended it.
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	r.mu.Lock()
+	ended := a.ended
+	r.mu.Unlock()
+	if ended {
+		return a.run, nil
+	}
+	ts := r.targets[a.run.Target]
+	if ts == nil {
+		return r.end(context.WithoutCancel(ctx), a, status, reason)
+	}
+	a.log.Info("stopping run", "status", status, "exit_reason", reason)
+	pane := a.run.HerdrPane
+	keys := func(k ...string) {
+		if err := ts.herdr.PaneSendKeys(ctx, pane, k...); err != nil {
+			a.log.Warn("cannot send keys", "keys", strings.Join(k, " "), "err", err)
+		}
+	}
+	keys("esc")
+	keys("ctrl+c", "ctrl+c")
+	if err := r.sleep(ctx, stopKeyGap); err != nil {
+		a.log.Warn("stop interrupted; run left open", "err", err)
+		return a.run, err
+	}
+	keys("ctrl+c", "ctrl+c")
+	if err := r.sleep(ctx, stopGrace); err != nil {
+		a.log.Warn("stop interrupted; run left open", "err", err)
+		return a.run, err
+	}
+	// From here the stop is quick and must be stored.
+	ctx = context.WithoutCancel(ctx)
+	tail, err := ts.herdr.PaneRead(ctx, pane, tailLines)
+	if err != nil {
+		a.log.Warn("cannot read pane output", "err", err)
+	}
+	r.mu.Lock()
+	a.run.OutputTail = tail
+	r.mu.Unlock()
+	if a.run.HerdrTab != "" {
+		if err := ts.herdr.TabClose(ctx, a.run.HerdrTab); err != nil && !herdr.IsCode(err, herdr.CodeTabNotFound) {
+			a.log.Warn("cannot close tab", "herdr_tab", a.run.HerdrTab, "err", err)
+		}
+	}
+	return r.end(ctx, a, status, reason)
+}
+
+// sleep waits d on the runner's clock, or returns ctx's error.
+func (r *Runner) sleep(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.clock.After(d):
+		return nil
+	}
+}
+
+// ActiveRuns returns a snapshot of every tracked run, on any target,
+// including runs being stopped, oldest first.
+func (r *Runner) ActiveRuns() []store.Run {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]store.Run, 0, len(r.active))
+	for _, a := range r.active {
+		out = append(out, a.run)
+	}
+	slices.SortFunc(out, func(a, b store.Run) int {
+		if c := a.StartedAt.Compare(b.StartedAt); c != 0 {
+			return c
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	return out
+}
+
 // Run polls every target with active runs each poll_interval until ctx is
-// done: one worker per target.
+// done: one worker per target. Before it returns it cancels the stop
+// sequences in flight and waits for them; their runs stay open, and no new
+// stop starts. A Runner runs once.
 func (r *Runner) Run(ctx context.Context) {
+	defer func() {
+		r.mu.Lock()
+		r.closed = true
+		r.mu.Unlock()
+		r.cancelStop()
+		r.stops.Wait()
+	}()
 	interval := r.cfg.PollInterval.Duration
 	if interval <= 0 {
 		interval = config.DefaultPollInterval
@@ -560,4 +853,16 @@ func (r *Runner) Run(ctx context.Context) {
 		}()
 	}
 	wg.Wait()
+}
+
+// formatDuration is d without zero trailing units: 2h, 1h30m, 45s.
+func formatDuration(d time.Duration) string {
+	s := d.String()
+	if strings.HasSuffix(s, "m0s") {
+		s = strings.TrimSuffix(s, "0s")
+	}
+	if strings.HasSuffix(s, "h0m") {
+		s = strings.TrimSuffix(s, "0m")
+	}
+	return s
 }
