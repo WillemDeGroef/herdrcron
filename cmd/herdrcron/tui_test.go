@@ -88,7 +88,7 @@ func TestTUIShowsHandEditWithin2s(t *testing.T) {
 	waitFor("@daily", 5*time.Second)
 
 	write(t, file, "id: nightly\ntarget: local\nschedule: \"17 3 * * *\"\nagent: {command: claude}\ntimeout: 1h\n")
-	waitFor("17 3 * * *", 2*time.Second)
+	waitFor("03:17 daily", 2*time.Second)
 
 	tm.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
 	tm.WaitFinished(t, teatest.WithFinalTimeout(3*time.Second))

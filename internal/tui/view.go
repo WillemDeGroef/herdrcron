@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,9 @@ func newStyles(r *lipgloss.Renderer) styles {
 const keyHelp = "space on/off  p pause  P pause all  r run now  s stop  / filter  g group  ? help  q quit"
 
 var columns = []string{"TARGET", "TASK", "SCHEDULE", "STATE", "LAST", "NEXT"}
+
+// lastColumn is the index of LAST in columns.
+const lastColumn = 4
 
 const gap = "  "
 
@@ -155,7 +159,31 @@ func (m Model) banner() string {
 
 // cells returns the column texts of t.
 func (m Model) cells(t api.TaskSummary) []string {
-	return []string{orDash(t.Target), t.ID, orDash(t.Schedule), stateText(t.State), m.lastText(t.LastRun), m.nextText(t)}
+	return []string{orDash(t.Target), t.ID, orDash(scheduleText(t.Schedule)), stateText(t.State), m.lastText(t.LastRun), m.nextText(t)}
+}
+
+// scheduleText shows the common cron forms as the spec mockup does:
+// "0 2 * * *" as "02:00 daily", "0 7 * * 1" as "Mon 07:00". Anything else
+// is shown as written.
+func scheduleText(s string) string {
+	f := strings.Fields(s)
+	if len(f) != 5 || f[2] != "*" || f[3] != "*" {
+		return s
+	}
+	minute, errM := strconv.Atoi(f[0])
+	hour, errH := strconv.Atoi(f[1])
+	if errM != nil || errH != nil || minute < 0 || minute > 59 || hour < 0 || hour > 23 {
+		return s
+	}
+	clock := fmt.Sprintf("%02d:%02d", hour, minute)
+	if f[4] == "*" {
+		return clock + " daily"
+	}
+	day, err := strconv.Atoi(f[4])
+	if err != nil || day < 0 || day > 7 {
+		return s
+	}
+	return time.Weekday(day % 7).String()[:3] + " " + clock
 }
 
 func stateText(s string) string {
@@ -181,7 +209,7 @@ func (m Model) lastText(r *api.RunSummary) string {
 		at = r.StartedAt
 	}
 	mark := "✗"
-	if r.Status == "done" {
+	if r.Status == runDone {
 		mark = "✓"
 	}
 	t, err := time.Parse(time.RFC3339, at)
@@ -223,7 +251,7 @@ func (m Model) when(s string) string {
 
 // critical reports whether the last run ended badly enough to show red.
 func critical(r *api.RunSummary) bool {
-	return r != nil && (r.Status == "failed" || r.Status == "timeout")
+	return r != nil && (r.Status == runFailed || r.Status == runTimeout)
 }
 
 // rowStyle is the colour of a task's row.
@@ -310,7 +338,7 @@ func (m Model) taskLine(t api.TaskSummary, cells []string, width []int, selected
 	parts := make([]string, len(cells))
 	for i, c := range cells {
 		s := base
-		if i == 4 && critical(t.LastRun) {
+		if i == lastColumn && critical(t.LastRun) {
 			s = m.st.critical.Inherit(base)
 		}
 		text := pad(c, width[i])

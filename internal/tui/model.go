@@ -67,7 +67,9 @@ type Model struct {
 	height   int
 	loaded   bool
 	connErr  string // why the TUI has no live connection to the daemon; empty when it has
+	gen      int    // generation of the current subscription
 	events   <-chan api.Notification
+	cancel   context.CancelFunc // ends the current subscription
 	status   api.StatusResult
 	statusAt time.Time // when status was read, for the uptime
 	tasks    map[string]api.TaskSummary
@@ -125,23 +127,34 @@ func New(o Options) Model {
 
 // Messages.
 type (
-	subscribedMsg struct{ events <-chan api.Notification }
-	streamErrMsg  struct{ err error }
-	eventMsg      struct{ n api.Notification }
-	reconnectMsg  struct{}
-	refreshMsg    struct{}
-	loadedMsg     struct {
+	// The stream messages carry the generation of the subscription they
+	// belong to; those of an abandoned subscription are dropped.
+	subscribedMsg struct {
+		gen    int
+		events <-chan api.Notification
+		cancel context.CancelFunc
+	}
+	streamErrMsg struct {
+		gen int
+		err error
+	}
+	eventMsg struct {
+		gen int
+		n   api.Notification
+	}
+	reconnectMsg struct{}
+	refreshMsg   struct{}
+	loadedMsg    struct {
 		status api.StatusResult
 		tasks  []api.TaskSummary
 		runs   []api.RunSummary
 	}
 	statusMsg struct{ status api.StatusResult }
-	// doneMsg reports a finished action: text for the message line, the
-	// task the daemon returned (if any), and whether to re-read the state.
+	// doneMsg reports a finished action: text for the message line and
+	// whether to re-read the state. Changed tasks arrive on the stream.
 	doneMsg struct {
 		text   string
 		err    error
-		task   *api.TaskSummary
 		reload bool
 	}
 	// runActiveMsg is a run_now refused because the task already runs.
@@ -153,43 +166,47 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(m.subscribe(), tea.Tick(refreshEvery, func(time.Time) tea.Msg { return refreshMsg{} }))
 }
 
+// subscribe opens subscription generation m.gen, on a context of its own
+// so that abandoning it closes its connection.
 func (m Model) subscribe() tea.Cmd {
-	ctx, b := m.ctx, m.backend
+	parent, b, gen := m.ctx, m.backend, m.gen
 	return func() tea.Msg {
+		ctx, cancel := context.WithCancel(parent)
 		ch, err := b.Subscribe(ctx)
 		if err != nil {
-			return streamErrMsg{err}
+			cancel()
+			return streamErrMsg{gen, err}
 		}
-		return subscribedMsg{ch}
+		return subscribedMsg{gen, ch, cancel}
 	}
 }
 
-func waitEvent(ch <-chan api.Notification) tea.Cmd {
+func waitEvent(gen int, ch <-chan api.Notification) tea.Cmd {
 	return func() tea.Msg {
 		n, ok := <-ch
 		if !ok {
-			return streamErrMsg{fmt.Errorf("lost the connection to the daemon")}
+			return streamErrMsg{gen, fmt.Errorf("lost the connection to the daemon")}
 		}
-		return eventMsg{n}
+		return eventMsg{gen, n}
 	}
 }
 
 // load reads the whole state. It runs after subscribing, so no change
 // falls between the two.
 func (m Model) load() tea.Cmd {
-	ctx, b := m.ctx, m.backend
+	ctx, b, gen := m.ctx, m.backend, m.gen
 	return func() tea.Msg {
 		var msg loadedMsg
 		if err := b.Call(ctx, api.MethodStatus, nil, &msg.status); err != nil {
-			return streamErrMsg{err}
+			return streamErrMsg{gen, err}
 		}
 		var tl api.TasksListResult
 		if err := b.Call(ctx, api.MethodTasksList, nil, &tl); err != nil {
-			return streamErrMsg{err}
+			return streamErrMsg{gen, err}
 		}
 		var rl api.RunsListResult
 		if err := b.Call(ctx, api.MethodRunsList, api.RunsListParams{Limit: runsListLimit}, &rl); err != nil {
-			return streamErrMsg{err}
+			return streamErrMsg{gen, err}
 		}
 		msg.tasks, msg.runs = tl.Tasks, rl.Runs
 		return msg
@@ -220,11 +237,23 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 	case subscribedMsg:
-		m.events = msg.events
-		return m, tea.Batch(waitEvent(msg.events), m.load())
+		if msg.gen != m.gen {
+			msg.cancel()
+			return m, nil
+		}
+		m.events, m.cancel = msg.events, msg.cancel
+		return m, tea.Batch(waitEvent(m.gen, msg.events), m.load())
 	case streamErrMsg:
+		if msg.gen != m.gen {
+			return m, nil
+		}
+		// Abandon this subscription; the next generation starts afresh.
+		if m.cancel != nil {
+			m.cancel()
+		}
 		m.connErr = msg.err.Error()
-		m.events = nil
+		m.events, m.cancel = nil, nil
+		m.gen++
 		return m, tea.Tick(reconnectDelay, func(time.Time) tea.Msg { return reconnectMsg{} })
 	case reconnectMsg:
 		return m, m.subscribe()
@@ -241,15 +270,12 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, tea.Batch(next, m.loadStatus())
 	case eventMsg:
-		m.applyEvent(msg.n)
-		if m.events == nil {
+		if msg.gen != m.gen {
 			return m, nil
 		}
-		return m, waitEvent(m.events)
+		m.applyEvent(msg.n)
+		return m, waitEvent(m.gen, m.events)
 	case doneMsg:
-		if msg.task != nil {
-			m.tasks[msg.task.ID] = *msg.task
-		}
 		m.setMessage(msg.text, msg.err)
 		if msg.reload {
 			return m, m.load()
@@ -316,9 +342,19 @@ func (m *Model) applyEvent(n api.Notification) {
 	}
 }
 
+// Run statuses the TUI tells apart (the "status" of api.RunSummary).
+const (
+	runStarting = "starting"
+	runRunning  = "running"
+	runBlocked  = "blocked"
+	runDone     = "done"
+	runFailed   = "failed"
+	runTimeout  = "timeout"
+)
+
 // activeStatus reports whether a run in status s is still going.
 func activeStatus(s string) bool {
-	return s == "starting" || s == "running" || s == "blocked"
+	return s == runStarting || s == runRunning || s == runBlocked
 }
 
 // noteRun records r in the active runs, or drops it once it ended.
@@ -333,10 +369,14 @@ func (m *Model) noteRun(r api.RunSummary) {
 	m.active[r.TaskID][r.ID] = r
 }
 
-// activeRun returns the newest active run of task id.
+// activeRun returns the newest active run of task id: from the runs seen,
+// or else the task's last run if that is still going.
 func (m Model) activeRun(id string) (api.RunSummary, bool) {
 	var best api.RunSummary
 	found := false
+	if t, ok := m.tasks[id]; ok && t.LastRun != nil && activeStatus(t.LastRun.Status) {
+		best, found = *t.LastRun, true
+	}
 	for _, r := range m.active[id] {
 		if !found || r.StartedAt > best.StartedAt || (r.StartedAt == best.StartedAt && r.ID > best.ID) {
 			best, found = r, true

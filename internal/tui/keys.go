@@ -89,6 +89,11 @@ func (m Model) listKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if t.PausedUntil != "" {
 			return m, m.resume(t.ID)
 		}
+		if t.State == api.StatePaused && t.Enabled {
+			// Paused only by a global pause: tasks.resume cannot lift it.
+			m.setMessage(t.ID+" is paused by a global pause; P resumes it", nil)
+			return m, nil
+		}
 		m.mode = modePauseMenu
 	case "r":
 		return m, m.runNow(t.ID, false)
@@ -259,11 +264,10 @@ func (m Model) resume(id string) tea.Cmd {
 func (m Model) taskCall(method string, params any, text string) tea.Cmd {
 	ctx, b := m.ctx, m.backend
 	return func() tea.Msg {
-		var t api.TaskSummary
-		if err := b.Call(ctx, method, params, &t); err != nil {
+		if err := b.Call(ctx, method, params, nil); err != nil {
 			return doneMsg{err: fmt.Errorf("%s: %w", method, err)}
 		}
-		return doneMsg{text: text, task: &t}
+		return doneMsg{text: text}
 	}
 }
 
@@ -293,7 +297,7 @@ func (m Model) runNow(id string, parallel bool) tea.Cmd {
 		switch {
 		case res.Queued:
 			return doneMsg{text: "queued a run of " + id}
-		case res.Status == "failed":
+		case res.Status == runFailed:
 			return doneMsg{err: fmt.Errorf("run %s failed to start: %s", id, res.ExitReason)}
 		}
 		return doneMsg{text: "started run " + res.ID + " of " + id}
@@ -303,8 +307,7 @@ func (m Model) runNow(id string, parallel bool) tea.Cmd {
 func (m Model) stop(id, runID string) tea.Cmd {
 	ctx, b := m.ctx, m.backend
 	return func() tea.Msg {
-		var r api.RunSummary
-		if err := b.Call(ctx, api.MethodRunsStop, api.RunsStopParams{RunID: runID}, &r); err != nil {
+		if err := b.Call(ctx, api.MethodRunsStop, api.RunsStopParams{RunID: runID}, nil); err != nil {
 			return doneMsg{err: fmt.Errorf("stop %s: %w", runID, err)}
 		}
 		return doneMsg{text: "stopped run " + runID + " of " + id}

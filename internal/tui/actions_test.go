@@ -336,7 +336,7 @@ func TestEventsUpdateTheList(t *testing.T) {
 	tm := start(t, newTestModel(f, plain()))
 	f.push(t, api.EventTaskChanged, api.TaskChangedEvent{ID: "peppol-sh-deps", Task: &api.TaskSummary{
 		ID: "peppol-sh-deps", Target: "local", Schedule: "30 6 * * 2", State: api.StateIdle, Enabled: true}})
-	waitText(t, tm, "30 6 * * 2")
+	waitText(t, tm, "Tue 06:30")
 	f.push(t, api.EventTaskChanged, api.TaskChangedEvent{ID: "brand-new", Task: &api.TaskSummary{
 		ID: "brand-new", Target: "local", Schedule: "@daily", State: api.StateIdle, Enabled: true}})
 	waitText(t, tm, "brand-new")
@@ -418,5 +418,31 @@ func TestLongListScrollsToTheCursor(t *testing.T) {
 	}
 	if !strings.Contains(view, "q quit") {
 		t.Errorf("footer scrolled away:\n%s", view)
+	}
+}
+
+func TestPOnGloballyPausedTaskPointsToP(t *testing.T) {
+	f := fixture()
+	tasks := f.results[api.MethodTasksList].(api.TasksListResult)
+	tasks.Tasks[0].State = api.StatePaused // peppol-sh-deps, paused only by a global pause
+	f.set(api.MethodTasksList, tasks)
+	tm := start(t, newTestModel(f, plain()))
+	selectTask(t, tm, order, "peppol-sh-deps")
+	tm.Send(key("p"))
+	waitText(t, tm, "P resumes it")
+	finalView(t, tm)
+	if got := f.callsOf(api.MethodTasksResume); len(got) != 0 {
+		t.Fatalf("resume called: %+v", got)
+	}
+}
+
+func TestScheduleText(t *testing.T) {
+	for in, want := range map[string]string{
+		"0 7 * * 1": "Mon 07:00", "30 2 * * *": "02:30 daily", "0 9 * * 0": "Sun 09:00", "0 9 * * 7": "Sun 09:00",
+		"*/30 * * * *": "*/30 * * * *", "@every 2h": "@every 2h", "0 7 1 * *": "0 7 1 * *", "0 7 * * 1-5": "0 7 * * 1-5",
+	} {
+		if got := scheduleText(in); got != want {
+			t.Errorf("scheduleText(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
