@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/WillemDeGroef/herdrcron/internal/api"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
 )
 
@@ -87,13 +88,13 @@ func TestDaemonAndList(t *testing.T) {
 	if len(lines) != 4 {
 		t.Fatalf("want header + 3 tasks, got:\n%s", out.String())
 	}
-	for _, col := range []string{"ID", "TARGET", "SCHEDULE", "STATE"} {
+	for _, col := range []string{"ID", "TARGET", "SCHEDULE", "STATE", "LAST", "NEXT"} {
 		if !strings.Contains(lines[0], col) {
 			t.Errorf("header %q lacks %s", lines[0], col)
 		}
 	}
 	wantRows := [][]string{
-		{"broken", "mars", "@daily", `invalid: unknown target "mars"`},
+		{"broken", "mars", "@daily", "invalid", `unknown target "mars"`},
 		{"nightly", "local", "@daily", "idle"},
 		{"parked", "local", "*/2 * * * *", "off"},
 	}
@@ -113,6 +114,45 @@ func TestUnknownCommand(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "usage") {
 		t.Errorf("stderr = %q", errOut.String())
+	}
+}
+
+func TestPrintTasksShowsLastAndNext(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Brussels")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	tasks := []api.TaskSummary{
+		{ID: "weekly", Target: "local", Schedule: "0 7 * * 1", State: "idle",
+			NextFireAt: "2026-11-09T06:00:00Z",
+			LastRun:    &api.RunSummary{Status: "done", StartedAt: "2026-11-03T06:00:00Z"}},
+		{ID: "fresh", Target: "local", Schedule: "@hourly", State: "idle", NextFireAt: "2026-11-06T13:00:00Z",
+			LastRun: &api.RunSummary{Status: "failed", StartedAt: "2026-11-06T11:58:00Z"}},
+		{ID: "parked", Target: "vps", Schedule: "@daily", State: "off"},
+		{ID: "broken", State: "invalid", Error: `unknown target "mars"`},
+	}
+	var out bytes.Buffer
+	if err := printTasks(&out, tasks, now, loc); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	wantRows := [][]string{
+		{"ID", "TARGET", "SCHEDULE", "STATE", "LAST", "NEXT"},
+		{"weekly", "idle", "done 3d ago", "Mon 09 Nov 07:00"},
+		{"fresh", "failed 2m ago", "Fri 06 Nov 14:00"},
+		{"parked", "off", "-"},
+		{"broken", "invalid", `unknown target "mars"`},
+	}
+	if len(lines) != len(wantRows) {
+		t.Fatalf("got %d lines, want %d:\n%s", len(lines), len(wantRows), out.String())
+	}
+	for i, cells := range wantRows {
+		for _, c := range cells {
+			if !strings.Contains(lines[i], c) {
+				t.Errorf("line %d %q lacks %q", i, lines[i], c)
+			}
+		}
 	}
 }
 

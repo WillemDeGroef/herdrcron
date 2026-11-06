@@ -85,6 +85,32 @@ func TestValidTaskLoads(t *testing.T) {
 	}
 }
 
+func TestPausedUntilValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{name: "null", yaml: "paused_until: null\n", want: ""},
+		{name: "omitted", yaml: "", want: ""},
+		{name: "indefinite", yaml: "paused_until: indefinite\n", want: "indefinite"},
+		{name: "rfc3339", yaml: "paused_until: 2026-11-06T14:30:00Z\n", want: "2026-11-06T14:30:00Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.task("peppol-sh-deps.yaml", validTask+tc.yaml)
+			f.prompt("peppol-sh-deps.md")
+			e := f.only()
+			if e.Err != nil {
+				t.Fatalf("unexpected error: %v", e.Err)
+			}
+			if e.Task.PausedUntil != tc.want {
+				t.Errorf("paused_until = %q, want %q", e.Task.PausedUntil, tc.want)
+			}
+		})
+	}
+}
+
 func TestPromptFileDefaultsToPromptsDirByID(t *testing.T) {
 	f := newFixture(t)
 	f.task("peppol-sh-deps.yaml", strings.Replace(validTask, "prompt_file: prompts/peppol-sh-deps.md\n", "", 1))
@@ -229,6 +255,11 @@ func TestValidationRules(t *testing.T) {
 			name:    "overlap must be a known mode",
 			edit:    func(s string) string { return s + "overlap: sometimes\n" },
 			wantErr: "overlap",
+		},
+		{
+			name:    "paused_until must be a known value",
+			edit:    func(s string) string { return s + "paused_until: tomorrow\n" },
+			wantErr: "paused_until",
 		},
 		{
 			name:    "malformed yaml",

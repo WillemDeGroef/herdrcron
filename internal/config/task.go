@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/robfig/cron/v3"
+	"github.com/WillemDeGroef/herdrcron/internal/schedule"
 	"gopkg.in/yaml.v3"
 )
 
@@ -176,6 +176,9 @@ func Validate(t Task, fileID, configDir string, cfg Config) error {
 	if t.Timeout.Duration <= 0 {
 		p = append(p, "timeout must be > 0")
 	}
+	if err := checkPausedUntil(t.PausedUntil); err != nil {
+		p = append(p, err.Error())
+	}
 	for _, f := range []struct{ key, val string }{
 		{"overlap", t.Overlap}, {"missed", t.Missed}, {"on_done", t.OnDone}, {"on_blocked", t.OnBlocked},
 	} {
@@ -189,29 +192,45 @@ func Validate(t Task, fileID, configDir string, cfg Config) error {
 	return &ValidationError{Problems: p}
 }
 
-// minEvery is the shortest @every interval: a run is a whole agent session.
-const minEvery = time.Minute
-
 // checkSchedule accepts a 5-field cron expression or a descriptor (@every
-// <duration>, @daily, @hourly, ...). The time zone comes from the task's
-// timezone field, so a CRON_TZ= prefix is refused.
+// <duration>, @daily, @hourly, ...); see package schedule.
 func checkSchedule(s string) error {
-	if strings.HasPrefix(s, "CRON_TZ=") || strings.HasPrefix(s, "TZ=") {
-		return errors.New("set the time zone with the timezone field, not a CRON_TZ= prefix")
+	_, err := schedule.Parse(s, time.UTC)
+	return err
+}
+
+// checkPausedUntil accepts the spec's values: empty (YAML null), "indefinite",
+// or an RFC 3339 time.
+func checkPausedUntil(s string) error {
+	_, _, err := parsePausedUntil(s)
+	return err
+}
+
+// parsePausedUntil interprets paused_until. indefinite is true for the
+// permanent pause. An empty value is not paused.
+func parsePausedUntil(s string) (until time.Time, indefinite bool, err error) {
+	switch s {
+	case "":
+		return time.Time{}, false, nil
+	case "indefinite":
+		return time.Time{}, true, nil
 	}
-	if _, err := cron.ParseStandard(s); err != nil {
-		return err
+	until, err = time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("paused_until %q must be null, an RFC 3339 time, or \"indefinite\"", s)
 	}
-	if rest, ok := strings.CutPrefix(s, "@every "); ok {
-		d, err := time.ParseDuration(strings.TrimSpace(rest))
-		if err != nil {
-			return err
-		}
-		if d < minEvery {
-			return fmt.Errorf("@every interval must be at least %v", minEvery)
-		}
+	return until, false, nil
+}
+
+// PausedAt reports whether the task is paused at at. "indefinite" is always
+// paused. A timestamp is paused while at is still before it. An unparseable
+// value is paused, so a bad file does not fire.
+func (t Task) PausedAt(at time.Time) bool {
+	until, indefinite, err := parsePausedUntil(t.PausedUntil)
+	if err != nil || indefinite {
+		return true
 	}
-	return nil
+	return !until.IsZero() && until.After(at)
 }
 
 // PromptPath resolves a task's prompt_file: relative paths are relative to

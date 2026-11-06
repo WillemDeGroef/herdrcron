@@ -19,8 +19,27 @@ const LocalTarget = "local"
 // Config is the content of config.yaml. Later tickets add the remaining
 // global settings (poll_interval, notify, ...).
 type Config struct {
-	Timezone string            `yaml:"timezone"`
-	Targets  map[string]Target `yaml:"targets"`
+	Timezone string `yaml:"timezone"`
+	// HistoryDays is how long run history is kept; default 90.
+	HistoryDays int               `yaml:"history_days"`
+	Targets     map[string]Target `yaml:"targets"`
+}
+
+// DefaultHistoryDays is the history_days default.
+const DefaultHistoryDays = 90
+
+// Location is the time zone of task t: its timezone field, or the config
+// timezone when the task has none.
+func (c Config) Location(t Task) (*time.Location, error) {
+	name := t.Timezone
+	if name == "" {
+		name = c.Timezone
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("timezone %q: %w", name, err)
+	}
+	return loc, nil
 }
 
 // Target is one machine herdrcron starts runs on.
@@ -47,6 +66,12 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Timezone == "" {
 		cfg.Timezone = "Local"
+	}
+	switch {
+	case cfg.HistoryDays == 0:
+		cfg.HistoryDays = DefaultHistoryDays
+	case cfg.HistoryDays < 0:
+		return Config{}, fmt.Errorf("history_days must be > 0, got %d", cfg.HistoryDays)
 	}
 	if _, err := time.LoadLocation(cfg.Timezone); err != nil {
 		return Config{}, fmt.Errorf("config timezone %q: %w", cfg.Timezone, err)

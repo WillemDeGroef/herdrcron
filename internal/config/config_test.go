@@ -79,3 +79,40 @@ func TestLoadRejectsUnknownTimezone(t *testing.T) {
 		t.Fatal("want error for unknown timezone")
 	}
 }
+
+func TestLoadHistoryDays(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HistoryDays != 90 {
+		t.Errorf("default HistoryDays = %d, want 90", cfg.HistoryDays)
+	}
+	writeFile(t, path, "history_days: 7\n")
+	if cfg, err = config.Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HistoryDays != 7 {
+		t.Errorf("HistoryDays = %d, want 7", cfg.HistoryDays)
+	}
+	writeFile(t, path, "history_days: -1\n")
+	if _, err := config.Load(path); err == nil {
+		t.Error("history_days -1: want error")
+	}
+}
+
+func TestLocationFallsBackToConfigTimezone(t *testing.T) {
+	cfg := config.Config{Timezone: "Europe/Brussels"}
+	loc, err := cfg.Location(config.Task{})
+	if err != nil || loc.String() != "Europe/Brussels" {
+		t.Errorf("no task timezone: %v, %v; want Europe/Brussels", loc, err)
+	}
+	loc, err = cfg.Location(config.Task{Timezone: "America/New_York"})
+	if err != nil || loc.String() != "America/New_York" {
+		t.Errorf("task timezone: %v, %v; want America/New_York", loc, err)
+	}
+	if _, err := cfg.Location(config.Task{Timezone: "Mars/Olympus"}); err == nil {
+		t.Error("unknown task timezone: want error")
+	}
+}
