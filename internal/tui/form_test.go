@@ -66,7 +66,7 @@ func peppolDetail() api.TaskDetail {
 			Schedule: "0 7 * * 1", Timezone: "Europe/Brussels", Enabled: true,
 			Agent:      api.AgentDef{Command: "claude", Args: []string{"--permission-mode", "acceptEdits", "--append-system-prompt", "be brief"}},
 			PromptFile: "prompts/peppol-sh-deps.md", Timeout: "2h",
-			Overlap: "skip", Missed: "run_once", OnDone: "keep_tab", OnBlocked: "notify",
+			Overlap: "skip", Missed: "run_once", OnDone: "close_tab", OnBlocked: "notify",
 			Env: map[string]string{"FOO": "bar"},
 		},
 		Prompt:  "Update the dependencies.\nRun the tests.\nOpen a PR.\n",
