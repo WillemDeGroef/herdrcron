@@ -342,6 +342,7 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		cmd := m.applyEvent(msg.n)
+		cmd = tea.Batch(cmd, m.detailEvent(msg.n))
 		return m, tea.Batch(waitEvent(m.gen, m.events), cmd)
 	case doneMsg:
 		m.setMessage(msg.text, msg.err)

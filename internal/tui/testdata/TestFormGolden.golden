@@ -1,0 +1,22 @@
+ herdrcron · edit task peppol-sh-deps
+
+  id            peppol-sh-deps  (fixed)
+  name          peppol.sh dependency update
+  target        local
+  cwd           ~/src/peppol-sh
+› schedule      0 7 * * 1   next: Mon Nov 9 06:00 · Mon Nov 16 06:00 · Mon Nov 23 06:00
+  timezone      Europe/Brussels
+  enabled       [x]
+  paused until  empty, RFC 3339 time or indefinite
+  agent command claude
+  agent args    --permission-mode acceptEdits --append-system-prompt 'be brief'
+  prompt file   prompts/peppol-sh-deps.md
+  timeout       2h
+  overlap       skip
+  missed        run_once
+  on done       keep_tab
+  on blocked    notify
+  env           FOO=bar
+  prompt        "Update the dependencies." (3 lines)  enter edits it in the editor
+
+ tab/↓ next  shift+tab/↑ previous  ←/→ space change  enter on prompt edits it  ctrl+s save  esc cancel

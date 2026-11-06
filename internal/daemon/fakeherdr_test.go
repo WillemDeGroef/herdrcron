@@ -22,7 +22,8 @@ const (
 	paneIdle
 	paneDone
 	paneBlocked
-	paneGone // the pane no longer exists
+	paneNoAgent // the agent exited: no agent, status unknown, shell busy
+	paneGone    // the pane no longer exists
 )
 
 type fakePane struct {
@@ -47,6 +48,8 @@ type fakeHerdr struct {
 
 	unreachable bool   // pane list fails
 	output      string // pane read text
+	ansiOutput  string // pane read --format ansi text
+	bin         string // the herdr binary it answers to; "" means "herdr"
 }
 
 func newFakeHerdr() *fakeHerdr {
@@ -99,6 +102,32 @@ func (f *fakeHerdr) setOutput(s string) {
 	f.output = s
 }
 
+func (f *fakeHerdr) setANSIOutput(s string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ansiOutput = s
+}
+
+// setBin makes the fake answer to bin (a target's herdr_path) as herdr.
+func (f *fakeHerdr) setBin(bin string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bin = bin
+}
+
+// lastCall returns the last call that started with prefix, or nil.
+func (f *fakeHerdr) lastCall(prefix ...string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.calls) - 1; i >= 0; i-- {
+		c := f.calls[i]
+		if len(c) >= len(prefix) && slices.Equal(c[:len(prefix)], prefix) {
+			return slices.Clone(c)
+		}
+	}
+	return nil
+}
+
 func (f *fakeHerdr) tabOpen(id string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -145,7 +174,11 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, slices.Clone(argv))
-	if argv[0] != "herdr" {
+	bin := f.bin
+	if bin == "" {
+		bin = "herdr"
+	}
+	if argv[0] != bin {
 		// The preflight script: argv ends with <command> <cwd>; print the cwd.
 		return []byte(argv[len(argv)-1] + "\n"), nil
 	}
@@ -164,6 +197,9 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 			agent := "claude"
 			info.Agent = &agent
 			switch p.state {
+			case paneNoAgent:
+				info.Agent = nil
+				info.AgentStatus = herdr.AgentStatusUnknown
 			case paneWorking:
 				info.AgentStatus = herdr.AgentStatusWorking
 			case paneIdle:
@@ -221,6 +257,9 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 			return nil, herdrErr(herdr.CodePaneNotFound)
 		}
 		if argv[2] == "read" {
+			if flag(argv, "--format") == "ansi" {
+				return []byte(f.ansiOutput), nil
+			}
 			return []byte(f.output), nil
 		}
 		return nil, nil

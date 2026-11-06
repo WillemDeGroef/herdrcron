@@ -111,6 +111,13 @@ func (c *Client) PaneRead(ctx context.Context, paneID string, lines int) (string
 	return string(out), err
 }
 
+// PaneReadANSI is PaneRead with colours kept (--format ansi), for a live
+// view of the pane.
+func (c *Client) PaneReadANSI(ctx context.Context, paneID string, lines int) (string, error) {
+	out, err := c.exec(ctx, "pane", "read", paneID, "--source", "recent-unwrapped", "--lines", strconv.Itoa(lines), "--format", "ansi")
+	return string(out), err
+}
+
 // PaneProcessInfo runs `herdr pane process-info`.
 func (c *Client) PaneProcessInfo(ctx context.Context, paneID string) (PaneProcessInfo, error) {
 	r, err := call[PaneProcessInfoResult](ctx, c, "pane_process_info", "pane", "process-info", "--pane", paneID)

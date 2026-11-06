@@ -31,7 +31,7 @@ func newStyles(r *lipgloss.Renderer) styles {
 }
 
 // keyHelp is the footer of the list.
-const keyHelp = "space on/off  p pause  P pause all  r run now  s stop  / filter  g group  ? help  q quit"
+const keyHelp = "space on/off  p pause  r run  n new  e edit  d del  enter detail  a attach  l live  ? help  q quit"
 
 var columns = []string{"TARGET", "TASK", "SCHEDULE", "STATE", "LAST", "NEXT"}
 
@@ -408,6 +408,13 @@ func (m Model) helpView() string {
 		{"P", "pause or resume all on the selected task's target, or on all targets"},
 		{"r", "run now (asks before a parallel run)"},
 		{"s", "stop the active run (asks first)"},
+		{"enter", "task detail: definition, next fires, last runs; enter on a run shows its output"},
+		{"l", "live output of the active run"},
+		{"a", "attach to the active run's agent (detach with ctrl+b q)"},
+		{"n", "new task (form)"},
+		{"e", "edit the task (form)"},
+		{"E", "edit the prompt in $EDITOR"},
+		{"d", "delete the task (asks first; offers stop and delete with an active run)"},
 		{"/", "filter by text; esc clears"},
 		{"g", "group by target"},
 		{"?", "this help"},

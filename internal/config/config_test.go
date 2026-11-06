@@ -204,3 +204,33 @@ func TestLoadNotifyRejectsEmptyProgram(t *testing.T) {
 		t.Fatal(`Load accepted notify.command: ["", x]`)
 	}
 }
+
+func TestLoadAttachMode(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := config.Load(filepath.Join(dir, "missing.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AttachMode != "pane" {
+		t.Errorf("default AttachMode = %q, want pane", cfg.AttachMode)
+	}
+	for _, mode := range []string{"pane", "full"} {
+		path := filepath.Join(dir, mode+".yaml")
+		writeFile(t, path, "attach_mode: "+mode+"\n")
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("attach_mode %s: %v", mode, err)
+		}
+		if cfg.AttachMode != mode {
+			t.Errorf("AttachMode = %q, want %q", cfg.AttachMode, mode)
+		}
+	}
+}
+
+func TestLoadRejectsUnknownAttachMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, "attach_mode: window\n")
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("want error for attach_mode: window")
+	}
+}
