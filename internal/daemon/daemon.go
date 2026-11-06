@@ -19,6 +19,7 @@ import (
 	"github.com/WillemDeGroef/herdrcron/internal/config"
 	"github.com/WillemDeGroef/herdrcron/internal/dispatch"
 	"github.com/WillemDeGroef/herdrcron/internal/logging"
+	"github.com/WillemDeGroef/herdrcron/internal/notify"
 	"github.com/WillemDeGroef/herdrcron/internal/paths"
 	"github.com/WillemDeGroef/herdrcron/internal/runner"
 	"github.com/WillemDeGroef/herdrcron/internal/scheduler"
@@ -67,6 +68,10 @@ type daemon struct {
 	versions map[string]string
 	// deleting holds tasks being deleted; the watcher leaves them alone.
 	deleting map[string]bool
+
+	// notifier runs notify.command for configured events; wired from runChanged
+	// so run notifications share one path with subscribe run.changed.
+	notifier *notify.Notifier
 
 	// dirty holds tasks whose runs changed since their state was last
 	// published; dirtyWake wakes publishDirty.
@@ -128,6 +133,10 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	if targets == nil {
 		targets = realTargets(cfg)
 	}
+	notifier := notify.New(cfg.Notify, log)
+	d.notifier = notifier
+	// Let notifications already started reach the user before exiting.
+	defer notifier.Wait()
 	d.runner = runner.New(runner.Options{
 		Clock: clk, Store: st, Targets: targets, Config: cfg, ConfigDir: p.ConfigDir, Log: log,
 		OnEnd:    func(ctx context.Context, run store.Run) { d.disp.RunEnded(ctx, run) },

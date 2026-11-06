@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/api"
+	"github.com/WillemDeGroef/herdrcron/internal/config"
 	"github.com/WillemDeGroef/herdrcron/internal/logging"
+	"github.com/WillemDeGroef/herdrcron/internal/notify"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
 	"github.com/WillemDeGroef/herdrcron/internal/watch"
 )
@@ -85,12 +87,23 @@ func (d *daemon) subscribe(ctx context.Context, _ json.RawMessage) (any, <-chan 
 }
 
 // runChanged is the runner's OnChange: it is the one place a stored run
-// change becomes a "run.changed" event (later features that react to run
-// states, such as notifications, hook in here). It also queues the task's
-// display state to be republished; that needs the runner's lock, which
-// OnChange may not take.
+// change becomes a "run.changed" event and optional notify.command calls
+// (blocked, failed, timeout, lost). It also queues the task's display
+// state to be republished; that needs the runner's lock, which OnChange
+// may not take.
 func (d *daemon) runChanged(run store.Run) {
 	d.bus.publish(api.EventRunChanged, api.RunChangedEvent{Run: *runSummary(run)})
+	runLog := logging.ForRun(d.log, run.ID, run.TaskID, run.Target)
+	switch run.Status {
+	case store.StatusBlocked:
+		d.notifier.Notify(config.EventBlocked, notify.RunMessage(run), runLog)
+	case store.StatusFailed:
+		d.notifier.Notify(config.EventFailed, notify.RunMessage(run), runLog)
+	case store.StatusTimeout:
+		d.notifier.Notify(config.EventTimeout, notify.RunMessage(run), runLog)
+	case store.StatusLost:
+		d.notifier.Notify(config.EventLost, notify.RunMessage(run), runLog)
+	}
 	d.dirtyMu.Lock()
 	d.dirty[run.TaskID] = struct{}{}
 	d.dirtyMu.Unlock()

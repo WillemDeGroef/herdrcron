@@ -16,6 +16,7 @@ import (
 
 	"github.com/WillemDeGroef/herdrcron/internal/clock"
 	"github.com/WillemDeGroef/herdrcron/internal/config"
+	"github.com/WillemDeGroef/herdrcron/internal/notify"
 	"github.com/WillemDeGroef/herdrcron/internal/runner"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
 	"github.com/WillemDeGroef/herdrcron/internal/target"
@@ -33,7 +34,39 @@ type env struct {
 	log       *bytes.Buffer
 
 	mu    sync.Mutex
-	ended []store.Run // runs passed to OnEnd
+	ended []store.Run    // runs passed to OnEnd
+	notes []notification // Notify calls
+}
+
+type notification struct{ event, message string }
+
+// recordNotify is like daemon.runChanged notifications: blocked and end
+// statuses that notify.on would fire for.
+func (e *env) recordNotify(run store.Run) {
+	var event string
+	switch run.Status {
+	case store.StatusBlocked:
+		event = config.EventBlocked
+	case store.StatusFailed:
+		event = config.EventFailed
+	case store.StatusTimeout:
+		event = config.EventTimeout
+	case store.StatusLost:
+		event = config.EventLost
+	default:
+		return
+	}
+	msg := notify.RunMessage(run)
+	e.mu.Lock()
+	e.notes = append(e.notes, notification{event, msg})
+	e.mu.Unlock()
+}
+
+// notifications returns the Notify calls so far, in order.
+func (e *env) notifications() []notification {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.notes)
 }
 
 const prompt = "Update the deps.\nSay \"done\" and 'stop'."
@@ -74,6 +107,7 @@ func (e *env) newRunner() *runner.Runner {
 		Log:       slog.New(slog.NewJSONHandler(e.log, nil)),
 		// The fake server answers at once or never.
 		ServerStartWait: 50 * time.Millisecond,
+		OnChange:        e.recordNotify,
 		OnEnd: func(_ context.Context, run store.Run) {
 			e.mu.Lock()
 			defer e.mu.Unlock()

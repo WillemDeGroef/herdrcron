@@ -639,7 +639,7 @@ func (r *Runner) track(ctx context.Context, ts *targetState, a *activeRun, p her
 	}
 	// On every blocked sample, not only on the change: a run recovered as
 	// blocked has no change. Polls skip a run being stopped, and beginStop
-	// starts at most one stop. Notifying on blocked is a later ticket.
+	// starts at most one stop.
 	if status == store.StatusBlocked && a.task.OnBlocked == "stop" {
 		r.beginStop(a, store.StatusStopped, "blocked (on_blocked: stop)")
 	}
