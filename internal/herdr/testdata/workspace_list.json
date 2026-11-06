@@ -1,0 +1,38 @@
+{
+ "id": "cli:workspace:list",
+ "result": {
+  "type": "workspace_list",
+  "workspaces": [
+   {
+    "active_tab_id": "w2:t60",
+    "agent_status": "idle",
+    "focused": false,
+    "label": "demo",
+    "number": 1,
+    "pane_count": 5,
+    "tab_count": 4,
+    "workspace_id": "w2"
+   },
+   {
+    "active_tab_id": "w8:tD",
+    "agent_status": "idle",
+    "focused": false,
+    "label": "demo",
+    "number": 2,
+    "pane_count": 2,
+    "tab_count": 2,
+    "workspace_id": "w8"
+   },
+   {
+    "active_tab_id": "wF:t1",
+    "agent_status": "idle",
+    "focused": false,
+    "label": "demo",
+    "number": 3,
+    "pane_count": 1,
+    "tab_count": 1,
+    "workspace_id": "wF"
+   }
+  ]
+ }
+}

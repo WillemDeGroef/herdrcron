@@ -277,7 +277,7 @@ timezone: Europe/Brussels
 poll_interval: 15s
 history_days: 90
 catch_up_window: 24h
-herdr_version: "0.7.1"      # expected on every target; mismatch = warning in TUI
+herdr_version: "0.9.1"      # expected on every target; mismatch = warning in TUI
 attach_mode: pane           # pane | full
 notify:
   command: ["ntfy", "publish", "herdrcron"]   # argv; message text is appended
@@ -341,7 +341,7 @@ Build in five steps; each step ends with working, tested software that the user 
 4. TUI: main screen, keys, form, detail, live output, attach.
 5. SSH targets: adapter, preflight, reachability and backoff, catch-up, targets screen.
 
-Open questions for the implementing agent to resolve against the installed herdr, and to report back before step 2 ends:
+Open questions for the implementing agent to resolve against the installed herdr, and to report back before step 2 ends. Answered for herdr 0.9.1 in `docs/herdr-findings.md`, which supersedes the guessed commands in this spec:
 
 - Exact CLI to create a tab inside a given workspace, to close a tab, and to find panes by label.
 - Which JSON field in `herdr pane list` carries the agent status, and its values.
