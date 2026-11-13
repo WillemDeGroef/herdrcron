@@ -695,3 +695,36 @@ func TestQueueFireDuringAFailedLaunchStartsOnceTheTaskIsIdle(t *testing.T) {
 		t.Fatalf("starts = %+v, want the pending fire started once the failed launch left the task idle", starts)
 	}
 }
+
+// Fires waiting on a target reload removed are discarded. Ending the runs
+// that were already active must not start them, on the max_parallel queue
+// or as a pending overlap fire.
+func TestDropTargetsDiscardsWaitingFires(t *testing.T) {
+	cfg := config.Config{Targets: map[string]config.Target{
+		"vps":   {MaxParallel: 1},
+		"local": {MaxParallel: 4},
+	}}
+	h := newHarness(t, cfg, nil)
+	first := submit(t, h, task("a", "vps", "skip"), store.TriggerSchedule, t0, false)
+	if first.Run.ID == "" {
+		t.Fatal("first vps fire did not start")
+	}
+	if out := submit(t, h, task("b", "vps", "parallel"), store.TriggerSchedule, t0, false); !out.Queued {
+		t.Fatalf("vps fire above max_parallel = %+v, want Queued", out)
+	}
+	overlap := submit(t, h, task("c", "local", "queue"), store.TriggerSchedule, t0, false)
+	if overlap.Run.ID == "" {
+		t.Fatal("local fire did not start")
+	}
+	if out := submit(t, h, task("c", "local", "queue"), store.TriggerSchedule, t0.Add(time.Hour), false); !out.Queued {
+		t.Fatalf("overlap fire = %+v, want Queued", out)
+	}
+
+	h.d.DropTargets([]string{"vps", "local"})
+	h.runs.end(t, first.Run.ID)
+	h.runs.end(t, overlap.Run.ID)
+
+	if n := len(h.runs.startCalls()); n != 2 {
+		t.Fatalf("Start called %d times, want 2: the waiting fires were dropped", n)
+	}
+}

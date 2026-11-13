@@ -77,14 +77,17 @@ type daemon struct {
 	// deleting holds tasks being deleted; the watcher leaves them alone.
 	deleting map[string]bool
 
-	// checkMu guards lastChecks and ctx. lastChecks is the last
+	// checkMu guards lastChecks, checkEpoch and ctx. lastChecks is the last
 	// "targets.check" report per target, shown in status and
-	// target.changed. ctx is the daemon's context for work started from
+	// target.changed. checkEpoch advances when a target's machine changes,
+	// so a check that was already running cannot store a report for the
+	// replacement. ctx is the daemon's context for work started from
 	// callbacks (catch-up after a target answers again). catchUp's
 	// bg.Add and stopCatchUps's ctx = nil share this lock, so Wait cannot
 	// race Add once the daemon is stopping.
 	checkMu    sync.Mutex
 	lastChecks map[string]api.TargetCheck
+	checkEpoch map[string]uint64
 	ctx        context.Context
 	bg         sync.WaitGroup
 
@@ -140,7 +143,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		configFile: p.ConfigFile(), bus: newBus(log), sshControlDir: p.SSHControlDir(),
 		versions: map[string]string{}, deleting: map[string]bool{},
 		dirty: map[string]struct{}{}, dirtyWake: make(chan struct{}, 1),
-		lastChecks: map[string]api.TargetCheck{},
+		lastChecks: map[string]api.TargetCheck{}, checkEpoch: map[string]uint64{},
 	}
 	for _, e := range tasks {
 		d.versions[e.ID] = d.fileVersion(e)
@@ -231,7 +234,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	// tasks) catch up their host_unreachable fires now.
 	for _, name := range d.targetNames() {
 		if st, ok := d.runner.TargetState(name); ok && st.Reachability == runner.ReachReachable {
-			d.catchUp(name)
+			d.catchUp(name, st.Gen)
 		}
 	}
 	schedDone := make(chan struct{})
@@ -531,6 +534,12 @@ func apiTime(t time.Time) string {
 type latestDef struct{ d *daemon }
 
 func (l latestDef) Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
+	// A catch-up was scheduled because one generation of the target
+	// answered. A reload may have replaced it since; starting the run
+	// would put that missed fire on the new machine.
+	if gen, ok := catchGenFrom(ctx); ok && !l.d.runner.HasGen(t.Target, gen) {
+		return store.Run{}, nil
+	}
 	cur, err := l.d.currentTask(t)
 	if err != nil {
 		return store.Run{}, err

@@ -194,3 +194,76 @@ func TestReloadAppliesAttachMode(t *testing.T) {
 		t.Errorf("attach mode after reload = %q, want full", got.Mode)
 	}
 }
+
+// A config.yaml change is not applied when the task files cannot be read:
+// the call fails and the daemon keeps the config it had.
+func TestReloadLeavesConfigWhenTasksCannotBeRead(t *testing.T) {
+	l := newLifecycle(t, noon, "timeout: 1h\n")
+	l.start()
+	tasks := l.p.TasksDir()
+	bak := tasks + ".dir"
+	if err := os.Rename(tasks, bak); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tasks, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		_ = os.Remove(tasks)
+		if err := os.Rename(bak, tasks); err != nil {
+			t.Errorf("restore tasks dir: %v", err)
+		}
+	}
+	defer restore()
+
+	write(t, l.p.ConfigFile(), "timezone: Europe/Brussels\n")
+	err := l.c.Call(context.Background(), api.MethodReload, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "tasks") {
+		t.Fatalf("reload err = %v, want a tasks directory error", err)
+	}
+	if got := call[api.StatusResult](t, l.c, api.MethodStatus, nil).Timezone; got != "UTC" {
+		t.Errorf("timezone = %q, want UTC: config was applied though the task files could not be read", got)
+	}
+}
+
+// A targets.check that started before reload replaced the target does not
+// become the new target's last check: the report describes the old machine.
+func TestReloadDropsACheckStartedBeforeTheTargetChanged(t *testing.T) {
+	l := newLifecycle(t, noon, "timeout: 1h\n")
+	l.start()
+	release := l.herdr.holdExec()
+	defer release()
+	c2, err := api.Dial(l.p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c2.Close() }()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c2.Call(context.Background(), api.MethodTargetsCheck, api.TargetCheckParams{Name: "local"}, nil)
+	}()
+	select {
+	case <-l.herdr.execHeldCh():
+	case <-time.After(5 * time.Second):
+		t.Fatal("targets.check did not reach the target")
+	}
+
+	write(t, l.p.ConfigFile(), "timezone: UTC\ntargets:\n  local:\n    herdr_path: /opt/bin/herdr\n")
+	if res := reload(t, l.c); res.RestartRequired || len(res.DeferredTargets) != 0 {
+		t.Fatalf("reload = %+v, want the herdr_path applied", res)
+	}
+	release()
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	for _, ts := range call[api.StatusResult](t, l.c, api.MethodStatus, nil).Targets {
+		if ts.Name == "local" && ts.LastCheck != nil {
+			t.Errorf("last check = %+v, want none: it ran against the target before herdr_path changed", ts.LastCheck)
+		}
+	}
+}

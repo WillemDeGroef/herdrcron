@@ -103,11 +103,14 @@ type Runner struct {
 	cancelStop context.CancelFunc
 	stops      sync.WaitGroup
 
-	// targetsMu guards cfg, targets and the poll workers. Lock order: mu,
-	// then targetsMu. Read them with config() and target().
+	// targetsMu guards cfg, targets, nextGen and the poll workers. Lock
+	// order: mu, then a target's changeMu, then targetsMu. observe and a
+	// drop in Reconfigure both take changeMu before targetsMu. Read the
+	// map with config() and target().
 	targetsMu sync.RWMutex
 	cfg       config.Config
 	targets   map[string]*targetState
+	nextGen   uint64 // last generation stamped onto a targetState
 	// runCtx is Run's context while Run is polling, else nil. workers
 	// holds the cancel func of each target's poll worker.
 	runCtx  context.Context
@@ -136,6 +139,11 @@ type targetState struct {
 	// openMu serialises workspace lookup and creation, so two runs that
 	// start at once for the same repo share one hc- workspace.
 	openMu sync.Mutex
+
+	// gen identifies this targetState. It changes when Reconfigure
+	// replaces the target, so a reachability result from the old one can
+	// be dropped. Immutable after stamp.
+	gen uint64
 
 	changeMu sync.Mutex // serializes reachability changes and their callbacks
 	reachMu  sync.Mutex
@@ -186,9 +194,16 @@ func New(o Options) *Runner {
 		r.waitStart = defaultServerStartWait
 	}
 	for name, t := range o.Targets {
-		r.targets[name] = newTargetState(t, o.Config.Targets[name])
+		r.targets[name] = r.stamp(newTargetState(t, o.Config.Targets[name]))
 	}
 	return r
+}
+
+// stamp gives ts a new generation. The caller holds targetsMu, or is New.
+func (r *Runner) stamp(ts *targetState) *targetState {
+	r.nextGen++
+	ts.gen = r.nextGen
+	return ts
 }
 
 func newTargetState(t target.Target, tc config.Target) *targetState {
@@ -230,16 +245,89 @@ func (r *Runner) Reconfigure(cfg config.Config, newTarget func(name string, tc c
 	// looks its target up.
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	busy := map[string]bool{}
+	return r.reconfigureLocked(cfg, newTarget)
+}
+
+// ReconfigureAfter is Reconfigure, but prepare runs once the deferred set
+// is known and before the runner changes. The daemon uses it to load task
+// files against the config it is about to publish: a non-nil error from
+// prepare leaves the runner unchanged. prepare may run again when a run
+// ends while it reads (the deferred set shrank). The caller must hold off
+// new runs for the duration — a run that starts and ends in between would
+// make prepare repeat without end. Passing a nil prepare is Reconfigure.
+func (r *Runner) ReconfigureAfter(cfg config.Config, newTarget func(name string, tc config.Target) target.Target, prepare func(deferred []string) error) (deferred []string, err error) {
+	if prepare == nil {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.reconfigureLocked(cfg, newTarget), nil
+	}
+	for {
+		r.mu.Lock()
+		deferred = r.wouldDeferLocked(cfg)
+		r.mu.Unlock()
+		if err = prepare(deferred); err != nil {
+			return nil, err
+		}
+		r.mu.Lock()
+		// A run can have ended during prepare. Starting one cannot: the
+		// caller is holding that off. The set only shrinks, so this ends.
+		if now := r.wouldDeferLocked(cfg); !slices.Equal(deferred, now) {
+			r.mu.Unlock()
+			continue
+		}
+		deferred = r.reconfigureLocked(cfg, newTarget)
+		r.mu.Unlock()
+		return deferred, nil
+	}
+}
+
+// wouldDeferLocked is the deferred set Reconfigure would return for cfg.
+// The caller holds r.mu.
+func (r *Runner) wouldDeferLocked(cfg config.Config) []string {
+	busy := r.busyLocked()
+	r.targetsMu.RLock()
+	defer r.targetsMu.RUnlock()
+	var deferred []string
+	for name, ts := range r.targets {
+		tc, wanted := cfg.Targets[name]
+		if wanted && sameTarget(ts.conf, tc) {
+			continue
+		}
+		if busy[name] {
+			deferred = append(deferred, name)
+		}
+	}
+	slices.Sort(deferred)
+	return deferred
+}
+
+// busyLocked is the set of targets with a run active or still starting.
+// The caller holds r.mu.
+func (r *Runner) busyLocked() map[string]bool {
+	busy := make(map[string]bool, len(r.active)+len(r.starting))
 	for _, a := range r.active {
 		busy[a.run.Target] = true
 	}
 	for _, a := range r.starting {
 		busy[a.run.Target] = true
 	}
-	r.targetsMu.Lock()
-	defer r.targetsMu.Unlock()
-	r.cfg = cfg
+	return busy
+}
+
+// reconfigureLocked is Reconfigure with r.mu held.
+//
+// A target that is dropped has its changeMu taken before targetsMu, the
+// same order as observe, so an in-flight reachability callback finishes
+// before the target leaves the map.
+func (r *Runner) reconfigureLocked(cfg config.Config, newTarget func(name string, tc config.Target) target.Target) (deferred []string) {
+	busy := r.busyLocked()
+	type retire struct {
+		name   string
+		ts     *targetState
+		wanted bool
+	}
+	r.targetsMu.RLock()
+	var retirees []retire
 	for name, ts := range r.targets {
 		tc, wanted := cfg.Targets[name]
 		if wanted && sameTarget(ts.conf, tc) {
@@ -249,15 +337,35 @@ func (r *Runner) Reconfigure(cfg config.Config, newTarget func(name string, tc c
 			deferred = append(deferred, name)
 			continue
 		}
-		delete(r.targets, name)
+		retirees = append(retirees, retire{name: name, ts: ts, wanted: wanted})
+	}
+	r.targetsMu.RUnlock()
+
+	for _, rt := range retirees {
+		rt.ts.changeMu.Lock()
+	}
+	defer func() {
+		for _, rt := range retirees {
+			rt.ts.changeMu.Unlock()
+		}
+	}()
+
+	r.targetsMu.Lock()
+	defer r.targetsMu.Unlock()
+	r.cfg = cfg
+	for _, rt := range retirees {
+		if r.targets[rt.name] != rt.ts {
+			continue
+		}
+		delete(r.targets, rt.name)
 		// Its worker may be sleeping out the old target's backoff; a
 		// replacement gets a fresh one below.
-		if stop := r.workers[name]; stop != nil {
+		if stop := r.workers[rt.name]; stop != nil {
 			stop()
-			delete(r.workers, name)
+			delete(r.workers, rt.name)
 		}
-		if !wanted {
-			r.log.Info("target removed", "target", name)
+		if !rt.wanted {
+			r.log.Info("target removed", "target", rt.name)
 		}
 	}
 	for name, tc := range cfg.Targets {
@@ -268,7 +376,7 @@ func (r *Runner) Reconfigure(cfg config.Config, newTarget func(name string, tc c
 		if t == nil {
 			continue
 		}
-		r.targets[name] = newTargetState(t, tc)
+		r.targets[name] = r.stamp(newTargetState(t, tc))
 		r.startWorkerLocked(name)
 		r.log.Info("target configured", "target", name)
 	}
