@@ -152,6 +152,52 @@ func TestSSHCancelStopsWhatTheRemoteCommandStarted(t *testing.T) {
 	}
 }
 
+// The login shell that started the remote command may lead a process group
+// it already had (an interactive user's shell). Cancelling must stop the
+// command and what it started, and must not signal that group's other jobs.
+func TestSSHCancelDoesNotSignalTheParentGroupsOtherJob(t *testing.T) {
+	needSetsid(t)
+	_, dir := fakeSSH(t)
+	t.Setenv("FAKE_SSH_REMOTE", "login")
+	s, _ := newTestSSH(t, "sh -c")
+	pidfile := filepath.Join(t.TempDir(), "pid")
+	remote := []string{"sh", "-c", `sleep 300 & echo $! > "$1.tmp" && mv "$1.tmp" "$1" && wait`, "sh", pidfile}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Exec(ctx, remote, nil)
+		done <- err
+	}()
+	child := waitForPid(t, pidfile)
+	bystander := waitForPid(t, filepath.Join(dir, "bystander"))
+	t.Cleanup(func() {
+		_ = syscall.Kill(child, syscall.SIGKILL)
+		_ = syscall.Kill(bystander, syscall.SIGKILL)
+	})
+
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("cancelled call returned no error")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancelled call did not return")
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for processRuns(child) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the remote command's child (pid %d) still runs after the call was cancelled", child)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !processRuns(bystander) {
+		t.Fatalf("a job of the parent process group (pid %d) was signalled when the call was cancelled", bystander)
+	}
+}
+
 // A call that is not cancelled is not cut short: the command outlives the
 // end of its stdin data and its exit code comes back.
 func TestSSHCommandOutlivesItsStdinData(t *testing.T) {

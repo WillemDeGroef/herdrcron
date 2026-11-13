@@ -192,10 +192,12 @@ func (s *SSH) run(ctx context.Context, name []string, cmd string, stdin io.Reade
 //     it closes: either ssh is gone, or the command finished and sshd
 //     closed the session. The watcher then signals the script (USR1),
 //     which has exited in the second case;
-//   - on USR1 sends TERM to its whole process group when sshd started the
-//     login shell as a group of its own (the group leader is the script
-//     or its parent, as under OpenSSH), else to the command and its
-//     descendants, found with ps.
+//   - on USR1 sends TERM to its whole process group only when this script
+//     leads that group (it replaced the login shell sshd started with
+//     setsid). A parent that leads the group is not enough: that parent
+//     may be an interactive login shell, and the group then holds jobs
+//     this command did not start. Otherwise it sends TERM to the command
+//     and its descendants, found with ps, and to nothing else.
 //
 // The watcher holds neither stdout nor stderr, so it never delays the end
 // of the ssh call. It starts once the stdin data has gone to the command:
@@ -208,7 +210,7 @@ func watchedScript(line string, stdinLen int) string {
 	}
 	return `exec 3<&0
 k() { for p in $(printf '%s\n' "$s" | while read -r a b; do [ "$b" = "$1" ] && echo "$a"; done); do k "$p"; done; kill -TERM "$1" 2>/dev/null; }
-trap 'trap "" TERM; g=$(ps -o pgid= -p $$ 2>/dev/null); case " $(echo $g) " in " $$ "|" $PPID ") kill -TERM 0;; *) s=$(ps -A -o pid= -o ppid= 2>/dev/null); k $!;; esac; exit 143' USR1
+trap 'trap "" TERM; g=$(ps -o pgid= -p $$ 2>/dev/null); case " $(echo $g) " in " $$ ") kill -TERM 0;; *) s=$(ps -A -o pid= -o ppid= 2>/dev/null); k $!;; esac; exit 143' USR1
 { ` + feed + `{ read -r _ <&3; kill -USR1 $$; } >/dev/null 2>&1 & } | ` + line + ` 3<&- &
 wait $!`
 }

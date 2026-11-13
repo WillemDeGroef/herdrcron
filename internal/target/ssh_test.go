@@ -14,7 +14,7 @@ import (
 )
 
 // fakeSSHScript stands in for the system ssh binary. It records its argv
-// (one element per NUL-terminated record) and its stdin, then acts on
+// (one element per NUL-terminated record), then acts on
 // FAKE_SSH_EXIT: unset runs the last argument (the remote command line)
 // with sh -c, as sshd would hand it to the login shell; a number exits
 // with that code after printing FAKE_SSH_STDERR to stderr; FAKE_SSH_HANG
@@ -24,7 +24,11 @@ import (
 // process. Unset, it replaces it. "session" runs it as sshd does: in a new
 // session and process group that outlives a killed ssh and only sees its
 // stdin close. "child" also outlives ssh but shares its process group, as
-// behind an sshd that does not start a session.
+// behind an sshd that does not start a session. "login" is a session leader
+// with another job beside the command. The leader execs the remote line, as
+// a login shell does with a simple command, so it stays the parent and the
+// group leader. That job ignores SIGHUP so the session ending does not look
+// like a kill.
 const fakeSSHScript = `#!/bin/sh
 dir=$(dirname "$0")
 : > "$dir/argv"
@@ -45,6 +49,7 @@ fi
 case "$FAKE_SSH_REMOTE" in
 session) setsid -w sh -c "$last"; exit $? ;;
 child) sh -c "$last"; exit $? ;;
+login) setsid -w sh -c 'trap "" HUP; sleep 300 & echo $! > "$1/bystander"; exec sh -c "$2"' sh "$dir" "$last"; exit $? ;;
 esac
 exec sh -c "$last"
 `
