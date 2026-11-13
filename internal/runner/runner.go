@@ -934,6 +934,26 @@ func terminalReplaced(run store.Run, pane herdr.PaneInfo) bool {
 	return run.HerdrTerminal != "" && pane.TerminalID != run.HerdrTerminal
 }
 
+// paneReplaced reports whether herdr lists run's pane id with another
+// terminal id than at launch. A run with no stored terminal id is not
+// checked. A failed pane list is not a replacement: err is that failure
+// and the bool is false, so the caller still stops.
+func (r *Runner) paneReplaced(ctx context.Context, ts *targetState, run store.Run) (bool, error) {
+	if run.HerdrTerminal == "" || run.HerdrPane == "" {
+		return false, nil
+	}
+	panes, err := ts.herdr.PaneList(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range panes {
+		if p.PaneID == run.HerdrPane && terminalReplaced(run, p) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // endIfPaneReplaced ends the run lost when herdr lists its pane id with
 // another terminal id than at launch. The restored shell is not the run:
 // it is left open and no keys are sent. A run with no stored terminal id
@@ -941,23 +961,17 @@ func terminalReplaced(run store.Run, pane herdr.PaneInfo) bool {
 // still stops and a timeout still ends the run while the target does not
 // answer. The bool is true when this call ended the run.
 func (r *Runner) endIfPaneReplaced(ctx context.Context, ts *targetState, a *activeRun) (bool, error) {
-	if a.run.HerdrTerminal == "" || a.run.HerdrPane == "" {
-		return false, nil
-	}
-	panes, err := ts.herdr.PaneList(ctx)
+	replaced, err := r.paneReplaced(ctx, ts, a.run)
 	if err != nil {
 		a.log.Warn("cannot check the pane terminal", "err", err)
 		return false, nil
 	}
-	for _, p := range panes {
-		if p.PaneID != a.run.HerdrPane || !terminalReplaced(a.run, p) {
-			continue
-		}
-		a.log.Info("pane replaced since the last poll")
-		_, err = r.end(context.WithoutCancel(ctx), a, store.StatusLost, reasonPaneReplaced)
-		return true, err
+	if !replaced {
+		return false, nil
 	}
-	return false, nil
+	a.log.Info("pane replaced since the last poll")
+	_, err = r.end(context.WithoutCancel(ctx), a, store.StatusLost, reasonPaneReplaced)
+	return true, err
 }
 
 // stop runs step 10 (see stopOnTarget) and ends the run, whatever
@@ -966,7 +980,8 @@ func (r *Runner) endIfPaneReplaced(ctx context.Context, ts *targetState, a *acti
 // since the last poll ends the run lost instead of stopping. If the
 // target is unreachable, the run ends at once with a reason that says its
 // tab may still be open, and the stop is finished when the target answers
-// again (see resumeCleanups).
+// again (see resumeCleanups). A pane restored as a new shell by then is
+// not sent keys; its tab is closed and the reason says the pane was replaced.
 func (r *Runner) stop(ctx context.Context, a *activeRun, status, reason string) (store.Run, error) {
 	// Wait for a poll that is tracking the run; it may have ended it.
 	a.mu.Lock()
@@ -1052,11 +1067,7 @@ func (r *Runner) stopOnTarget(ctx context.Context, ts *targetState, log *slog.Lo
 	// unreachable returns err if it says the target does not answer. It
 	// does not stretch the backoff: the poll worker's retries do.
 	unreachable := func(err error) error {
-		if !errors.Is(err, target.ErrUnreachable) {
-			return nil
-		}
-		r.observe(run.Target, err, false)
-		return err
+		return r.asUnreachable(run.Target, err)
 	}
 	keys := func(k ...string) error {
 		err := ts.herdr.PaneSendKeys(ctx, run.HerdrPane, k...)
@@ -1089,25 +1100,77 @@ func (r *Runner) stopOnTarget(ctx context.Context, ts *targetState, log *slog.Lo
 			return "", "", err
 		}
 	}
-	outcome = reasonTabClosed
-	if run.HerdrTab != "" {
-		err := ts.herdr.TabClose(ctx, run.HerdrTab)
-		switch {
-		case err == nil:
-		case herdr.IsCode(err, herdr.CodeTabNotFound):
-			outcome = reasonTabGone
-		case herdr.IsCode(err, herdr.CodeServerNotRunning):
-			log.Warn("cannot close tab", "herdr_tab", run.HerdrTab, "err", err)
-			outcome = reasonTabGone
-		default:
-			log.Warn("cannot close tab", "herdr_tab", run.HerdrTab, "err", err)
-			if err := unreachable(err); err != nil {
-				return tail, "", err // the tail was read; the caller keeps it
-			}
-			outcome = reasonTabNotClosed
-		}
+	outcome, err = r.closeRunTab(ctx, ts, log, run)
+	if err != nil {
+		return tail, "", err // the tail was read; the caller keeps it
 	}
 	return tail, outcome, nil
+}
+
+// asUnreachable returns err when it means the target did not answer, and
+// marks the target unreachable. It does not stretch the backoff: the poll
+// worker's retries do. Any other error, including nil, is reported as nil.
+func (r *Runner) asUnreachable(name string, err error) error {
+	if !errors.Is(err, target.ErrUnreachable) {
+		return nil
+	}
+	r.observe(name, err, false)
+	return err
+}
+
+// closeRunTab closes the run's tab and reports what became of it
+// (reasonTabClosed, reasonTabGone or reasonTabNotClosed). An error
+// matching target.ErrUnreachable means the target did not answer; the
+// target is marked unreachable and the caller keeps the stop pending.
+// Other close errors are logged.
+func (r *Runner) closeRunTab(ctx context.Context, ts *targetState, log *slog.Logger, run store.Run) (string, error) {
+	if run.HerdrTab == "" {
+		return reasonTabClosed, nil
+	}
+	err := ts.herdr.TabClose(ctx, run.HerdrTab)
+	switch {
+	case err == nil:
+		return reasonTabClosed, nil
+	case herdr.IsCode(err, herdr.CodeTabNotFound):
+		return reasonTabGone, nil
+	case herdr.IsCode(err, herdr.CodeServerNotRunning):
+		log.Warn("cannot close tab", "herdr_tab", run.HerdrTab, "err", err)
+		return reasonTabGone, nil
+	default:
+		log.Warn("cannot close tab", "herdr_tab", run.HerdrTab, "err", err)
+		if err := r.asUnreachable(run.Target, err); err != nil {
+			return "", err
+		}
+		return reasonTabNotClosed, nil
+	}
+}
+
+// finishPendingStop is the rest of a stop that could not reach the target.
+// If herdr restored the pane id as a new shell, no keys are sent to it;
+// the tab is still closed and the outcome records the replacement, so a
+// retry does not send keys either. Otherwise it is step 10. The tail is
+// empty when no keys were sent: the restored shell's text is not the run's.
+func (r *Runner) finishPendingStop(ctx context.Context, ts *targetState, log *slog.Logger, run store.Run) (tail, outcome string, err error) {
+	replaced, err := r.paneReplaced(ctx, ts, run)
+	if err != nil {
+		log.Warn("cannot check the pane terminal", "err", err)
+	}
+	if !replaced {
+		return r.stopOnTarget(ctx, ts, log, run)
+	}
+	log.Info("pane replaced since the stop; closing the tab without sending keys", "herdr_pane", run.HerdrPane)
+	outcome, err = r.closeRunTab(ctx, ts, log, run)
+	if err != nil {
+		return "", "", err
+	}
+	return "", replacedTabOutcome(outcome), nil
+}
+
+// replacedTabOutcome records that the pending stop found a new shell under
+// the run's pane id, so it sent no keys, and what became of the tab. The
+// result still ends with outcome, which is how a retry knows the stop is done.
+func replacedTabOutcome(outcome string) string {
+	return "; " + reasonPaneReplaced + outcome
 }
 
 // tabOutcomeSettled reports whether reason already ends with what became of
@@ -1206,7 +1269,9 @@ func (r *Runner) resumeCleanups(name string) {
 // says what became of the tab. A store write that fails leaves the cleanup
 // pending, and the next try amends the row without repeating a stop that
 // already reached the target. If the target drops again, or the daemon
-// stops, the cleanup stays pending.
+// stops, the cleanup stays pending. A pane herdr restored under the same
+// id is a new shell: no keys are sent, the tab is still closed, and the
+// reason says the pane was replaced.
 func (r *Runner) cleanup(ctx context.Context, c *pendingCleanup) {
 	<-c.ready // closed as soon as the store has answered
 	r.mu.Lock()
@@ -1226,7 +1291,7 @@ func (r *Runner) cleanup(ctx context.Context, c *pendingCleanup) {
 			return
 		}
 		c.log.Info("target reachable again; finishing the stop", "herdr_tab", run.HerdrTab)
-		tail, outcome, err := r.stopOnTarget(ctx, ts, c.log, run)
+		tail, outcome, err := r.finishPendingStop(ctx, ts, c.log, run)
 		if err != nil {
 			c.log.Warn("cannot finish the stop; it stays pending", "err", err)
 			stay()
