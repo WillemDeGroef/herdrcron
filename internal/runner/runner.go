@@ -329,14 +329,14 @@ func (r *Runner) openTab(ctx context.Context, ts *targetState, a *activeRun, cwd
 		if err != nil {
 			return fmt.Errorf("create tab: %w", err)
 		}
-		r.setHerdrIDs(a, res.Tab.WorkspaceID, res.Tab.TabID, res.RootPane.PaneID)
+		r.setHerdrIDs(a, res.Tab.WorkspaceID, res.Tab.TabID, res.RootPane)
 		return nil
 	}
 	res, err := ts.herdr.WorkspaceCreate(ctx, cwd, wsLabel, env)
 	if err != nil {
 		return fmt.Errorf("create workspace: %w", err)
 	}
-	r.setHerdrIDs(a, res.Workspace.WorkspaceID, res.Tab.TabID, res.RootPane.PaneID)
+	r.setHerdrIDs(a, res.Workspace.WorkspaceID, res.Tab.TabID, res.RootPane)
 	if err := ts.herdr.TabRename(ctx, res.Tab.TabID, label); err != nil {
 		return fmt.Errorf("rename tab: %w", err)
 	}
@@ -345,10 +345,11 @@ func (r *Runner) openTab(ctx context.Context, ts *targetState, a *activeRun, cwd
 
 // setHerdrIDs stores a starting run's herdr ids under r.mu, which LiveRuns
 // reads it with.
-func (r *Runner) setHerdrIDs(a *activeRun, workspace, tab, pane string) {
+func (r *Runner) setHerdrIDs(a *activeRun, workspace, tab string, pane herdr.PaneInfo) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	a.run.HerdrWorkspace, a.run.HerdrTab, a.run.HerdrPane = workspace, tab, pane
+	a.run.HerdrWorkspace, a.run.HerdrTab = workspace, tab
+	a.run.HerdrPane, a.run.HerdrTerminal = pane.PaneID, pane.TerminalID
 }
 
 // tabLabel is hc-<task-id>-<HHMM>, in the task's time zone.
@@ -680,6 +681,14 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 			p, ok := byID[a.run.HerdrPane]
 			if !ok {
 				r.finish(ctx, ts, a, store.StatusLost, "pane gone")
+				return
+			}
+			// A herdr server that crashed and started again restores its
+			// session: the pane id exists again, as a new shell with
+			// another terminal id. The run's processes went with the old
+			// server. Runs stored without a terminal id skip the check.
+			if a.run.HerdrTerminal != "" && p.TerminalID != a.run.HerdrTerminal {
+				r.finish(ctx, ts, a, store.StatusLost, "pane replaced: herdr server restarted")
 				return
 			}
 			r.track(ctx, ts, a, p)

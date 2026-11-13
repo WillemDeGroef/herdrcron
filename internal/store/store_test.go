@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"slices"
@@ -45,6 +46,7 @@ func TestInsertGetRoundtrip(t *testing.T) {
 		HerdrWorkspace: "ws1",
 		HerdrTab:       "tab1",
 		HerdrPane:      "pane1",
+		HerdrTerminal:  "term_1",
 		ExitReason:     "done",
 		OutputTail:     "line1\nline2\n",
 	}
@@ -555,4 +557,73 @@ func TestGlobalPauseSurvivesReopen(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 	assertGlobalPause(t, s, true, "vps")
+}
+
+// A database written by schema version 1 has no runs.herdr_terminal: Open
+// adds the column and keeps the rows.
+func TestOpenUpgradesSchemaVersion1(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+CREATE TABLE runs (
+	id              TEXT PRIMARY KEY,
+	task_id         TEXT NOT NULL,
+	target          TEXT NOT NULL,
+	trigger         TEXT NOT NULL,
+	scheduled_at    TIMESTAMP,
+	started_at      TIMESTAMP NOT NULL,
+	ended_at        TIMESTAMP,
+	status          TEXT NOT NULL,
+	herdr_workspace TEXT,
+	herdr_tab       TEXT,
+	herdr_pane      TEXT,
+	exit_reason     TEXT,
+	output_tail     TEXT
+);
+INSERT INTO runs (id, task_id, target, trigger, started_at, status, herdr_pane)
+	VALUES ('old', 'backup', 'local', 'manual', '2026-01-02T03:04:05Z', 'running', 'w1:p1');
+PRAGMA user_version = 1;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	for range 2 { // the second Open finds the column already there
+		s, err := store.Open(path)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		run, err := s.GetRun(ctx, "old")
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if run.HerdrPane != "w1:p1" || run.HerdrTerminal != "" {
+			t.Errorf("old run = pane %q terminal %q, want w1:p1 and no terminal", run.HerdrPane, run.HerdrTerminal)
+		}
+		run.HerdrTerminal = "term_1"
+		if err := s.UpdateRun(ctx, run); err != nil {
+			t.Fatalf("UpdateRun: %v", err)
+		}
+		if got, _ := s.GetRun(ctx, "old"); got.HerdrTerminal != "term_1" {
+			t.Errorf("terminal after update = %q, want term_1", got.HerdrTerminal)
+		}
+		run.HerdrTerminal = ""
+		if err := s.UpdateRun(ctx, run); err != nil {
+			t.Fatalf("UpdateRun: %v", err)
+		}
+		// A daemon that died after adding the column, before storing
+		// the new version, left version 1 with the column.
+		if err := s.SetUserVersionForTest(1); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
