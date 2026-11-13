@@ -1,6 +1,7 @@
 // Package store keeps the herdrcron daemon state in SQLite: one row per run
 // in table runs, per task scheduling state in table task_state, and the
-// global pauses in table global_pause.
+// global pauses in table global_pause, and the ended runs whose tab may still
+// be open on their target in table pending_cleanups.
 package store
 
 import (
@@ -68,6 +69,9 @@ CREATE TABLE IF NOT EXISTS task_state (
 );
 CREATE TABLE IF NOT EXISTS global_pause (
 	target TEXT PRIMARY KEY -- "" means all targets.
+);
+CREATE TABLE IF NOT EXISTS pending_cleanups (
+	run_id TEXT PRIMARY KEY -- An ended run whose tab may still be open.
 );
 `
 
@@ -293,6 +297,30 @@ func (s *Store) ListOpenRuns(ctx context.Context) ([]Run, error) {
 	return runs, nil
 }
 
+// SetPendingCleanup records (pending true) or clears that the run ended
+// while its target was unreachable, so its tab may still be open there.
+func (s *Store) SetPendingCleanup(ctx context.Context, runID string, pending bool) error {
+	query := `INSERT OR IGNORE INTO pending_cleanups (run_id) VALUES (?)`
+	if !pending {
+		query = `DELETE FROM pending_cleanups WHERE run_id = ?`
+	}
+	if _, err := s.db.ExecContext(ctx, query, runID); err != nil {
+		return fmt.Errorf("set pending cleanup of run %s: %w", runID, err)
+	}
+	return nil
+}
+
+// ListPendingCleanups returns the runs with a pending cleanup, oldest
+// first.
+func (s *Store) ListPendingCleanups(ctx context.Context) ([]Run, error) {
+	runs, err := s.queryRuns(ctx, `SELECT `+runColumns+` FROM runs
+		WHERE id IN (SELECT run_id FROM pending_cleanups) ORDER BY started_at, id`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending cleanups: %w", err)
+	}
+	return runs, nil
+}
+
 // queryRuns runs a query that selects runColumns.
 func (s *Store) queryRuns(ctx context.Context, query string, args ...any) ([]Run, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -428,7 +456,8 @@ func (s *Store) GetTaskState(ctx context.Context, taskID string) (st TaskState, 
 }
 
 // DeleteRunsBefore deletes ended runs that started before cutoff and
-// returns how many it deleted. Active runs (no end time) are always kept.
+// returns how many it deleted. Active runs (no end time) and runs with a
+// pending cleanup are always kept.
 // Task states that pointed at a deleted run lose their last run id.
 func (s *Store) DeleteRunsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -437,7 +466,8 @@ func (s *Store) DeleteRunsBefore(ctx context.Context, cutoff time.Time) (int64, 
 	}
 	defer func() { _ = tx.Rollback() }()
 	res, err := tx.ExecContext(ctx, `DELETE FROM runs
-		WHERE ended_at IS NOT NULL AND started_at < ?`, formatTime(cutoff))
+		WHERE ended_at IS NOT NULL AND started_at < ?
+		AND id NOT IN (SELECT run_id FROM pending_cleanups)`, formatTime(cutoff))
 	if err != nil {
 		return 0, fmt.Errorf("delete runs: %w", err)
 	}

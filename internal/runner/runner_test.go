@@ -32,11 +32,14 @@ type env struct {
 	configDir string
 	dbPath    string
 	log       *bytes.Buffer
+	logger    *slog.Logger // one handler: runners before and after a restart share log
 
 	mu      sync.Mutex
 	ended   []store.Run          // runs passed to OnEnd
 	notes   []notification       // Notify calls
 	targets []runner.TargetState // OnTargetChange calls
+
+	onAmend func(store.Run) // the next newRunner's OnAmend
 }
 
 type notification struct{ event, message string }
@@ -92,6 +95,7 @@ func newEnv(t *testing.T) *env {
 		clock: clock.NewFake(time.Date(2026, 11, 6, 7, 0, 0, 0, time.UTC)),
 		log:   &bytes.Buffer{},
 	}
+	e.logger = slog.New(slog.NewJSONHandler(e.log, nil))
 	e.runner = e.newRunner()
 	return e
 }
@@ -105,10 +109,11 @@ func (e *env) newRunner() *runner.Runner {
 		Targets:   map[string]target.Target{"local": e.herdr},
 		Config:    config.Config{Timezone: "Europe/Brussels", Targets: map[string]config.Target{"local": {}}},
 		ConfigDir: e.configDir,
-		Log:       slog.New(slog.NewJSONHandler(e.log, nil)),
+		Log:       e.logger,
 		// The fake server answers at once or never.
 		ServerStartWait: 50 * time.Millisecond,
 		OnChange:        e.recordNotify,
+		OnAmend:         e.onAmend,
 		OnTargetChange: func(st runner.TargetState) {
 			e.mu.Lock()
 			defer e.mu.Unlock()

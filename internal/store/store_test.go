@@ -556,3 +556,66 @@ func TestGlobalPauseSurvivesReopen(t *testing.T) {
 	defer func() { _ = s.Close() }()
 	assertGlobalPause(t, s, true, "vps")
 }
+
+func TestPendingCleanups(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	day := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	ended := func(r store.Run) store.Run {
+		r.EndedAt = r.StartedAt.Add(time.Minute)
+		r.Status = store.StatusStopped
+		return r
+	}
+	first, second, other := ended(newRun("a", day)), ended(newRun("b", day.Add(time.Hour))), ended(newRun("a", day.Add(2*time.Hour)))
+	for _, r := range []store.Run{second, first, other} {
+		if err := s.InsertRun(ctx, r); err != nil {
+			t.Fatalf("InsertRun: %v", err)
+		}
+	}
+	ids := func() []string {
+		t.Helper()
+		runs, err := s.ListPendingCleanups(ctx)
+		if err != nil {
+			t.Fatalf("ListPendingCleanups: %v", err)
+		}
+		var out []string
+		for _, r := range runs {
+			out = append(out, r.ID)
+		}
+		return out
+	}
+	set := func(id string, pending bool) {
+		t.Helper()
+		if err := s.SetPendingCleanup(ctx, id, pending); err != nil {
+			t.Fatalf("SetPendingCleanup: %v", err)
+		}
+	}
+	if got := ids(); len(got) != 0 {
+		t.Fatalf("pending cleanups of a new store = %v, want none", got)
+	}
+	set(second.ID, true)
+	set(first.ID, true)
+	set(first.ID, true) // twice is once
+	if got, want := ids(), []string{first.ID, second.ID}; !slices.Equal(got, want) {
+		t.Fatalf("pending cleanups = %v, want %v (oldest first)", got, want)
+	}
+
+	// Retention keeps a run whose tab may still be open.
+	n, err := s.DeleteRunsBefore(ctx, day.Add(24*time.Hour))
+	if err != nil || n != 1 {
+		t.Fatalf("DeleteRunsBefore = %d, %v; want 1 run deleted", n, err)
+	}
+	if got, want := ids(), []string{first.ID, second.ID}; !slices.Equal(got, want) {
+		t.Fatalf("pending cleanups after retention = %v, want %v", got, want)
+	}
+
+	set(first.ID, false)
+	set(first.ID, false) // clearing what is not pending is fine
+	if got, want := ids(), []string{second.ID}; !slices.Equal(got, want) {
+		t.Fatalf("pending cleanups after clearing one = %v, want %v", got, want)
+	}
+	n, err = s.DeleteRunsBefore(ctx, day.Add(24*time.Hour))
+	if err != nil || n != 1 {
+		t.Fatalf("DeleteRunsBefore after clearing = %d, %v; want 1 run deleted", n, err)
+	}
+}

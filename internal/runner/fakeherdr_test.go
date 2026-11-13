@@ -78,15 +78,17 @@ type fakeHerdr struct {
 	scripts    [][]sample
 	nextID     int
 
-	serverDown   bool   // herdr calls fail with server_not_running
-	unreachable  bool   // herdr calls fail as an ssh target that does not answer
-	serverStarts bool   // starting the server brings it up
-	preflight    string // stderr line of a failing preflight; "" = ok
-	resolvedCwd  string // what the preflight prints; "" = the cwd as given
-	output       string // pane read text
-	failRun      bool   // pane run fails
-	failPut      bool   // PutFile fails
-	version      string // `herdr --version` prints "herdr <version>"; "" = 0.9.1
+	serverDown  bool // herdr calls fail with server_not_running
+	unreachable bool // herdr calls fail as an ssh target that does not answer
+	// unreachableFor makes only this herdr command ("tab close") fail so.
+	unreachableFor string
+	serverStarts   bool   // starting the server brings it up
+	preflight      string // stderr line of a failing preflight; "" = ok
+	resolvedCwd    string // what the preflight prints; "" = the cwd as given
+	output         string // pane read text
+	failRun        bool   // pane run fails
+	failPut        bool   // PutFile fails
+	version        string // `herdr --version` prints "herdr <version>"; "" = 0.9.1
 	// hostEnv, when set, makes the shell-script calls (preflight and
 	// target check) run for real in a local sh with this environment
 	// (a temp HOME and PATH), instead of the canned answers above.
@@ -122,6 +124,9 @@ func (f *fakeHerdr) PutFile(_ context.Context, path string, data []byte) error {
 func (f *fakeHerdr) RemoveFile(_ context.Context, path string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.unreachable {
+		return &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connect to host: Connection refused\n")}
+	}
 	delete(f.files, path)
 	return nil
 }
@@ -179,7 +184,7 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		return f.preflightCheck(argv)
 	}
 	cmd := strings.Join(argv[1:min(3, len(argv))], " ")
-	if f.unreachable {
+	if f.unreachable || (f.unreachableFor != "" && f.unreachableFor == cmd) {
 		return nil, &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connect to host: Connection refused\n")}
 	}
 	if cmd == "--version" {
