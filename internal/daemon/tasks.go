@@ -216,6 +216,10 @@ func (d *daemon) tasksUpdate(ctx context.Context, params json.RawMessage) (any, 
 		return nil, api.InvalidParams(fmt.Errorf("unknown task %q", p.ID))
 	}
 	old := d.tasks[i]
+	// Before the task file is rewritten: the prompt path to drop is what the
+	// task file on disk names now, not the in-memory entry (promptPathOf
+	// falls back when the load had a syntax error).
+	oldPrompt, oldPromptKnown := d.promptPathInFile(old)
 	// Compare with the files, not memory: a hand edit the watcher has not
 	// reloaded yet must still refuse the write.
 	if cur := d.fileVersion(old); p.Version == "" || p.Version != cur {
@@ -241,6 +245,11 @@ func (d *daemon) tasksUpdate(ctx context.Context, params json.RawMessage) (any, 
 	}
 	e := config.LoadTask(d.configDir, p.ID, d.cfg)
 	d.tasks[i] = e
+	// The task points at its new prompt file now; the old one goes unless
+	// it is still in use. When the old path is unknown, nothing is removed.
+	if oldPromptKnown {
+		d.removeUnusedPromptLocked(p.ID, oldPrompt)
+	}
 	d.log.Info("task updated", logging.KeyTaskID, e.ID)
 	return d.storedLocked(ctx, e)
 }
@@ -305,21 +314,15 @@ func (d *daemon) tasksDelete(ctx context.Context, params json.RawMessage) (any, 
 		return res, nil // a reload removed it meanwhile
 	}
 	e := d.tasks[i]
-	promptPath := d.promptPathOf(e)
+	promptPath, promptKnown := d.promptPathInFile(e)
 	if err := os.Remove(e.File); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		d.rescheduleLocked(ctx)
 		return nil, fmt.Errorf("remove task file: %w", err)
 	}
 	d.tasks = slices.Delete(d.tasks, i, i+1)
 	delete(d.versions, p.ID)
-	// A prompt file another task points at stays.
-	shared := slices.ContainsFunc(d.tasks, func(o config.TaskEntry) bool {
-		return filepath.Clean(d.promptPathOf(o)) == filepath.Clean(promptPath)
-	})
-	if !shared && d.inConfigDir(promptPath) {
-		if err := os.Remove(promptPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			d.log.Warn("cannot remove prompt file", logging.KeyTaskID, p.ID, "err", err)
-		}
+	if promptKnown {
+		d.removeUnusedPromptLocked(p.ID, promptPath)
 	}
 	if err := d.store.DeleteTaskState(ctx, p.ID); err != nil {
 		d.log.Warn("cannot remove task state", logging.KeyTaskID, p.ID, "err", err)
@@ -327,6 +330,55 @@ func (d *daemon) tasksDelete(ctx context.Context, params json.RawMessage) (any, 
 	d.log.Info("task deleted", logging.KeyTaskID, p.ID, "stopped_runs", len(res.StoppedRuns))
 	d.publishDeleted(p.ID)
 	return res, nil
+}
+
+// removeUnusedPromptLocked removes the prompt file task id used until now,
+// after a delete or after an update moved the task to another prompt_file.
+// The file stays when a task file still names it, by path or as the same
+// file through a link, when a task file does not parse (its prompt_file is
+// unknown), and when it is outside the config directory. Task files are
+// read from disk, so a hand edit the watcher has not reloaded yet still
+// counts. A failure to remove is logged: the task itself is already
+// stored. Call it with d.mu held and d.tasks up to date.
+func (d *daemon) removeUnusedPromptLocked(id, promptPath string) {
+	if !d.inConfigDir(promptPath) {
+		return
+	}
+	info, statErr := os.Stat(promptPath)
+	inUse := slices.ContainsFunc(d.tasks, func(o config.TaskEntry) bool {
+		other, known := d.promptPathInFile(o)
+		if !known {
+			return true
+		}
+		if filepath.Clean(other) == filepath.Clean(promptPath) {
+			return true
+		}
+		otherInfo, otherErr := os.Stat(other)
+		return statErr == nil && otherErr == nil && os.SameFile(info, otherInfo)
+	})
+	if inUse {
+		return
+	}
+	if err := os.Remove(promptPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		d.log.Warn("cannot remove prompt file", logging.KeyTaskID, id, "err", err)
+	}
+}
+
+// promptPathInFile is the prompt path the task file names on disk.
+// known is false when that file does not parse, so its prompt_file cannot
+// be told. A type error still carries the fields that parsed, which
+// promptPathOf does not: it falls back to prompts/<id>.md whenever the
+// lenient read returns an error, and would both invent a path for a syntax
+// error and hide the prompt_file a bad field left intact.
+func (d *daemon) promptPathInFile(e config.TaskEntry) (string, bool) {
+	t, err := config.ReadTaskLenient(e.File)
+	if err != nil && t.PromptFile == "" {
+		return "", false
+	}
+	if t.PromptFile == "" {
+		t.PromptFile = config.DefaultTask(e.ID).PromptFile
+	}
+	return config.PromptPath(t.PromptFile, d.configDir), true
 }
 
 // restoreSchedule schedules a task again after its delete gave up.
@@ -356,12 +408,25 @@ func (d *daemon) insertLocked(e config.TaskEntry) {
 // taskPath is the task file of id.
 func (d *daemon) taskPath(id string) string { return filepath.Join(d.tasksDir(), id+".yaml") }
 
-// inConfigDir reports whether path is inside the config directory. The
-// API only removes prompt files there. path is lexical: os.Remove does
-// not follow a symlink's target, so a link inside the directory is removed
-// and a path that climbs out is not.
+// inConfigDir reports whether path is a file of the config directory:
+// path-wise inside it, and still inside once the symlinks in its directory
+// are followed. The API only removes prompt files there. The last
+// component is not followed: os.Remove removes a link, not its target, so
+// a link inside the directory is removed, and a path that climbs out or
+// passes through a linked directory to the outside is not.
 func (d *daemon) inConfigDir(path string) bool {
-	return withinDir(d.configDir, path)
+	if !withinDir(d.configDir, path) {
+		return false
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return false
+	}
+	root, err := filepath.EvalSymlinks(d.configDir)
+	if err != nil {
+		root = d.configDir
+	}
+	return withinDir(root, dir)
 }
 
 // promptInside reports whether a prompt path stays inside the config
