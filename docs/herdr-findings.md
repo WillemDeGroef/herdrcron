@@ -53,6 +53,7 @@ Rules for the tracker:
 
 - Count `idle`/`done` towards completion only when `agent` is present. During startup the status is `unknown`, not `idle`, so a run does not finish before the agent starts.
 - Pane missing from `pane list` → `lost`.
+- Pane in `pane list` with another `terminal_id` than at launch → `lost`, reason `pane replaced: herdr server restarted` (see "Server restart" below).
 - `agent` absent gives `unknown`: before the agent starts, after it exits back to the shell, and for the whole run of a plain command such as the integration test's `bash -c 'echo hi; sleep 5'`. To tell whether the launched command has ended, use `herdr pane process-info --pane <id>`: when both `.result.process_info.shell_pid` and `foreground_process_group_id` are non-null and equal, the shell's own process group is in the foreground. After a command has run, that is the prompt (verified: `sleep` takes the foreground group; when it exits the two ids are equal again and `foreground_processes` is just the shell). The same equality is also true while startup files still run in the shell's group, before the command starts (observed: `conda` still listed in `foreground_processes`, ids already equal). The first sample after `pane run` must not by itself end the run. A later equal sample may: with a 15 s poll a short command can finish without a sample ever seeing the other process group. Call process-info only for panes whose `agent` is absent, so the normal poll stays one `pane list` call per target.
 - Shell back at its prompt, not during a stop:
   - no agent was ever detected in the run (plain command) → `done`;
@@ -107,6 +108,14 @@ herdrcron sends `ctrl+c ctrl+c` a second time 2 s after the first (the spec's "C
 Then retry `herdr pane list` until it succeeds or a few seconds have passed. If it still fails, the run is `failed` with the reason. Do not treat the starter's exit status as the result: the process is not supposed to exit, and a second start that races one already running exits 1 with the plain-text error above.
 
 Reason: the always-on host loses its herdr server on every reboot, and failing every run until the user opens a terminal defeats the scheduler. This is the same server the user's `herdr` would start. The systemd unit that runs the daemon must not kill that process when the daemon stops (`KillMode=process`, or an equivalent). A server started in the daemon's cgroup dies with it, and takes the panes with it.
+
+## Server restart
+
+- A herdr server that stops (crash, `kill -9`, `herdr server stop`, reboot) takes every process in its panes with it. While it is down, `pane list` fails with `server_not_running`: the poll ends the target's runs `lost`.
+- When the server starts again it restores the session from `session.json`: the same workspaces, tabs and labels, and the same pane ids (`w1:p1`), each a new shell in the old cwd. Only `terminal_id` differs (`term_66024df88e3dc1` before, `term_66024dff78c4b1` after). Verified on 0.9.1 with an isolated session (`hc-i34-exp`): `kill -9` of the server, then `herdr server` again.
+- So a pane id alone does not identify a run's pane. If the server restarts between two polls, the poll finds the pane id and would track the empty shell: the run stays `running` (no agent was ever detected in that shell), or ends on a wrong reading.
+
+**Decision: a run stores the pane's `terminal_id` at launch** (`runs.herdr_terminal`, from `root_pane` of `workspace create` / `tab create`). A poll, recovery at daemon start, and a stop or timeout that lands before the next poll, end the run `lost` when its pane id is listed with another `terminal_id`. They do not send keys to that shell or close its tab. Runs stored before this column existed have no terminal id and skip the check. The restored tab is left open, as for every `lost` run. A pane list that fails is not a replacement: a timeout still ends the run while the target does not answer.
 
 ## Attach
 
