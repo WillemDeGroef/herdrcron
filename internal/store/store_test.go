@@ -556,3 +556,48 @@ func TestGlobalPauseSurvivesReopen(t *testing.T) {
 	defer func() { _ = s.Close() }()
 	assertGlobalPause(t, s, true, "vps")
 }
+
+func TestQueuedFiresRoundtripInQueueOrder(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	pending := store.QueuedFire{TaskID: "a", Target: "local", Trigger: store.TriggerSchedule, ScheduledAt: at, Pending: true}
+	manual := store.QueuedFire{TaskID: "b", Target: "mini", Trigger: store.TriggerManual}
+	var err error
+	if pending.ID, err = s.AddQueuedFire(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	if manual.ID, err = s.AddQueuedFire(ctx, manual); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListQueuedFires(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []store.QueuedFire{pending, manual}; !slices.Equal(got, want) {
+		t.Fatalf("ListQueuedFires = %+v, want %+v", got, want)
+	}
+
+	// A released fire goes behind the fires already waiting.
+	released := pending
+	released.Pending = false
+	if released.ID, err = s.ReleaseQueuedFire(ctx, pending.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = s.ListQueuedFires(ctx); !slices.Equal(got, []store.QueuedFire{manual, released}) {
+		t.Fatalf("after release: %+v, want %+v", got, []store.QueuedFire{manual, released})
+	}
+	if _, err := s.ReleaseQueuedFire(ctx, pending.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("release of a gone fire: err = %v, want ErrNotFound", err)
+	}
+
+	if err := s.DeleteQueuedFire(ctx, manual.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteQueuedFire(ctx, manual.ID); err != nil {
+		t.Errorf("second delete: %v, want nil", err)
+	}
+	if got, _ = s.ListQueuedFires(ctx); !slices.Equal(got, []store.QueuedFire{released}) {
+		t.Fatalf("after delete: %+v, want %+v", got, []store.QueuedFire{released})
+	}
+}

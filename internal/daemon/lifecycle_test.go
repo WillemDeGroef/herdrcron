@@ -408,3 +408,45 @@ func TestTimeoutStopsTheRun(t *testing.T) {
 		t.Errorf("tab %s still open after the timeout", run.HerdrTab)
 	}
 }
+
+// Issue #33: a fire waiting in the queue must survive a daemon restart.
+func TestQueuedRunSurvivesADaemonRestart(t *testing.T) {
+	l := newLifecycle(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC), "timeout: 1h\noverlap: queue\n")
+	l.start()
+	first := l.mustRunNow()
+	queued, err := l.runNow(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queued.Queued {
+		t.Fatalf("second run_now = %+v, want queued", queued)
+	}
+
+	l.kill()
+	l.start()
+	if n := len(l.runs()); n != 1 {
+		t.Fatalf("%d runs after the restart, want 1: the queued fire still waits for the recovered run", n)
+	}
+
+	l.herdr.set(first.HerdrPane, paneIdle)
+	l.advanceUntil("the first run ends", pollStep, l.ended(first.ID))
+	eventually(t, "the queued run to start", func() bool {
+		runs := l.runs()
+		return len(runs) == 2 && runs[0].Status != store.StatusStarting
+	})
+	second := l.runs()[0]
+	if second.ID == first.ID || second.Trigger != store.TriggerManual || second.Status != store.StatusRunning {
+		t.Errorf("queued run = %+v, want a running manual run", second)
+	}
+
+	// The fire ran once: nothing is left for another restart to start.
+	l.kill()
+	st, err := store.Open(l.p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if fires, err := st.ListQueuedFires(context.Background()); err != nil || len(fires) != 0 {
+		t.Errorf("stored queued fires after the run started = %+v err=%v, want none", fires, err)
+	}
+}
