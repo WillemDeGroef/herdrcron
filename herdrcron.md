@@ -149,7 +149,7 @@ type Target interface {
 ```
 
 - `local`: `os/exec`, no shell.
-- SSH: the system `ssh` binary, so `~/.ssh/config`, agents, keys and ProxyJump work as the user expects. Always pass `-o BatchMode=yes -o ControlMaster=auto -o ControlPath=$XDG_STATE_HOME/herdrcron/ssh/%C -o ControlPersist=10m -o ConnectTimeout=10`. Quote every argument with a POSIX shell quoter; never build a command string from unquoted user data.
+- SSH: the system `ssh` binary, so `~/.ssh/config`, agents, keys and ProxyJump work as the user expects. Always pass `-o BatchMode=yes -o ControlMaster=auto -o ControlPath=$XDG_STATE_HOME/herdrcron/ssh/%C -o ControlPersist=10m -o ConnectTimeout=10`. Quote every argument with a POSIX shell quoter; never build a command string from unquoted user data. The remote login shell may be a non-POSIX shell (fish, tcsh): send every command as `/bin/sh -c …` in a form all login shells read the same, and let `/bin/sh` read the quoted command. A cancelled call also stops its command on the remote (see `docs/herdr-findings.md`, "SSH: login shell and cancellation").
 - Remote PATH: non-interactive SSH shells often lack `herdr` and `claude` on PATH. Each target in `config.yaml` has `shell` (default `bash -lc`) and optional `herdr_path`. Run every remote command through that shell.
 - SSH exit code 255 = target unreachable. Any other non-zero exit = command error.
 

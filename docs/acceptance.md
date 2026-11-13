@@ -47,7 +47,7 @@ The spec says all criteria "must pass on the user's machines", so every item als
 ### 2. The same task on a remote target starts there, and `a` attaches
 
 - [x] verified-by-test (fake `ssh` binary on PATH, argv assertions; by human decision no test uses a real remote):
-  - `internal/target`: `TestSSHExecArgvUsesTheSpecOptionsAndTheTargetShell`, `TestSSHExecQuotesEveryArgument`, `TestSSHPutFileWritesThePromptViaStdin`.
+  - `internal/target`: `TestSSHExecArgvUsesTheSpecOptionsAndTheTargetShell`, `TestSSHExecQuotesEveryArgument`, `TestSSHPutFileWritesThePromptViaStdin`, `TestSSHRemoteCommandLineDoesNotDependOnTheLoginShell` (any login shell), `TestSSHCancelStopsTheRemoteCommand` and `TestSSHCancelStopsWhatTheRemoteCommandStarted` (a cancelled call stops the remote command), `TestSSHCancelDoesNotSignalTheParentGroupsOtherJob` (cancel does not signal other jobs in the parent process group).
   - `internal/daemon`: `TestRealTargetsMakesAnSSHTargetForEveryRemoteTarget`, `TestAttachCmdOnARemoteTargetUsesSSHWithATTY`.
   - `internal/tui`: `TestAttachRunsTheAttachCommand`, `TestAttachFromOutputAndDetail`.
 - [ ] needs-user:
