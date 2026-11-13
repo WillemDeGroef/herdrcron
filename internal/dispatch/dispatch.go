@@ -6,7 +6,9 @@ package dispatch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -28,8 +30,10 @@ type Runner interface {
 
 // Options configures New.
 type Options struct {
-	Runs   Runner
-	Store  *store.Store // records deferred schedule and catch_up fires; may be nil
+	Runs Runner
+	// Store records deferred schedule and catch_up fires and keeps the
+	// waiting fires for Restore. It may be nil: nothing is stored then.
+	Store  *store.Store
 	Config config.Config
 	Log    *slog.Logger
 }
@@ -59,6 +63,8 @@ type fire struct {
 	task        config.Task
 	trigger     string
 	scheduledAt time.Time
+	// id is the fire's row in the store while it waits; 0 if it has none.
+	id int64
 }
 
 // Dispatcher applies overlap and max_parallel. It is safe for concurrent use.
@@ -126,6 +132,7 @@ func (d *Dispatcher) Submit(ctx context.Context, t config.Task, trigger string, 
 					"trigger", trigger, "scheduled_at", scheduledAt)
 				return Outcome{Skipped: true}, nil
 			}
+			d.storeLocked(&f, true)
 			d.pending[t.ID] = f
 			d.mu.Unlock()
 			return Outcome{Queued: true}, nil
@@ -141,6 +148,7 @@ func (d *Dispatcher) Submit(ctx context.Context, t config.Task, trigger string, 
 	}
 	target := t.Target
 	if len(d.queue[target]) > 0 || !d.hasCapacityLocked(target, active) {
+		d.storeLocked(&f, false)
 		d.queue[target] = append(d.queue[target], f)
 		d.mu.Unlock()
 		return Outcome{Queued: true}, nil
@@ -204,6 +212,15 @@ func (d *Dispatcher) releasePendingLocked(taskID string) {
 		return
 	}
 	delete(d.pending, taskID)
+	if d.store != nil && f.id != 0 {
+		id, err := d.store.ReleaseQueuedFire(context.Background(), f.id)
+		if err != nil {
+			// The fire keeps its old row, which the launch removes.
+			d.log.Error("cannot store queued fire", logging.KeyTaskID, taskID, "err", err)
+		} else {
+			f.id = id
+		}
+	}
 	d.queue[f.task.Target] = append(d.queue[f.task.Target], f)
 }
 
@@ -261,6 +278,9 @@ func (d *Dispatcher) drain(ctx context.Context, target string) {
 		}
 		f := d.queue[target][0]
 		d.queue[target] = d.queue[target][1:]
+		// Unstored before the launch: a daemon that stops during it leaves
+		// the run row, and must not start the fire a second time.
+		d.unstoreLocked(f)
 		d.launching[target]++
 		d.launchingTask[f.task.ID]++
 		d.mu.Unlock()
@@ -285,6 +305,111 @@ func (d *Dispatcher) startDeferred(ctx context.Context, f fire) {
 	}
 	if err := d.store.RecordFire(ctx, f.task.ID, run.ID, f.scheduledAt); err != nil {
 		log.Error("cannot write task state", "err", err)
+	}
+}
+
+// storeLocked writes a fire that starts to wait to the store, so that
+// Restore finds it after a daemon restart. A fire that cannot be stored
+// still waits in memory. The write happens under d.mu to keep the stored
+// order equal to the queue order.
+func (d *Dispatcher) storeLocked(f *fire, pending bool) {
+	if d.store == nil {
+		return
+	}
+	id, err := d.store.AddQueuedFire(context.Background(), store.QueuedFire{
+		TaskID: f.task.ID, Target: f.task.Target, Trigger: f.trigger,
+		ScheduledAt: f.scheduledAt, Pending: pending,
+	})
+	if err != nil {
+		d.log.Error("cannot store queued fire: a daemon restart would lose it",
+			logging.KeyTaskID, f.task.ID, logging.KeyTarget, f.task.Target, "err", err)
+		return
+	}
+	f.id = id
+}
+
+// unstoreLocked removes a fire that no longer waits from the store.
+func (d *Dispatcher) unstoreLocked(f fire) {
+	if d.store == nil || f.id == 0 {
+		return
+	}
+	if err := d.store.DeleteQueuedFire(context.Background(), f.id); err != nil {
+		d.log.Error("cannot remove queued fire from the store",
+			logging.KeyTaskID, f.task.ID, logging.KeyTarget, f.task.Target, "err", err)
+	}
+}
+
+// Restore loads the fires a previous daemon left waiting, in their queue
+// order. Call it once at daemon start, after the runner recovered its open
+// runs and before any Submit. tasks are the valid tasks as they are now: a
+// fire waits on its task's current target, and a fire of a task that is
+// gone is dropped. So is a schedule or catch_up fire planned longer than
+// catch_up_window before now: like a missed fire of that age, it no longer
+// runs. A pending overlap fire whose run ended with the previous daemon
+// moves to its target's queue. Restore starts nothing; Resume does.
+func (d *Dispatcher) Restore(ctx context.Context, tasks []config.Task, now time.Time) error {
+	if d.store == nil {
+		return nil
+	}
+	stored, err := d.store.ListQueuedFires(ctx)
+	if err != nil {
+		return fmt.Errorf("restore queued fires: %w", err)
+	}
+	byID := make(map[string]config.Task, len(tasks))
+	for _, t := range tasks {
+		byID[t.ID] = t
+	}
+	active := d.lockWithActive()
+	defer d.mu.Unlock()
+	for _, s := range stored {
+		t, ok := byID[s.TaskID]
+		f := fire{task: t, trigger: s.Trigger, scheduledAt: s.ScheduledAt, id: s.ID}
+		_, dup := d.pending[s.TaskID]
+		switch {
+		case !ok:
+			d.log.Warn("queued fire dropped: its task is gone or invalid",
+				logging.KeyTaskID, s.TaskID, logging.KeyTarget, s.Target,
+				"trigger", s.Trigger, "scheduled_at", s.ScheduledAt)
+			d.unstoreLocked(f)
+			continue
+		case s.Trigger != store.TriggerManual && d.cfg.CatchUpWindow.Duration > 0 &&
+			now.Sub(s.ScheduledAt) > d.cfg.CatchUpWindow.Duration:
+			d.log.Warn("queued fire dropped: older than catch_up_window",
+				logging.KeyTaskID, s.TaskID, logging.KeyTarget, s.Target, "trigger", s.Trigger,
+				"scheduled_at", s.ScheduledAt, "catch_up_window", d.cfg.CatchUpWindow.String())
+			d.unstoreLocked(f)
+			continue
+		case s.Pending && dup:
+			// Submit keeps one pending fire per task, so this is not stored.
+			d.unstoreLocked(f)
+			continue
+		case s.Pending:
+			d.pending[t.ID] = f
+			if !d.taskInFlightLocked(t.ID, active) {
+				d.releasePendingLocked(t.ID)
+			}
+		default:
+			d.queue[t.Target] = append(d.queue[t.Target], f)
+		}
+		d.log.Info("queued fire restored", logging.KeyTaskID, t.ID, logging.KeyTarget, t.Target,
+			"trigger", s.Trigger, "scheduled_at", s.ScheduledAt)
+	}
+	return nil
+}
+
+// Resume starts the waiting fires that fit on their targets now. The
+// daemon calls it after Restore; while it runs, fires are also started by
+// Submit and RunEnded as usual.
+func (d *Dispatcher) Resume(ctx context.Context) {
+	d.mu.Lock()
+	targets := make([]string, 0, len(d.queue))
+	for target := range d.queue {
+		targets = append(targets, target)
+	}
+	d.mu.Unlock()
+	slices.Sort(targets)
+	for _, target := range targets {
+		d.drain(ctx, target)
 	}
 }
 

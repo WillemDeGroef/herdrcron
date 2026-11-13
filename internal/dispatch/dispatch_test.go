@@ -695,3 +695,161 @@ func TestQueueFireDuringAFailedLaunchStartsOnceTheTaskIsIdle(t *testing.T) {
 		t.Fatalf("starts = %+v, want the pending fire started once the failed launch left the task idle", starts)
 	}
 }
+
+// restart returns a new dispatcher and runner on the same store, as a
+// daemon restart gives. recovered are the runs the new runner still tracks.
+func restart(t *testing.T, cfg config.Config, st *store.Store, recovered ...store.Run) harness {
+	t.Helper()
+	h := newHarness(t, cfg, st)
+	for _, r := range recovered {
+		h.runs.recover(r.ID, r.TaskID, r.Target)
+	}
+	return h
+}
+
+func openStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+// restore restores and resumes one minute after t0.
+func restore(t *testing.T, h harness, tasks ...config.Task) {
+	t.Helper()
+	if err := h.d.Restore(context.Background(), tasks, t0.Add(time.Minute)); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	h.d.Resume(context.Background())
+}
+
+func oneSlot() config.Config {
+	return config.Config{Targets: map[string]config.Target{"local": {MaxParallel: 1}}}
+}
+
+func TestRestoreStartsMaxParallelFiresInTheirQueueOrder(t *testing.T) {
+	st := openStore(t)
+	a, b, c := task("a", "local", "parallel"), task("b", "local", "parallel"), task("c", "local", "parallel")
+	h := newHarness(t, oneSlot(), st)
+	first := submit(t, h, a, store.TriggerSchedule, t0, false)
+	if !submit(t, h, b, store.TriggerSchedule, t0.Add(time.Minute), false).Queued ||
+		!submit(t, h, c, store.TriggerManual, time.Time{}, false).Queued {
+		t.Fatal("want b and c queued behind a")
+	}
+
+	// The daemon restarts; a's run ended meanwhile, so the slot is free.
+	h = restart(t, oneSlot(), st)
+	restore(t, h, a, b, c)
+	starts := h.runs.startCalls()
+	if len(starts) != 1 || starts[0].TaskID != "b" || starts[0].Trigger != store.TriggerSchedule ||
+		!starts[0].ScheduledAt.Equal(t0.Add(time.Minute)) {
+		t.Fatalf("after restore: starts = %+v, want only b's scheduled fire (first run was %s)", starts, first.Run.ID)
+	}
+	ts, ok, err := st.GetTaskState(context.Background(), "b")
+	if err != nil || !ok || ts.LastRunID != starts[0].ID {
+		t.Errorf("task state of b = %+v ok=%v err=%v, want the restored fire recorded", ts, ok, err)
+	}
+	h.runs.end(t, starts[0].ID)
+	starts = h.runs.startCalls()
+	if len(starts) != 2 || starts[1].TaskID != "c" || starts[1].Trigger != store.TriggerManual {
+		t.Fatalf("after b ended: starts = %+v, want c's manual fire second", starts)
+	}
+
+	// Both fires started: a further restart has nothing to restore.
+	h = restart(t, oneSlot(), st)
+	restore(t, h, a, b, c)
+	if starts := h.runs.startCalls(); len(starts) != 0 {
+		t.Errorf("second restore started %+v, want nothing", starts)
+	}
+}
+
+func TestRestoreKeepsAPendingFireBehindItsRecoveredRun(t *testing.T) {
+	st := openStore(t)
+	tk := task("nightly", "local", "queue")
+	h := newHarness(t, config.Config{}, st)
+	first := submit(t, h, tk, store.TriggerSchedule, t0, false)
+	submit(t, h, tk, store.TriggerSchedule, t0.Add(time.Hour), false)
+
+	h = restart(t, config.Config{}, st, first.Run)
+	restore(t, h, tk)
+	if starts := h.runs.startCalls(); len(starts) != 0 {
+		t.Fatalf("restore started %+v while the task's run is active", starts)
+	}
+	// The restored fire is the task's one pending fire: a further one is dropped.
+	if out := submit(t, h, tk, store.TriggerSchedule, t0.Add(2*time.Hour), false); !out.Skipped {
+		t.Errorf("fire after restore = %+v, want skipped", out)
+	}
+	h.runs.end(t, first.Run.ID)
+	starts := h.runs.startCalls()
+	if len(starts) != 1 || !starts[0].ScheduledAt.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("after the run ended: starts = %+v, want the restored fire", starts)
+	}
+}
+
+func TestRestoreStartsAPendingFireWhoseRunEndedWithTheOldDaemon(t *testing.T) {
+	st := openStore(t)
+	tk := task("nightly", "local", "queue")
+	h := newHarness(t, config.Config{}, st)
+	submit(t, h, tk, store.TriggerSchedule, t0, false)
+	submit(t, h, tk, store.TriggerSchedule, t0.Add(time.Hour), false)
+
+	h = restart(t, config.Config{}, st) // the first run did not survive
+	restore(t, h, tk)
+	starts := h.runs.startCalls()
+	if len(starts) != 1 || !starts[0].ScheduledAt.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("starts = %+v, want the restored fire", starts)
+	}
+	h = restart(t, config.Config{}, st, starts[0])
+	restore(t, h, tk)
+	if starts := h.runs.startCalls(); len(starts) != 0 {
+		t.Errorf("second restore started %+v, want nothing", starts)
+	}
+}
+
+func TestRestoreDropsTheFireOfATaskThatIsGone(t *testing.T) {
+	st := openStore(t)
+	a, b := task("a", "local", "parallel"), task("b", "local", "parallel")
+	h := newHarness(t, oneSlot(), st)
+	submit(t, h, a, store.TriggerSchedule, t0, false)
+	submit(t, h, b, store.TriggerSchedule, t0, false)
+
+	h = restart(t, oneSlot(), st)
+	restore(t, h, a) // b was deleted while the daemon was down
+	if starts := h.runs.startCalls(); len(starts) != 0 {
+		t.Fatalf("starts = %+v, want nothing", starts)
+	}
+	if !strings.Contains(h.logs.String(), "queued fire dropped") {
+		t.Errorf("log does not tell the fire was dropped:\n%s", h.logs.String())
+	}
+	fires, err := st.ListQueuedFires(context.Background())
+	if err != nil || len(fires) != 0 {
+		t.Errorf("stored fires = %+v err=%v, want none", fires, err)
+	}
+}
+
+func TestRestoreDropsAScheduledFireOlderThanCatchUpWindow(t *testing.T) {
+	st := openStore(t)
+	cfg := oneSlot()
+	cfg.CatchUpWindow = config.Duration{Duration: time.Hour}
+	a, b, c := task("a", "local", "parallel"), task("b", "local", "parallel"), task("c", "local", "parallel")
+	h := newHarness(t, cfg, st)
+	submit(t, h, a, store.TriggerSchedule, t0, false)
+	submit(t, h, b, store.TriggerSchedule, t0.Add(-2*time.Hour), false) // too old at restore
+	submit(t, h, c, store.TriggerManual, time.Time{}, false)            // manual fires do not age
+
+	h = restart(t, cfg, st)
+	restore(t, h, a, b, c)
+	starts := h.runs.startCalls()
+	if len(starts) != 1 || starts[0].TaskID != "c" {
+		t.Fatalf("starts = %+v, want only c's manual fire", starts)
+	}
+	if !strings.Contains(h.logs.String(), "older than catch_up_window") {
+		t.Errorf("log does not tell the old fire was dropped:\n%s", h.logs.String())
+	}
+	if fires, err := st.ListQueuedFires(context.Background()); err != nil || len(fires) != 0 {
+		t.Errorf("stored fires = %+v err=%v, want none", fires, err)
+	}
+}

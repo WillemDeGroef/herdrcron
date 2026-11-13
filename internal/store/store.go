@@ -1,6 +1,7 @@
 // Package store keeps the herdrcron daemon state in SQLite: one row per run
-// in table runs, per task scheduling state in table task_state, and the
-// global pauses in table global_pause.
+// in table runs, per task scheduling state in table task_state, the global
+// pauses in table global_pause, and the fires that wait for a run to end or
+// for a free slot in table queued_fires.
 package store
 
 import (
@@ -68,6 +69,14 @@ CREATE TABLE IF NOT EXISTS task_state (
 );
 CREATE TABLE IF NOT EXISTS global_pause (
 	target TEXT PRIMARY KEY -- "" means all targets.
+);
+CREATE TABLE IF NOT EXISTS queued_fires (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT, -- queue order
+	task_id      TEXT NOT NULL,
+	target       TEXT NOT NULL,
+	trigger      TEXT NOT NULL,
+	scheduled_at TIMESTAMP,
+	pending      INTEGER NOT NULL -- 1: waits for the task's active run.
 );
 `
 
@@ -506,4 +515,103 @@ func (s *Store) DeleteTaskState(ctx context.Context, taskID string) error {
 		return fmt.Errorf("delete task state %s: %w", taskID, err)
 	}
 	return nil
+}
+
+// QueuedFire is a fire the dispatcher has not started yet. The daemon
+// stores it so that it survives a restart.
+type QueuedFire struct {
+	ID          int64 // Set by AddQueuedFire; a higher ID was queued later.
+	TaskID      string
+	Target      string
+	Trigger     string    // One of the Trigger values.
+	ScheduledAt time.Time // Planned fire time; zero for manual fires.
+	// Pending: the fire waits for the task's active run to end (overlap
+	// queue). Otherwise it waits in its target's max_parallel queue.
+	Pending bool
+}
+
+// AddQueuedFire stores f at the end of the queue and returns its ID. f.ID
+// is ignored.
+func (s *Store) AddQueuedFire(ctx context.Context, f QueuedFire) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `INSERT INTO queued_fires
+		(task_id, target, trigger, scheduled_at, pending) VALUES (?, ?, ?, ?, ?)`,
+		f.TaskID, f.Target, f.Trigger, timeValue(f.ScheduledAt), f.Pending)
+	if err != nil {
+		return 0, fmt.Errorf("add queued fire of %s: %w", f.TaskID, err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("add queued fire of %s: %w", f.TaskID, err)
+	}
+	return id, nil
+}
+
+// ReleaseQueuedFire moves a pending fire to the end of the queue and
+// clears its pending mark, in one transaction. It returns the fire's new
+// ID. The error wraps ErrNotFound if there is no such fire.
+func (s *Store) ReleaseQueuedFire(ctx context.Context, id int64) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("release queued fire %d: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `INSERT INTO queued_fires
+		(task_id, target, trigger, scheduled_at, pending)
+		SELECT task_id, target, trigger, scheduled_at, 0 FROM queued_fires WHERE id = ?`, id)
+	if err != nil {
+		return 0, fmt.Errorf("release queued fire %d: %w", id, err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return 0, fmt.Errorf("release queued fire %d: %w", id, err)
+	} else if n == 0 {
+		return 0, fmt.Errorf("queued fire %d: %w", id, ErrNotFound)
+	}
+	newID, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("release queued fire %d: %w", id, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM queued_fires WHERE id = ?`, id); err != nil {
+		return 0, fmt.Errorf("release queued fire %d: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("release queued fire %d: %w", id, err)
+	}
+	return newID, nil
+}
+
+// DeleteQueuedFire removes a queued fire: it is starting, or it was
+// dropped. A fire that does not exist is not an error.
+func (s *Store) DeleteQueuedFire(ctx context.Context, id int64) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM queued_fires WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete queued fire %d: %w", id, err)
+	}
+	return nil
+}
+
+// ListQueuedFires returns the queued fires in queue order, oldest first.
+func (s *Store) ListQueuedFires(ctx context.Context) ([]QueuedFire, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, task_id, target, trigger,
+		scheduled_at, pending FROM queued_fires ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list queued fires: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var fires []QueuedFire
+	for rows.Next() {
+		var (
+			f         QueuedFire
+			scheduled sql.NullString
+		)
+		if err := rows.Scan(&f.ID, &f.TaskID, &f.Target, &f.Trigger, &scheduled, &f.Pending); err != nil {
+			return nil, fmt.Errorf("list queued fires: %w", err)
+		}
+		if f.ScheduledAt, err = parseTime(scheduled); err != nil {
+			return nil, fmt.Errorf("list queued fires: %w", err)
+		}
+		fires = append(fires, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list queued fires: %w", err)
+	}
+	return fires, nil
 }
