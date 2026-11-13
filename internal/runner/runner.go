@@ -139,6 +139,8 @@ type targetState struct {
 	// start at once for the same repo share one hc- workspace.
 	openMu sync.Mutex
 
+	adoptMu sync.Mutex // serializes AdoptLost on the target
+
 	changeMu sync.Mutex // serializes reachability changes and their callbacks
 	reachMu  sync.Mutex
 	reach    reach
@@ -233,7 +235,8 @@ func (r *Runner) Start(ctx context.Context, t config.Task, trigger string, sched
 	r.mu.Unlock()
 	if errors.Is(err, target.ErrUnreachable) {
 		// Recorded so the missed policy can catch the fire up when the
-		// target answers again.
+		// target answers again. A launch whose reply was lost says so in
+		// its reason: AdoptLost looks for it.
 		a.log.Warn("target unreachable at fire time", "err", err)
 		return r.end(context.WithoutCancel(ctx), a, store.StatusHostUnreachable, err.Error())
 	}
@@ -295,6 +298,10 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 	a.log.Info("prompt file written", "prompt_file", t.PromptFile, "path", promptPath, "bytes", len(data))
 
 	if err := ts.herdr.PaneRun(ctx, a.run.HerdrPane, launchCommand(t.Agent, a.run.ID)); err != nil {
+		if errors.Is(err, target.ErrUnreachable) {
+			// The target may have run the command and lost only the reply.
+			return fmt.Errorf("%s: %w", reasonLaunchUnconfirmed, err)
+		}
 		return fmt.Errorf("launch agent: %w", err)
 	}
 	// Until the running status is stored the run counts as starting, so a

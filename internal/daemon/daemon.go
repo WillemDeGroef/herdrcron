@@ -160,7 +160,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	})
 	d.disp = dispatch.New(dispatch.Options{Runs: latestDef{d}, Store: st, Config: cfg, Log: log})
 	d.sched = scheduler.New(scheduler.Options{
-		Clock: clk, Store: st, Runs: d.disp, Config: cfg, Log: log,
+		Clock: clk, Store: st, Runs: d.disp, Adopt: d.runner, Config: cfg, Log: log,
 		OnPauseExpired: d.pauseExpired,
 	})
 	if err := d.loadGlobalPause(ctx); err != nil {

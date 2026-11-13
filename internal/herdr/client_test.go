@@ -148,6 +148,18 @@ func TestTabCreate(t *testing.T) {
 	}
 }
 
+func TestTabList(t *testing.T) {
+	f := &fakeTarget{replies: []reply{ok(readFixture(t, "tab_list.json"))}}
+	tabs, err := herdr.New(f, "").TabList(context.Background(), "w15")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkArgv(t, f, "herdr", "tab", "list", "--workspace", "w15")
+	if len(tabs) == 0 || tabs[0].TabID == "" || tabs[0].Label == "" {
+		t.Errorf("tabs = %+v, want tabs with id and label", tabs)
+	}
+}
+
 func TestTabRename(t *testing.T) {
 	out := []byte(`{"id":"cli:tab:rename","result":{"type":"tab_info","tab":{"agent_status":"unknown","focused":false,"label":"hc-x-0930","number":1,"pane_count":1,"tab_id":"w15:t1","workspace_id":"w15"}}}`)
 	f := &fakeTarget{replies: []reply{ok(out)}}

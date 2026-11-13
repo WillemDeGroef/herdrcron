@@ -89,8 +89,14 @@ type fakeHerdr struct {
 	resolvedCwd    string // what the preflight prints; "" = the cwd as given
 	output         string // pane read text
 	failRun        bool   // pane run fails
-	failPut        bool   // PutFile fails
-	version        string // `herdr --version` prints "herdr <version>"; "" = 0.9.1
+	// loseRunReply: pane run types the command, then the target drops
+	// before the reply arrives and stays unreachable.
+	loseRunReply bool
+	// dropBeforeRun: the target drops before pane run reaches it and stays
+	// unreachable; nothing is typed into the pane.
+	dropBeforeRun bool
+	failPut       bool   // PutFile fails
+	version       string // `herdr --version` prints "herdr <version>"; "" = 0.9.1
 	// hostEnv, when set, makes the shell-script calls (preflight and
 	// target check) run for real in a local sh with this environment
 	// (a temp HOME and PATH), instead of the canned answers above.
@@ -244,6 +250,15 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		return ok(herdr.TabCreatedResult{
 			Type: "tab_created", Tab: herdr.TabInfo{TabID: tab, WorkspaceID: ws, Label: label}, RootPane: pane,
 		})
+	case "tab list":
+		ws := flag(argv, "--workspace")
+		list := []herdr.TabInfo{}
+		for id, w := range f.tabs {
+			if w == ws {
+				list = append(list, herdr.TabInfo{TabID: id, WorkspaceID: w, Label: f.tabLabels[id]})
+			}
+		}
+		return ok(herdr.TabListResult{Type: "tab_list", Tabs: list})
 	case "tab rename":
 		f.tabLabels[argv[3]] = argv[4]
 		return ok(herdr.TabInfoResult{Type: "tab_info", Tab: herdr.TabInfo{TabID: argv[3], Label: argv[4]}})
@@ -267,7 +282,15 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		if f.failRun {
 			return nil, &target.ExitError{Code: 1, Stderr: []byte("boom")}
 		}
+		if f.dropBeforeRun {
+			f.dropBeforeRun, f.unreachable = false, true
+			return nil, &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connect to host: timed out\n")}
+		}
 		p.command = argv[4]
+		if f.loseRunReply {
+			f.loseRunReply, f.unreachable = false, true
+			return nil, &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connection reset\n")}
+		}
 		return nil, nil
 	case "pane send-keys":
 		p, found := f.panes[argv[3]]
@@ -289,7 +312,8 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 			return nil, herdrErr(herdr.CodePaneNotFound)
 		}
 		pid, fg := uint32(100), uint32(200)
-		if p.current().atPrompt {
+		// A pane nothing was typed into is a shell at its prompt.
+		if p.command == "" || p.current().atPrompt {
 			fg = pid
 		}
 		return ok(herdr.PaneProcessInfoResult{Type: "pane_process_info", ProcessInfo: herdr.PaneProcessInfo{

@@ -42,24 +42,28 @@ type fakeHerdr struct {
 	puts       []string          // contents of every PutFile, in order
 	workspaces map[string]string // label -> id
 	tabs       map[string]string // tab id -> workspace id
+	tabLabels  map[string]string // tab id -> label
 	panes      map[string]*fakePane
 	order      []string // pane ids in creation order
 	nextID     int
 
-	name        string        // target name; "" means "local"
-	unreachable bool          // every call fails as ssh exit 255 would
-	output      string        // pane read text
-	ansiOutput  string        // pane read --format ansi text
-	bin         string        // the herdr binary it answers to; "" means "herdr"
-	readErr     error         // pane read --format ansi fails with it
-	putGate     chan struct{} // PutFile waits until it is closed
-	execGate    chan struct{} // Exec waits until it is closed
+	name        string // target name; "" means "local"
+	unreachable bool   // every call fails as ssh exit 255 would
+	// loseRunReply: the next pane run is accepted, then the target drops
+	// before the reply arrives and stays unreachable.
+	loseRunReply bool
+	output       string        // pane read text
+	ansiOutput   string        // pane read --format ansi text
+	bin          string        // the herdr binary it answers to; "" means "herdr"
+	readErr      error         // pane read --format ansi fails with it
+	putGate      chan struct{} // PutFile waits until it is closed
+	execGate     chan struct{} // Exec waits until it is closed
 }
 
 func newFakeHerdr() *fakeHerdr {
 	return &fakeHerdr{
 		files: map[string][]byte{}, workspaces: map[string]string{},
-		tabs: map[string]string{}, panes: map[string]*fakePane{},
+		tabs: map[string]string{}, tabLabels: map[string]string{}, panes: map[string]*fakePane{},
 	}
 }
 
@@ -112,6 +116,12 @@ func (f *fakeHerdr) set(paneID string, s paneState) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.panes[paneID].state = s
+}
+
+func (f *fakeHerdr) setLoseRunReply() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.loseRunReply = true
 }
 
 func (f *fakeHerdr) setUnreachable(v bool) {
@@ -299,10 +309,21 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		}
 		label := flag(argv, "--label")
 		tab, pane := f.newTab(ws)
+		f.tabLabels[tab] = label
 		return ok(herdr.TabCreatedResult{
 			Type: "tab_created", Tab: herdr.TabInfo{TabID: tab, WorkspaceID: ws, Label: label}, RootPane: pane,
 		})
+	case "tab list":
+		ws := flag(argv, "--workspace")
+		list := []herdr.TabInfo{}
+		for id, w := range f.tabs {
+			if w == ws {
+				list = append(list, herdr.TabInfo{TabID: id, WorkspaceID: w, Label: f.tabLabels[id]})
+			}
+		}
+		return ok(herdr.TabListResult{Type: "tab_list", Tabs: list})
 	case "tab rename":
+		f.tabLabels[argv[3]] = argv[4]
 		return ok(herdr.TabInfoResult{Type: "tab_info", Tab: herdr.TabInfo{TabID: argv[3], Label: argv[4]}})
 	case "tab close":
 		id := argv[3]
@@ -328,6 +349,10 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 				return []byte(f.ansiOutput), nil
 			}
 			return []byte(f.output), nil
+		}
+		if argv[2] == "run" && f.loseRunReply {
+			f.loseRunReply, f.unreachable = false, true
+			return nil, f.unreachableErr()
 		}
 		return nil, nil
 	case "pane process-info":
