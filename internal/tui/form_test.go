@@ -83,15 +83,12 @@ func TestNewFormCreatesWithDefaults(t *testing.T) {
 	typeText(tm, "my-task")
 	tabs(tm, fSchedule)
 	typeText(tm, "@daily")
-	tabs(tm, fCommand-fSchedule)
-	typeText(tm, "claude")
-	tabs(tm, fTimeout-fCommand)
-	typeText(tm, "30m")
+	// The agent command and the timeout are pre-filled (config.NewTask).
 	tm.Send(ctrl(tea.KeyCtrlS))
 	got := waitCall(t, f, api.MethodTasksCreate, 1)
 	want := api.TaskWriteParams{Task: api.TaskDef{
 		ID: "my-task", Target: "local", Schedule: "@daily", Enabled: true,
-		Agent: api.AgentDef{Command: "claude"}, Timeout: "30m",
+		Agent: api.AgentDef{Command: "claude"}, Timeout: "2h",
 		Overlap: "skip", Missed: "run_once", OnDone: "close_tab", OnBlocked: "notify",
 	}}
 	if !reflect.DeepEqual(got[0], want) {
