@@ -719,22 +719,35 @@ func (m Model) fieldNote(f formField) string {
 }
 
 // schedulePreview is the next 3 fire times of the schedule as typed, or
-// why it does not parse.
+// why it does not parse. It follows a global pause on the target as typed
+// and the paused until field: no fire times under a pause without an end,
+// and the fires after a timed pause.
 func (m Model) schedulePreview() string {
 	expr := strings.TrimSpace(m.form.get("schedule"))
 	if expr == "" {
 		return ""
 	}
-	fires, err := nextFires(expr, strings.TrimSpace(m.form.get("timezone")), m.status.Timezone, m.loc, m.now(), 3)
+	h := m.holdOn(strings.TrimSpace(m.form.get("target")), strings.TrimSpace(m.form.get("paused_until")))
+	fires, err := nextFires(expr, strings.TrimSpace(m.form.get("timezone")), m.status.Timezone, m.loc, h.from(expr, m.now()), 3)
 	if err != nil {
 		return m.st.critical.Render("✗ " + err.Error())
 	}
-	if len(fires) == 0 {
+	if h.endless() {
+		return m.st.dim.Render(h.text(m.loc))
+	}
+	lead := "next:"
+	if !h.none() {
+		lead = h.text(m.loc) + ":"
+	}
+	switch {
+	case len(fires) == 0 && h.none():
 		return m.st.dim.Render("never fires again")
+	case len(fires) == 0:
+		return m.st.dim.Render(lead + " never fires again")
 	}
 	var ts []string
 	for _, t := range fires {
 		ts = append(ts, t.In(m.loc).Format(fireLayout))
 	}
-	return m.st.dim.Render("next: " + strings.Join(ts, " · "))
+	return m.st.dim.Render(lead + " " + strings.Join(ts, " · "))
 }
