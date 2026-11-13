@@ -329,27 +329,27 @@ func (d *daemon) tasksDelete(ctx context.Context, params json.RawMessage) (any, 
 
 // removeUnusedPromptLocked removes the prompt file task id used until now,
 // after a delete or after an update moved the task to another prompt_file.
-// The file stays when a task in d.tasks still points at it, by path or as
-// the same file through a link, when a task file does not parse (its
-// prompt_file is unknown), and when it is outside the config directory. A failure is logged: the task itself is already stored. Call
-// it with d.mu held and d.tasks up to date.
+// The file stays when a task file still names it, by path or as the same
+// file through a link, when a task file does not parse (its prompt_file is
+// unknown), and when it is outside the config directory. Task files are
+// read from disk, so a hand edit the watcher has not reloaded yet still
+// counts. A failure to remove is logged: the task itself is already
+// stored. Call it with d.mu held and d.tasks up to date.
 func (d *daemon) removeUnusedPromptLocked(id, promptPath string) {
 	if !d.inConfigDir(promptPath) {
 		return
 	}
-	info, err := os.Stat(promptPath)
+	info, statErr := os.Stat(promptPath)
 	inUse := slices.ContainsFunc(d.tasks, func(o config.TaskEntry) bool {
-		if o.Err != nil {
-			if _, err := config.ReadTaskLenient(o.File); err != nil {
-				return true
-			}
+		other, known := d.promptPathInFile(o)
+		if !known {
+			return true
 		}
-		other := d.promptPathOf(o)
 		if filepath.Clean(other) == filepath.Clean(promptPath) {
 			return true
 		}
 		otherInfo, otherErr := os.Stat(other)
-		return err == nil && otherErr == nil && os.SameFile(info, otherInfo)
+		return statErr == nil && otherErr == nil && os.SameFile(info, otherInfo)
 	})
 	if inUse {
 		return
@@ -357,6 +357,23 @@ func (d *daemon) removeUnusedPromptLocked(id, promptPath string) {
 	if err := os.Remove(promptPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		d.log.Warn("cannot remove prompt file", logging.KeyTaskID, id, "err", err)
 	}
+}
+
+// promptPathInFile is the prompt path the task file names on disk.
+// known is false when that file does not parse, so its prompt_file cannot
+// be told. A type error still carries the fields that parsed, which
+// promptPathOf does not: it falls back to prompts/<id>.md whenever the
+// lenient read returns an error, and would both invent a path for a syntax
+// error and hide the prompt_file a bad field left intact.
+func (d *daemon) promptPathInFile(e config.TaskEntry) (string, bool) {
+	t, err := config.ReadTaskLenient(e.File)
+	if err != nil && t.PromptFile == "" {
+		return "", false
+	}
+	if t.PromptFile == "" {
+		t.PromptFile = config.DefaultTask(e.ID).PromptFile
+	}
+	return config.PromptPath(t.PromptFile, d.configDir), true
 }
 
 // restoreSchedule schedules a task again after its delete gave up.
