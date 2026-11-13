@@ -31,7 +31,7 @@ type env struct {
 	runner    *runner.Runner
 	configDir string
 	dbPath    string
-	log       *bytes.Buffer
+	log       *lockedBuffer
 	logger    *slog.Logger // one handler: runners before and after a restart share log
 
 	mu      sync.Mutex
@@ -43,6 +43,25 @@ type env struct {
 }
 
 type notification struct{ event, message string }
+
+// lockedBuffer is the test log sink. Cleanup runs in its own goroutine, so
+// a test that reads the log while that goroutine writes needs the lock.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) Bytes() []byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return bytes.Clone(l.b.Bytes())
+}
 
 // recordNotify is like daemon.runChanged notifications: blocked and end
 // statuses that notify.on would fire for.
@@ -93,7 +112,7 @@ func newEnv(t *testing.T) *env {
 	e := &env{
 		t: t, ctx: context.Background(), store: st, herdr: newFakeHerdr(), configDir: dir, dbPath: dbPath,
 		clock: clock.NewFake(time.Date(2026, 11, 6, 7, 0, 0, 0, time.UTC)),
-		log:   &bytes.Buffer{},
+		log:   &lockedBuffer{},
 	}
 	e.logger = slog.New(slog.NewJSONHandler(e.log, nil))
 	e.runner = e.newRunner()

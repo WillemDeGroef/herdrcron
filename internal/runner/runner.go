@@ -985,15 +985,16 @@ const (
 // stopOnTarget is the part of step 10 that runs on the target, as adapted
 // in docs/herdr-findings.md: esc (dismisses a question dialog), Ctrl-C
 // twice in one call (exits Claude Code), again after 2 s, then after 10 s
-// the output tail is read and the tab closed. It returns the tail and what
-// became of the tab (reasonTabClosed, reasonTabGone or reasonTabNotClosed).
+// the output tail is read and the tab closed. It returns the tail and the
+// exit-reason suffix for what became of the tab (reasonTabClosed,
+// reasonTabGone or reasonTabNotClosed).
 //
 // An error matching target.ErrUnreachable means the target did not answer
 // one of the calls, or is known not to: the rest is skipped, the tab may
 // still be open, and the target is marked unreachable. The tail is
 // returned with it if it was read before the target dropped. Any other error is
 // ctx's, during a wait. Other key, read and close errors are logged only.
-func (r *Runner) stopOnTarget(ctx context.Context, ts *targetState, log *slog.Logger, run store.Run) (tail, tab string, err error) {
+func (r *Runner) stopOnTarget(ctx context.Context, ts *targetState, log *slog.Logger, run store.Run) (tail, outcome string, err error) {
 	if err := r.knownUnreachable(ts, run.Target); err != nil {
 		return "", "", err
 	}
@@ -1037,25 +1038,39 @@ func (r *Runner) stopOnTarget(ctx context.Context, ts *targetState, log *slog.Lo
 			return "", "", err
 		}
 	}
-	tab = reasonTabClosed
+	outcome = reasonTabClosed
 	if run.HerdrTab != "" {
 		err := ts.herdr.TabClose(ctx, run.HerdrTab)
 		switch {
 		case err == nil:
 		case herdr.IsCode(err, herdr.CodeTabNotFound):
-			tab = reasonTabGone
+			outcome = reasonTabGone
 		case herdr.IsCode(err, herdr.CodeServerNotRunning):
 			log.Warn("cannot close tab", "herdr_tab", run.HerdrTab, "err", err)
-			tab = reasonTabGone
+			outcome = reasonTabGone
 		default:
 			log.Warn("cannot close tab", "herdr_tab", run.HerdrTab, "err", err)
 			if err := unreachable(err); err != nil {
 				return tail, "", err // the tail was read; the caller keeps it
 			}
-			tab = reasonTabNotClosed
+			outcome = reasonTabNotClosed
 		}
 	}
-	return tail, tab, nil
+	return tail, outcome, nil
+}
+
+// tabOutcomeSettled reports whether reason already ends with what became of
+// the tab, so a cleanup retry must not run step 10 again or append a second
+// phrase.
+func tabOutcomeSettled(reason string) bool {
+	return strings.HasSuffix(reason, reasonTabClosed) ||
+		strings.HasSuffix(reason, reasonTabGone) ||
+		strings.HasSuffix(reason, reasonTabNotClosed)
+}
+
+// withTabOutcome replaces the "tab may still be open" caveat with outcome.
+func withTabOutcome(reason, outcome string) string {
+	return strings.TrimSuffix(reason, reasonTabMayBeOpen) + outcome
 }
 
 // pendingCleanup is an ended run whose stop could not reach its target:
@@ -1137,40 +1152,75 @@ func (r *Runner) resumeCleanups(name string) {
 
 // cleanup finishes the stop of an ended run now that its target answers:
 // the stop keys, the output tail, the tab and the prompt file. The row then
-// says what became of the tab. If the target drops again, or the daemon
+// says what became of the tab. A store write that fails leaves the cleanup
+// pending, and the next try amends the row without repeating a stop that
+// already reached the target. If the target drops again, or the daemon
 // stops, the cleanup stays pending.
 func (r *Runner) cleanup(ctx context.Context, c *pendingCleanup) {
 	<-c.ready // closed as soon as the store has answered
 	r.mu.Lock()
 	run := c.run
 	r.mu.Unlock()
-	ts := r.targets[run.Target]
-	c.log.Info("target reachable again; finishing the stop", "herdr_tab", run.HerdrTab)
-	tail, tab, err := r.stopOnTarget(ctx, ts, c.log, run)
-	if err != nil {
-		c.log.Warn("cannot finish the stop; it stays pending", "err", err)
+	stay := func() {
 		r.mu.Lock()
 		c.running = false
 		r.mu.Unlock()
+	}
+
+	if !tabOutcomeSettled(run.ExitReason) {
+		ts := r.targets[run.Target]
+		if ts == nil {
+			c.log.Warn("target not configured; the stop stays pending", "herdr_tab", run.HerdrTab)
+			stay()
+			return
+		}
+		c.log.Info("target reachable again; finishing the stop", "herdr_tab", run.HerdrTab)
+		tail, outcome, err := r.stopOnTarget(ctx, ts, c.log, run)
+		if err != nil {
+			c.log.Warn("cannot finish the stop; it stays pending", "err", err)
+			stay()
+			return
+		}
+		// From here the stop reached the target and must be stored.
+		ctx = context.WithoutCancel(ctx)
+		if run.HerdrPane != "" {
+			if err := ts.t.RemoveFile(ctx, promptPath(run.ID)); err != nil {
+				c.log.Warn("cannot delete prompt file", "err", err)
+			}
+		}
+		run.ExitReason = withTabOutcome(run.ExitReason, outcome)
+		if tail != "" {
+			run.OutputTail = tail
+		}
+		// Remember the outcome before the store write, so a failed amend
+		// retries the write and not step 10 (the tab is already closed).
+		r.mu.Lock()
+		c.run = run
+		r.mu.Unlock()
+	} else {
+		ctx = context.WithoutCancel(ctx)
+	}
+
+	stored, err := r.store.GetRun(ctx, run.ID)
+	if err != nil {
+		c.log.Error("cannot read the run to finish the stop", "err", err)
+		stay()
 		return
 	}
-	ctx = context.WithoutCancel(ctx)
-	if run.HerdrPane != "" {
-		if err := ts.t.RemoveFile(ctx, promptPath(run.ID)); err != nil {
-			c.log.Warn("cannot delete prompt file", "err", err)
+	if stored.ExitReason != run.ExitReason || stored.OutputTail != run.OutputTail {
+		if err := r.store.UpdateRun(ctx, run); err != nil {
+			c.log.Error("cannot store the finished stop", "err", err)
+			stay()
+			return
 		}
-	}
-	run.ExitReason = strings.TrimSuffix(run.ExitReason, reasonTabMayBeOpen) + tab
-	if tail != "" {
-		run.OutputTail = tail
-	}
-	if err := r.store.UpdateRun(ctx, run); err != nil {
-		c.log.Error("cannot store the finished stop", "err", err)
-	} else if r.onAmend != nil {
-		r.onAmend(run)
+		if r.onAmend != nil {
+			r.onAmend(run)
+		}
 	}
 	if err := r.store.SetPendingCleanup(ctx, run.ID, false); err != nil {
 		c.log.Error("cannot clear pending cleanup", "err", err)
+		stay()
+		return
 	}
 	r.mu.Lock()
 	delete(r.cleanups, run.ID)

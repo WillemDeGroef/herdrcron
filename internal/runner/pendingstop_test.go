@@ -2,6 +2,7 @@ package runner_test
 
 import (
 	"context"
+	"database/sql"
 	"slices"
 	"testing"
 	"time"
@@ -296,5 +297,172 @@ func TestStopKeepsTheTailWhenTheTargetDropsBeforeTheTabClose(t *testing.T) {
 	e.waitReason(run.ID, reasonTabClosed)
 	if e.herdr.tabOpen(run.HerdrTab) {
 		t.Errorf("tab left open")
+	}
+}
+
+// openDB opens a second connection on the env's database. The caller uses
+// it to inject a failure the store connection then hits; it stays open so
+// that connection sees the schema change.
+func (e *env) openDB() *sql.DB {
+	e.t.Helper()
+	db, err := sql.Open("sqlite", e.dbPath)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// recordAmends makes the next runner report OnAmend calls on amended.
+func (e *env) recordAmends(amended *[]store.Run) {
+	e.onAmend = func(r store.Run) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		*amended = append(*amended, r)
+	}
+	e.runner = e.newRunner()
+}
+
+func (e *env) amendedRuns(amended *[]store.Run) []store.Run {
+	e.t.Helper()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(*amended)
+}
+
+// The tab is closed, then the row update fails: the cleanup stays pending
+// and the next try stores the same outcome without stopping again.
+func TestPendingStopKeepsTheCleanupWhenTheAmendFails(t *testing.T) {
+	e := newEnv(t)
+	var amended []store.Run
+	e.recordAmends(&amended)
+	run := e.stopUnreachable()
+	db := e.openDB()
+	if _, err := db.Exec(`CREATE TRIGGER fail_amend BEFORE UPDATE ON runs WHEN OLD.id = '` + run.ID +
+		`' BEGIN SELECT RAISE(ABORT, 'disk on fire'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	e.setUnreachable(false)
+	e.runner.PollTarget(e.ctx, "local")
+	e.driveStop()
+	e.waitFor("the amend to fail", func() bool {
+		return len(e.logLines("cannot store the finished stop")) >= 1
+	})
+	if got := e.get(run.ID); got.ExitReason != reasonTabMayBeOpen || !got.EndedAt.Equal(run.EndedAt) {
+		t.Fatalf("stored run = %q ended %v, want %q still", got.ExitReason, got.EndedAt, reasonTabMayBeOpen)
+	}
+	if pending, err := e.store.ListPendingCleanups(e.ctx); err != nil || len(pending) != 1 {
+		t.Fatalf("pending cleanups = %v, %v; want the run kept", pending, err)
+	}
+	if e.herdr.tabOpen(run.HerdrTab) {
+		t.Fatal("tab left open after the stop that could not be stored")
+	}
+	if n := len(e.amendedRuns(&amended)); n != 0 {
+		t.Fatalf("OnAmend called %d times before the row was stored", n)
+	}
+	steps := e.stopSteps()
+
+	if _, err := db.Exec(`DROP TRIGGER fail_amend`); err != nil {
+		t.Fatal(err)
+	}
+	e.waitFor("the amend to be stored", func() bool {
+		e.runner.PollTarget(e.ctx, "local")
+		return e.get(run.ID).ExitReason == reasonTabClosed && len(e.amendedRuns(&amended)) == 1
+	})
+	if got := e.stopSteps(); !slices.Equal(got, steps) {
+		t.Errorf("stop calls after the retry = %q, want %q", got, steps)
+	}
+	if pending, err := e.store.ListPendingCleanups(e.ctx); err != nil || len(pending) != 0 {
+		t.Errorf("pending cleanups = %v, %v; want none", pending, err)
+	}
+	if got := e.amendedRuns(&amended); len(got) != 1 || got[0].ExitReason != reasonTabClosed {
+		t.Errorf("OnAmend = %+v, want one call with %q", got, reasonTabClosed)
+	}
+	if n := len(e.endedRuns()); n != 1 {
+		t.Errorf("OnEnd called %d times, want 1", n)
+	}
+}
+
+// The row already says the tab was closed, but the pending row survived
+// (its delete failed, or the daemon died after the amend). A restart clears
+// it and does not stop again, so the reason is not given a second phrase.
+func TestPendingStopAlreadyRecordedIsNotRunAgain(t *testing.T) {
+	e := newEnv(t)
+	run := e.stopUnreachable()
+	e.setUnreachable(false)
+	e.runner.PollTarget(e.ctx, "local")
+	e.driveStop()
+	e.waitReason(run.ID, reasonTabClosed)
+	steps := e.stopSteps()
+	if err := e.store.SetPendingCleanup(e.ctx, run.ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	var amended []store.Run
+	e.onAmend = func(r store.Run) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		amended = append(amended, r)
+	}
+	e.restart(deps())
+	e.waitFor("the leftover cleanup to clear", func() bool {
+		pending, err := e.store.ListPendingCleanups(e.ctx)
+		return err == nil && len(pending) == 0
+	})
+	if got := e.get(run.ID); got.ExitReason != reasonTabClosed {
+		t.Fatalf("exit reason = %q, want %q", got.ExitReason, reasonTabClosed)
+	}
+	if got := e.stopSteps(); !slices.Equal(got, steps) {
+		t.Errorf("stop calls after the restart = %q, want %q", got, steps)
+	}
+	if n := len(e.amendedRuns(&amended)); n != 0 {
+		t.Errorf("OnAmend called %d times for a row that already recorded the close", n)
+	}
+}
+
+// The amend is stored, then clearing the pending row fails: the next try
+// only clears it, and does not amend or stop a second time.
+func TestPendingStopRetriesClearingWhenTheDeleteFails(t *testing.T) {
+	e := newEnv(t)
+	var amended []store.Run
+	e.recordAmends(&amended)
+	run := e.stopUnreachable()
+	db := e.openDB()
+	if _, err := db.Exec(`CREATE TRIGGER fail_clear BEFORE DELETE ON pending_cleanups BEGIN SELECT RAISE(ABORT, 'disk on fire'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	e.setUnreachable(false)
+	e.runner.PollTarget(e.ctx, "local")
+	e.driveStop()
+	got := e.waitReason(run.ID, reasonTabClosed)
+	e.waitFor("the clear to fail", func() bool {
+		return len(e.logLines("cannot clear pending cleanup")) >= 1
+	})
+	if pending, err := e.store.ListPendingCleanups(e.ctx); err != nil || len(pending) != 1 {
+		t.Fatalf("pending cleanups = %v, %v; want the run kept", pending, err)
+	}
+	if n := len(e.amendedRuns(&amended)); n != 1 {
+		t.Fatalf("OnAmend called %d times, want 1", n)
+	}
+	steps := e.stopSteps()
+
+	if _, err := db.Exec(`DROP TRIGGER fail_clear`); err != nil {
+		t.Fatal(err)
+	}
+	e.waitFor("the pending cleanup to clear", func() bool {
+		e.runner.PollTarget(e.ctx, "local")
+		pending, err := e.store.ListPendingCleanups(e.ctx)
+		return err == nil && len(pending) == 0
+	})
+	if again := e.get(run.ID); again.ExitReason != reasonTabClosed || !again.EndedAt.Equal(got.EndedAt) {
+		t.Fatalf("run after the clear = %q ended %v, want %q ended %v", again.ExitReason, again.EndedAt, reasonTabClosed, got.EndedAt)
+	}
+	if stepsNow := e.stopSteps(); !slices.Equal(stepsNow, steps) {
+		t.Errorf("stop calls after the clear retry = %q, want %q", stepsNow, steps)
+	}
+	if n := len(e.amendedRuns(&amended)); n != 1 {
+		t.Errorf("OnAmend called %d times, want 1", n)
 	}
 }
