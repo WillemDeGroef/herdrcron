@@ -32,6 +32,24 @@ type fakeRuns struct {
 	// beforeInsert runs synchronously at the start of Start, before the run
 	// row is inserted (used to simulate pause/disable mid-tick).
 	beforeInsert func(t config.Task)
+	// adopt answers AdoptLost; nil adopts nothing.
+	adopt func(t config.Task) (store.Run, bool, error)
+}
+
+func (f *fakeRuns) AdoptLost(_ context.Context, t config.Task) (store.Run, bool, error) {
+	f.mu.Lock()
+	adopt := f.adopt
+	f.mu.Unlock()
+	if adopt == nil {
+		return store.Run{}, false, nil
+	}
+	return adopt(t)
+}
+
+func (f *fakeRuns) setAdopt(adopt func(t config.Task) (store.Run, bool, error)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.adopt = adopt
 }
 
 type startCall struct {
@@ -142,6 +160,7 @@ func (e *env) newScheduler() *scheduler.Scheduler {
 		Clock:  e.clock,
 		Store:  e.store,
 		Runs:   e.starter,
+		Adopt:  e.starter,
 		Config: e.config,
 		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		OnPauseExpired: func(_ context.Context, id string) error {

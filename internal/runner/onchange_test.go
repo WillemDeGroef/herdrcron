@@ -1,7 +1,6 @@
 package runner_test
 
 import (
-	"log/slog"
 	"slices"
 	"sync"
 	"testing"
@@ -43,7 +42,7 @@ func (e *env) withOnChange(onChange func(store.Run)) {
 		Targets:         map[string]target.Target{"local": e.herdr},
 		Config:          config.Config{Timezone: "Europe/Brussels", Targets: map[string]config.Target{"local": {}}},
 		ConfigDir:       e.configDir,
-		Log:             slog.New(slog.NewJSONHandler(e.log, nil)),
+		Log:             e.logger,
 		ServerStartWait: 50 * time.Millisecond,
 		OnChange:        onChange,
 	})

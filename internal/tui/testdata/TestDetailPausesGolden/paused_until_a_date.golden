@@ -1,0 +1,32 @@
+ factory-coordinator
+  state         ⏸ paused
+  name          Factory coordinator
+  target        vps
+  cwd           /srv/factory
+  schedule      */30 * * * *
+  timezone      Europe/Brussels
+  enabled       yes
+  paused until  2026-11-10T08:00:00Z
+  agent         claude --model opus
+  prompt file   prompts/factory-coordinator.md
+  timeout       45m
+  overlap       skip
+  missed        run_once
+  on done       close
+  on blocked    notify
+  env           FACTORY_MODE GH_TOKEN
+
+ Next fires
+  paused until Tue Nov 10 08:00 UTC, then
+  Tue Nov 10 08:00 UTC
+  Tue Nov 10 08:30 UTC
+  Tue Nov 10 09:00 UTC
+  Tue Nov 10 09:30 UTC
+  Tue Nov 10 10:00 UTC
+
+ Runs
+  STATUS  TRIGGER   START        DURATION  REASON
+› failed  manual    Nov 5 09:00  1m30s     agent exited 1
+  done    schedule  Nov 5 08:00  12m00s
+
+ ↑/↓ run  enter output  l live output  a attach  esc back

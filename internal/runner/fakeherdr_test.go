@@ -39,6 +39,7 @@ var (
 
 type fakePane struct {
 	id, tab, ws string
+	terminal    string // changes when a restarted server restores the pane
 	script      []sample
 	polls       int // pane lists since pane run
 	command     string
@@ -77,16 +78,25 @@ type fakeHerdr struct {
 	order      []string // pane ids in creation order
 	scripts    [][]sample
 	nextID     int
+	terminals  int
 
-	serverDown   bool   // herdr calls fail with server_not_running
-	unreachable  bool   // herdr calls fail as an ssh target that does not answer
-	serverStarts bool   // starting the server brings it up
-	preflight    string // stderr line of a failing preflight; "" = ok
-	resolvedCwd  string // what the preflight prints; "" = the cwd as given
-	output       string // pane read text
-	failRun      bool   // pane run fails
-	failPut      bool   // PutFile fails
-	version      string // `herdr --version` prints "herdr <version>"; "" = 0.9.1
+	serverDown  bool // herdr calls fail with server_not_running
+	unreachable bool // herdr calls fail as an ssh target that does not answer
+	// unreachableFor makes only this herdr command ("tab close") fail so.
+	unreachableFor string
+	serverStarts   bool   // starting the server brings it up
+	preflight      string // stderr line of a failing preflight; "" = ok
+	resolvedCwd    string // what the preflight prints; "" = the cwd as given
+	output         string // pane read text
+	failRun        bool   // pane run fails
+	// loseRunReply: pane run types the command, then the target drops
+	// before the reply arrives and stays unreachable.
+	loseRunReply bool
+	// dropBeforeRun: the target drops before pane run reaches it and stays
+	// unreachable; nothing is typed into the pane.
+	dropBeforeRun bool
+	failPut       bool   // PutFile fails
+	version       string // `herdr --version` prints "herdr <version>"; "" = 0.9.1
 	// hostEnv, when set, makes the shell-script calls (preflight and
 	// target check) run for real in a local sh with this environment
 	// (a temp HOME and PATH), instead of the canned answers above.
@@ -122,6 +132,9 @@ func (f *fakeHerdr) PutFile(_ context.Context, path string, data []byte) error {
 func (f *fakeHerdr) RemoveFile(_ context.Context, path string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.unreachable {
+		return &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connect to host: Connection refused\n")}
+	}
 	delete(f.files, path)
 	return nil
 }
@@ -179,7 +192,7 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		return f.preflightCheck(argv)
 	}
 	cmd := strings.Join(argv[1:min(3, len(argv))], " ")
-	if f.unreachable {
+	if f.unreachable || (f.unreachableFor != "" && f.unreachableFor == cmd) {
 		return nil, &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connect to host: Connection refused\n")}
 	}
 	if cmd == "--version" {
@@ -204,7 +217,7 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 			if s.gone {
 				continue
 			}
-			info := herdr.PaneInfo{PaneID: p.id, TabID: p.tab, WorkspaceID: p.ws, AgentStatus: s.status}
+			info := herdr.PaneInfo{PaneID: p.id, TabID: p.tab, WorkspaceID: p.ws, TerminalID: p.terminal, AgentStatus: s.status}
 			if s.agent != "" {
 				info.Agent = &s.agent
 			}
@@ -237,6 +250,15 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		return ok(herdr.TabCreatedResult{
 			Type: "tab_created", Tab: herdr.TabInfo{TabID: tab, WorkspaceID: ws, Label: label}, RootPane: pane,
 		})
+	case "tab list":
+		ws := flag(argv, "--workspace")
+		list := []herdr.TabInfo{}
+		for id, w := range f.tabs {
+			if w == ws {
+				list = append(list, herdr.TabInfo{TabID: id, WorkspaceID: w, Label: f.tabLabels[id]})
+			}
+		}
+		return ok(herdr.TabListResult{Type: "tab_list", Tabs: list})
 	case "tab rename":
 		f.tabLabels[argv[3]] = argv[4]
 		return ok(herdr.TabInfoResult{Type: "tab_info", Tab: herdr.TabInfo{TabID: argv[3], Label: argv[4]}})
@@ -260,7 +282,15 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		if f.failRun {
 			return nil, &target.ExitError{Code: 1, Stderr: []byte("boom")}
 		}
+		if f.dropBeforeRun {
+			f.dropBeforeRun, f.unreachable = false, true
+			return nil, &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connect to host: timed out\n")}
+		}
 		p.command = argv[4]
+		if f.loseRunReply {
+			f.loseRunReply, f.unreachable = false, true
+			return nil, &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connection reset\n")}
+		}
 		return nil, nil
 	case "pane send-keys":
 		p, found := f.panes[argv[3]]
@@ -282,7 +312,8 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 			return nil, herdrErr(herdr.CodePaneNotFound)
 		}
 		pid, fg := uint32(100), uint32(200)
-		if p.current().atPrompt {
+		// A pane nothing was typed into is a shell at its prompt.
+		if p.command == "" || p.current().atPrompt {
 			fg = pid
 		}
 		return ok(herdr.PaneProcessInfoResult{Type: "pane_process_info", ProcessInfo: herdr.PaneProcessInfo{
@@ -299,13 +330,34 @@ func (f *fakeHerdr) newTab(ws, label string) (string, herdr.PaneInfo) {
 	pane := fmt.Sprintf("%s:p%d", ws, f.nextID)
 	f.tabs[tab] = ws
 	f.tabLabels[tab] = label
-	p := &fakePane{id: pane, tab: tab, ws: ws}
+	p := &fakePane{id: pane, tab: tab, ws: ws, terminal: f.newTerminal()}
 	if len(f.scripts) > 0 {
 		p.script, f.scripts = f.scripts[0], f.scripts[1:]
 	}
 	f.panes[pane] = p
 	f.order = append(f.order, pane)
-	return tab, herdr.PaneInfo{PaneID: pane, TabID: tab, WorkspaceID: ws, AgentStatus: herdr.AgentStatusUnknown}
+	return tab, herdr.PaneInfo{PaneID: pane, TabID: tab, WorkspaceID: ws, TerminalID: p.terminal, AgentStatus: herdr.AgentStatusUnknown}
+}
+
+func (f *fakeHerdr) newTerminal() string {
+	f.terminals++
+	return fmt.Sprintf("term_%d", f.terminals)
+}
+
+// restartServer plays a herdr server that crashed and was started again,
+// as herdr 0.9.1 does it: the session is restored, so every workspace, tab
+// and pane keeps its id, but each pane is a new shell with a new terminal
+// id and the processes that ran in it are gone.
+func (f *fakeHerdr) restartServer() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.panes {
+		if p.closed {
+			continue
+		}
+		p.terminal = f.newTerminal()
+		p.script, p.polls, p.command, p.interrupted = nil, 0, "", false
+	}
 }
 
 // preflightCheck answers the shell script that checks the agent command and

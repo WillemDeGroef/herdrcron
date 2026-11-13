@@ -245,17 +245,26 @@ func (m Model) lastText(r *api.RunSummary) string {
 	return mark + " " + ago(m.now().Sub(t))
 }
 
+// nextText is the NEXT column: when the task fires next, or the pause that
+// holds it. The daemon's next fire time ignores pauses, so a paused task
+// shows its pause instead, whatever its state (a manual run shows as
+// running over paused).
 func (m Model) nextText(t api.TaskSummary) string {
-	if t.State == api.StatePaused {
-		switch t.PausedUntil {
-		case "":
-			return "paused"
-		case api.PauseIndefinite:
-			return "indefinitely"
-		}
-		return "until " + m.when(t.PausedUntil)
+	if t.State == api.StateOff || t.State == api.StateInvalid {
+		return "—"
 	}
-	if t.NextFireAt == "" {
+	h := m.holdOn(t.Target, t.PausedUntil)
+	switch {
+	case h.endless():
+		return "paused"
+	case !h.none():
+		return "until " + m.when(t.PausedUntil)
+	case t.State == api.StatePaused && !pauseEnded(t.PausedUntil, m.now()):
+		// Paused with no time of its own: a global pause the status read
+		// has not shown yet. A timestamp that has passed does not land
+		// here; that pause has ended and the next fire stands.
+		return "paused"
+	case t.NextFireAt == "":
 		return "—"
 	}
 	return m.when(t.NextFireAt)

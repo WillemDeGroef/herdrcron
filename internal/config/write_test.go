@@ -54,6 +54,18 @@ func TestDefaultTask(t *testing.T) {
 	}
 }
 
+// NewTask adds the agent command and timeout a new task starts with;
+// DefaultTask must not have them, or a file without them would load.
+func TestNewTask(t *testing.T) {
+	got := config.NewTask("nightly")
+	want := config.DefaultTask("nightly")
+	want.Agent.Command = "claude"
+	want.Timeout = config.Duration{Duration: 2 * time.Hour}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NewTask = %+v, want %+v", got, want)
+	}
+}
+
 func TestValidateReportsFieldErrors(t *testing.T) {
 	f := newFixture(t)
 	f.prompt("peppol-sh-deps.md")

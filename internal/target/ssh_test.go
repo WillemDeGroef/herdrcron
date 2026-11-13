@@ -14,11 +14,21 @@ import (
 )
 
 // fakeSSHScript stands in for the system ssh binary. It records its argv
-// (one element per NUL-terminated record) and its stdin, then acts on
+// (one element per NUL-terminated record), then acts on
 // FAKE_SSH_EXIT: unset runs the last argument (the remote command line)
 // with sh -c, as sshd would hand it to the login shell; a number exits
 // with that code after printing FAKE_SSH_STDERR to stderr; FAKE_SSH_HANG
 // set hangs, as ssh over a dead ControlMaster connection does.
+//
+// FAKE_SSH_REMOTE says how the remote command line relates to the ssh
+// process. Unset, it replaces it. "session" runs it as sshd does: in a new
+// session and process group that outlives a killed ssh and only sees its
+// stdin close. "child" also outlives ssh but shares its process group, as
+// behind an sshd that does not start a session. "login" is a session leader
+// with another job beside the command. The leader execs the remote line, as
+// a login shell does with a simple command, so it stays the parent and the
+// group leader. That job ignores SIGHUP so the session ending does not look
+// like a kill.
 const fakeSSHScript = `#!/bin/sh
 dir=$(dirname "$0")
 : > "$dir/argv"
@@ -33,10 +43,14 @@ if [ -n "$FAKE_SSH_HANG" ]; then
 	exec sleep 60
 fi
 if [ -n "$FAKE_SSH_EXIT" ]; then
-	cat > "$dir/stdin"
 	printf '%s' "$FAKE_SSH_STDERR" >&2
 	exit "$FAKE_SSH_EXIT"
 fi
+case "$FAKE_SSH_REMOTE" in
+session) setsid -w sh -c "$last"; exit $? ;;
+child) sh -c "$last"; exit $? ;;
+login) setsid -w sh -c 'trap "" HUP; sleep 300 & echo $! > "$1/bystander"; exec sh -c "$2"' sh "$dir" "$last"; exit $? ;;
+esac
 exec sh -c "$last"
 `
 
@@ -51,6 +65,7 @@ func fakeSSH(t *testing.T) (argv func() []string, dir string) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("FAKE_SSH_EXIT", "")
 	t.Setenv("FAKE_SSH_HANG", "")
+	t.Setenv("FAKE_SSH_REMOTE", "")
 	return func() []string {
 		t.Helper()
 		data, err := os.ReadFile(filepath.Join(dir, "argv"))
@@ -114,11 +129,14 @@ func TestSSHExecArgvUsesTheSpecOptionsAndTheTargetShell(t *testing.T) {
 		"-o", "ControlPersist=10m",
 		"-o", "ConnectTimeout=10",
 		"--", "vps-alias",
-		"bash -lc 'herdr pane list'",
 	}
 	got := argv()
-	if !slices.Equal(got, want) {
-		t.Errorf("argv =\n%q\nwant\n%q", got, want)
+	if len(got) != len(want)+1 || !slices.Equal(got[:len(want)], want) {
+		t.Fatalf("argv =\n%q\nwant\n%q and the remote command line", got, want)
+	}
+	line := got[len(got)-1]
+	if !strings.HasPrefix(line, neutralPrefix) || !strings.Contains(line, `bash -lc \0047herdr pane list\0047`) {
+		t.Errorf("remote command line = %q, want the target shell command inside the /bin/sh wrapper", line)
 	}
 	fi, err := os.Stat(control)
 	if err != nil {
@@ -132,7 +150,7 @@ func TestSSHExecArgvUsesTheSpecOptionsAndTheTargetShell(t *testing.T) {
 func TestSSHExecQuotesEveryArgument(t *testing.T) {
 	fakeSSH(t)
 	s, _ := newTestSSH(t, "sh -c")
-	nasty := "it's $HOME `id` \"q\" \\ ; rm -rf /\nline two"
+	nasty := "it's $HOME `id` \"q\" \\ ; rm -rf /\nline two! \\' é \\\\ \\n 100%"
 	out, err := s.Exec(context.Background(), []string{"printf", "%s|%s", nasty, ""}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -316,7 +334,7 @@ func TestSSHInteractiveArgv(t *testing.T) {
 		"-o", "ControlPersist=10m",
 		"-o", "ConnectTimeout=10",
 		"--", "vps-alias",
-		"bash -lc '/opt/herdr agent attach w1:p2'",
+		`/bin/sh -c 'eval "$(printf %b "$0")"' 'bash -lc \0047/opt/herdr agent attach w1:p2\0047'`,
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("argv =\n%q\nwant\n%q", got, want)

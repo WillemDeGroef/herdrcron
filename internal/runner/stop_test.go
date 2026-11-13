@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/WillemDeGroef/herdrcron/internal/config"
 	"github.com/WillemDeGroef/herdrcron/internal/runner"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
 )
@@ -367,5 +368,93 @@ func TestShutdownDuringAStopLeavesTheRunOpen(t *testing.T) {
 	}
 	if _, err := e.runner.Stop(e.ctx, run.ID); err == nil {
 		t.Errorf("Stop after Run returned succeeded")
+	}
+}
+
+// A stop that lands after the herdr server restored the pane id must not
+// send keys to the new shell or close its tab.
+func TestUserStopOfAReplacedPaneEndsLost(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.script(working)
+	run := e.start(deps())
+	e.poll(run.ID)
+	e.herdr.restartServer()
+
+	got, err := e.runner.Stop(e.ctx, run.ID)
+	if err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if got.Status != store.StatusLost || got.ExitReason != "pane replaced: herdr server restarted" || got.EndedAt.IsZero() {
+		t.Errorf("Stop = %s %q ended %v, want lost", got.Status, got.ExitReason, got.EndedAt)
+	}
+	if steps := e.stopSteps(); len(steps) != 0 {
+		t.Errorf("stop touched the restored pane: %q", steps)
+	}
+	if !e.herdr.tabOpen(run.HerdrTab) {
+		t.Errorf("restored tab was closed")
+	}
+	notes := e.notifications()
+	if len(notes) != 1 || notes[0].event != config.EventLost {
+		t.Errorf("notifications = %+v, want one lost", notes)
+	}
+}
+
+// A timeout decided before the pane list must not stop the shell a
+// restarted server restored under the run's pane id.
+func TestTimeoutOfAReplacedPaneEndsLost(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.script(working, working)
+	task := deps()
+	task.Timeout.Duration = 2 * time.Hour
+	run := e.start(task)
+	e.poll(run.ID)
+	e.herdr.restartServer()
+
+	e.clock.Advance(2 * time.Hour)
+	e.runner.PollTarget(e.ctx, "local")
+	got := e.waitEnded(run.ID)
+	if got.Status != store.StatusLost || got.ExitReason != "pane replaced: herdr server restarted" {
+		t.Errorf("run = %s %q, want lost %q", got.Status, got.ExitReason, "pane replaced: herdr server restarted")
+	}
+	if e.clock.Waiters() != 0 {
+		t.Errorf("timeout waited to send keys")
+	}
+	if steps := e.stopSteps(); len(steps) != 0 {
+		t.Errorf("stop touched the restored pane: %q", steps)
+	}
+	if !e.herdr.tabOpen(run.HerdrTab) {
+		t.Errorf("restored tab was closed")
+	}
+	notes := e.notifications()
+	if len(notes) != 1 || notes[0].event != config.EventLost {
+		t.Errorf("notifications = %+v, want one lost", notes)
+	}
+}
+
+// A run stored before herdr_terminal existed cannot be told from a
+// restored pane, so a user stop still stops it.
+func TestUserStopWithoutATerminalIDStillStops(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.script(working, working)
+	run := e.start(deps())
+	e.poll(run.ID)
+	old := e.get(run.ID)
+	old.HerdrTerminal = ""
+	if err := e.store.UpdateRun(e.ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	e.restart(deps())
+	if !e.runner.Active(run.ID) {
+		t.Fatal("recovered run is not tracked")
+	}
+
+	res := e.stopAsync(run.ID)
+	e.driveStop()
+	r := <-res
+	if r.err != nil || r.run.Status != store.StatusStopped || r.run.ExitReason != "stopped by user" {
+		t.Fatalf("Stop = %s %q, %v; want stopped by user", r.run.Status, r.run.ExitReason, r.err)
+	}
+	if e.herdr.tabOpen(run.HerdrTab) {
+		t.Errorf("tab left open")
 	}
 }

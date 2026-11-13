@@ -170,11 +170,12 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		Clock: clk, Store: st, Targets: targets, Config: cfg, ConfigDir: p.ConfigDir, Log: log,
 		OnEnd:          func(ctx context.Context, run store.Run) { d.disp.RunEnded(ctx, run) },
 		OnChange:       d.runChanged,
+		OnAmend:        d.runAmended,
 		OnTargetChange: d.targetChanged,
 	})
 	d.disp = dispatch.New(dispatch.Options{Runs: latestDef{d}, Store: st, Config: cfg, Log: log})
 	d.sched = scheduler.New(scheduler.Options{
-		Clock: clk, Store: st, Runs: d.disp, Config: cfg, Log: log,
+		Clock: clk, Store: st, Runs: d.disp, Adopt: d.runner, Config: cfg, Log: log,
 		OnPauseExpired: d.pauseExpired,
 	})
 	if err := d.loadGlobalPause(ctx); err != nil {
@@ -185,6 +186,12 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	// fire must see a recovered run as active and follow overlap.
 	if err := d.runner.Recover(ctx, validTasks(tasks)); err != nil {
 		log.Error("cannot recover open runs", "err", err)
+		return err
+	}
+	// The fires the previous daemon left waiting come back before the
+	// scheduler can submit new ones, so they keep their place in the queue.
+	if err := d.disp.Restore(ctx, validTasks(tasks), clk.Now()); err != nil {
+		log.Error("cannot restore queued fires", "err", err)
 		return err
 	}
 	if err := d.sched.SetTasks(ctx, tasks); err != nil {
@@ -252,6 +259,11 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		defer close(watchDone)
 		d.watchFiles(ctx, w) // returns when ctx is done
 	}()
+	resumeDone := make(chan struct{})
+	go func() {
+		defer close(resumeDone)
+		d.disp.Resume(ctx) // starts the restored fires that have a free slot
+	}()
 	publishDone := make(chan struct{})
 	go func() {
 		defer close(publishDone)
@@ -263,6 +275,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	<-runnerDone
 	<-watchDone
 	<-publishDone
+	<-resumeDone
 	d.stopCatchUps()
 	d.bg.Wait()
 	log.Info("daemon stopped")

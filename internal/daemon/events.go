@@ -86,13 +86,10 @@ func (d *daemon) subscribe(ctx context.Context, _ json.RawMessage) (any, <-chan 
 	return api.SubscribeResult{Subscribed: true}, d.bus.subscribe(ctx), nil
 }
 
-// runChanged is the runner's OnChange: it is the one place a stored run
-// change becomes a "run.changed" event and optional notify.command calls
-// (blocked, failed, timeout, lost). It also queues the task's display
-// state to be republished; that needs the runner's lock, which OnChange
-// may not take.
+// runChanged is the runner's OnChange: optional notify.command calls
+// (blocked, failed, timeout, lost) and a run.changed publish (via
+// runAmended). OnChange may not take the runner's lock.
 func (d *daemon) runChanged(run store.Run) {
-	d.bus.publish(api.EventRunChanged, api.RunChangedEvent{Run: *runSummary(run)})
 	runLog := logging.ForRun(d.log, run.ID, run.TaskID, run.Target)
 	switch run.Status {
 	case store.StatusBlocked:
@@ -104,6 +101,14 @@ func (d *daemon) runChanged(run store.Run) {
 	case store.StatusLost:
 		d.notifier.Notify(config.EventLost, notify.RunMessage(run), runLog)
 	}
+	d.runAmended(run)
+}
+
+// runAmended is the runner's OnAmend: an ended run's row changed (its stop
+// was finished when the target came back). It publishes "run.changed" and
+// queues the task's display state, without a second notification.
+func (d *daemon) runAmended(run store.Run) {
+	d.bus.publish(api.EventRunChanged, api.RunChangedEvent{Run: *runSummary(run)})
 	d.dirtyMu.Lock()
 	d.dirty[run.TaskID] = struct{}{}
 	d.dirtyMu.Unlock()

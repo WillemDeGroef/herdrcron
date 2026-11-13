@@ -47,7 +47,7 @@ The spec says all criteria "must pass on the user's machines", so every item als
 ### 2. The same task on a remote target starts there, and `a` attaches
 
 - [x] verified-by-test (fake `ssh` binary on PATH, argv assertions; by human decision no test uses a real remote):
-  - `internal/target`: `TestSSHExecArgvUsesTheSpecOptionsAndTheTargetShell`, `TestSSHExecQuotesEveryArgument`, `TestSSHPutFileWritesThePromptViaStdin`.
+  - `internal/target`: `TestSSHExecArgvUsesTheSpecOptionsAndTheTargetShell`, `TestSSHExecQuotesEveryArgument`, `TestSSHPutFileWritesThePromptViaStdin`, `TestSSHRemoteCommandLineDoesNotDependOnTheLoginShell` (any login shell), `TestSSHCancelStopsTheRemoteCommand` and `TestSSHCancelStopsWhatTheRemoteCommandStarted` (a cancelled call stops the remote command), `TestSSHCancelDoesNotSignalTheParentGroupsOtherJob` (cancel does not signal other jobs in the parent process group).
   - `internal/daemon`: `TestRealTargetsMakesAnSSHTargetForEveryRemoteTarget`, `TestAttachCmdOnARemoteTargetUsesSSHWithATTY`.
   - `internal/tui`: `TestAttachRunsTheAttachCommand`, `TestAttachFromOutputAndDetail`.
 - [ ] needs-user:
@@ -123,6 +123,7 @@ The spec says all criteria "must pass on the user's machines", so every item als
 | shell quoting | `internal/shellquote`: `TestRoundTripThroughShell` | verified-by-test |
 | state machine: working → done; working → blocked → working → done; pane vanishes; target drops 3 polls; timeout | `internal/runner`: `TestRunGoesFromWorkingToDone`, `TestRunGoesFromWorkingToBlockedAndBackToDone`, `TestPaneVanishesRunIsLost`, `TestTargetDropsForThreePollsAndReturns`, `TestTimeoutStopsTheRun` | verified-by-test |
 | recovery after a kill | `internal/daemon`: `TestRecoveryAfterKillKeepsTrackingTheSameRun` | verified-by-test |
+| queued fires survive a restart | `internal/daemon`: `TestQueuedRunSurvivesADaemonRestart`. `internal/dispatch`: `TestRestoreStartsMaxParallelFiresInTheirQueueOrder` | verified-by-test |
 | integration: real herdr on localhost, `bash -c 'echo hi; sleep 5'` | `cmd/herdrcron`: `TestRealHerdrDaemonRunsTask` (tag `integration`) | verified-manually-here (not in CI: CI has no herdr) |
 | integration: SSH target against a local sshd container | `internal/target`: `TestSSHIntegration` (tag `integration`, needs `HERDRCRON_SSH_TEST_HOST`) | **needs-user**: SSH is tested with fakes only, by human decision; no real sshd was started here |
 | TUI teatest golden files: main screen and form | `internal/tui`: `TestMainScreenGolden`, `TestFormGolden` | verified-by-test |

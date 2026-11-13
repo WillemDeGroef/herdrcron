@@ -53,6 +53,7 @@ Rules for the tracker:
 
 - Count `idle`/`done` towards completion only when `agent` is present. During startup the status is `unknown`, not `idle`, so a run does not finish before the agent starts.
 - Pane missing from `pane list` → `lost`.
+- Pane in `pane list` with another `terminal_id` than at launch → `lost`, reason `pane replaced: herdr server restarted` (see "Server restart" below).
 - `agent` absent gives `unknown`: before the agent starts, after it exits back to the shell, and for the whole run of a plain command such as the integration test's `bash -c 'echo hi; sleep 5'`. To tell whether the launched command has ended, use `herdr pane process-info --pane <id>`: when both `.result.process_info.shell_pid` and `foreground_process_group_id` are non-null and equal, the shell's own process group is in the foreground. After a command has run, that is the prompt (verified: `sleep` takes the foreground group; when it exits the two ids are equal again and `foreground_processes` is just the shell). The same equality is also true while startup files still run in the shell's group, before the command starts (observed: `conda` still listed in `foreground_processes`, ids already equal). The first sample after `pane run` must not by itself end the run. A later equal sample may: with a 15 s poll a short command can finish without a sample ever seeing the other process group. Call process-info only for panes whose `agent` is absent, so the normal poll stays one `pane list` call per target.
 - Shell back at its prompt, not during a stop:
   - no agent was ever detected in the run (plain command) → `done`;
@@ -108,12 +109,20 @@ Then retry `herdr pane list` until it succeeds or a few seconds have passed. If 
 
 Reason: the always-on host loses its herdr server on every reboot, and failing every run until the user opens a terminal defeats the scheduler. This is the same server the user's `herdr` would start. The systemd unit that runs the daemon must not kill that process when the daemon stops (`KillMode=process`, or an equivalent). A server started in the daemon's cgroup dies with it, and takes the panes with it.
 
+## Server restart
+
+- A herdr server that stops (crash, `kill -9`, `herdr server stop`, reboot) takes every process in its panes with it. While it is down, `pane list` fails with `server_not_running`: the poll ends the target's runs `lost`.
+- When the server starts again it restores the session from `session.json`: the same workspaces, tabs and labels, and the same pane ids (`w1:p1`), each a new shell in the old cwd. Only `terminal_id` differs (`term_66024df88e3dc1` before, `term_66024dff78c4b1` after). Verified on 0.9.1 with an isolated session (`hc-i34-exp`): `kill -9` of the server, then `herdr server` again.
+- So a pane id alone does not identify a run's pane. If the server restarts between two polls, the poll finds the pane id and would track the empty shell: the run stays `running` (no agent was ever detected in that shell), or ends on a wrong reading.
+
+**Decision: a run stores the pane's `terminal_id` at launch** (`runs.herdr_terminal`, from `root_pane` of `workspace create` / `tab create`). A poll, recovery at daemon start, and a stop or timeout that lands before the next poll, end the run `lost` when its pane id is listed with another `terminal_id`. They do not send keys to that shell or close its tab. Runs stored before this column existed have no terminal id and skip the check. The restored tab is left open, as for every `lost` run. A pane list that fails is not a replacement: a timeout still ends the run while the target does not answer.
+
 ## Attach
 
 `herdr agent attach <TARGET> [--takeover]` takes **a pane id or a unique agent name**, but only for a pane that hosts a detected agent. A plain shell pane gives `agent_not_found` (exit 1). It needs a TTY (`Not a tty` without one). Detach is the prefix key then `q` (default `ctrl+b q`, configurable in herdr's `config.toml`).
 
 - Local argv: `["herdr", "agent", "attach", "<pane_id>"]`
-- Remote argv: `["ssh", "-t", <ssh options>, "<alias>", "<shell> " + quote("herdr agent attach <pane_id>")]`, for the default shell `["ssh", "-t", "<alias>", "bash -lc 'herdr agent attach w1:p2'"]`, with `herdr_path` in place of `herdr` when set. `herdr --machine` does not forward interactive attach, so SSH is the way.
+- Remote argv: `["ssh", "-t", <ssh options>, "<alias>", neutral("<shell> " + quote("herdr agent attach <pane_id>"))]`, with `herdr_path` in place of `herdr` when set. `neutral` (see "SSH: login shell and cancellation") makes the line read the same in any login shell; for the default shell it is `/bin/sh -c 'eval "$(printf %b "$0")"' 'bash -lc \0047herdr agent attach w1:p2\0047'`. `herdr --machine` does not forward interactive attach, so SSH is the way.
 - `attach_mode: full`: local `["herdr"]`; remote `["herdr", "--remote", "<alias>"]`.
 - When the agent has exited (`agent` absent), attach fails; the TUI should fall back to the full UI (`attach_mode: full` form) for that run.
 
@@ -132,3 +141,13 @@ Go types for the JSON outputs above are generated from the schema:
 - Regenerate: `go generate ./internal/herdr/...`. A test fails when `types_gen.go` is out of date, and another decodes real CLI output (`internal/herdr/testdata/`) into the generated types with unknown fields disallowed.
 - Generated results: `workspace_*`, `tab_*`, `pane_info`, `pane_list`, `pane_process_info` and `ok` for the calls above; `agent_info`/`agent_list` because `herdr agent get|list` add `state_change_seq` and `interactive_ready`, a possible later way to detect a finished turn; `pane_read` (`PaneReadOutputResult`) is the socket API form of `pane read` and is unused while the CLI prints text.
 - For a new herdr version: `herdr api schema --json > internal/herdr/schema/herdr-<version>.json`, point the `go:generate` line at it, regenerate, and re-check this document.
+
+## SSH: login shell and cancellation
+
+Not verified against a real sshd (SSH is tested with fakes only): the fake `ssh` in `internal/target` runs the remote line with `sh`, optionally in its own session as sshd does.
+
+- sshd hands the command line to the remote user's login shell. bash, zsh, fish and tcsh disagree on quoting: fish reads `\\` and `\'` inside single quotes as escapes, csh expands `!` and rejects a newline inside quotes. They agree on a single-quoted word without `'`, `!`, a newline or a backslash before `'` or `\`. So every line is `/bin/sh -c 'eval "$(printf %b "$0")"' '<script>'`, with each byte of the script outside printable ASCII, and `'`, `\` and `!`, written as `\0ooo` (octal, decoded by `printf %b`). The script is the old line, `<shell> ` + quote(command), read by `/bin/sh`.
+- Killing the local `ssh` signals nothing on the remote: without a TTY the command only sees its stdin close. `ssh -tt` would fix that but alters stdin and stdout (CR LF, echo, control bytes in a prompt). Instead herdrcron keeps ssh's stdin open for the whole call and the script leaves a watcher reading it. Stdin data (the prompt of `PutFile`) is cut off with `head -c <length>`; after it nothing comes until stdin closes. At that point the watcher signals the script. The script sends SIGTERM to its whole process group only when it leads that group (it replaced the login shell of the session OpenSSH created with `setsid`). It does not signal a group led by its parent: that parent may be an interactive user's login shell, and the group then holds jobs this command did not start. Otherwise it sends SIGTERM only to the command and its descendants, from a `ps` snapshot of pid and ppid. There is no SIGKILL after it: a command that ignores SIGTERM keeps running. A `ps` that cannot print those two columns (some BusyBox builds) signals the command and not the descendants the snapshot would have listed. The watcher starts after the stdin data has gone to the command, so a command that leaves more than a pipe buffer of it unread is not stopped. A cancel during `PutFile` can leave the temp file next to the destination: the write is signalled before the shell reaches the cleanup that removes it.
+- The watcher holds neither stdout nor stderr, so a finished command ends the ssh call at once. It exits when sshd closes the session.
+- `setsid herdr server … &` (see "herdr server") is in its own session and survives both kills.
+- The interactive attach (`ssh -t`) has no watcher: the TTY's hangup ends the remote command.
