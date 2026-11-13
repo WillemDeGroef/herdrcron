@@ -88,11 +88,9 @@ type Options struct {
 type Runner struct {
 	clock     clock.Clock
 	store     *store.Store
-	cfg       config.Config
 	configDir string
 	log       *slog.Logger
 	waitStart time.Duration
-	targets   map[string]*targetState
 	onEnd     func(context.Context, store.Run)
 	onChange  func(store.Run)
 
@@ -105,6 +103,17 @@ type Runner struct {
 	cancelStop context.CancelFunc
 	stops      sync.WaitGroup
 
+	// targetsMu guards cfg, targets and the poll workers. Lock order: mu,
+	// then targetsMu. Read them with config() and target().
+	targetsMu sync.RWMutex
+	cfg       config.Config
+	targets   map[string]*targetState
+	// runCtx is Run's context while Run is polling, else nil. workers
+	// holds the cancel func of each target's poll worker.
+	runCtx  context.Context
+	workers map[string]context.CancelFunc
+	polls   sync.WaitGroup
+
 	mu     sync.Mutex
 	active map[string]*activeRun // by run id
 	// starting holds the runs between their insert and the end of their
@@ -116,6 +125,7 @@ type Runner struct {
 // targetState is a target with its herdr client and preflight cache.
 type targetState struct {
 	t     target.Target
+	conf  config.Target // the settings it was built from
 	herdr *herdr.Client
 	shell []string
 
@@ -167,6 +177,7 @@ func New(o Options) *Runner {
 		clock: o.Clock, store: o.Store, cfg: o.Config, configDir: o.ConfigDir, log: o.Log,
 		waitStart: o.ServerStartWait, onEnd: o.OnEnd, onChange: o.OnChange, onTargetChange: o.OnTargetChange,
 		targets:  make(map[string]*targetState, len(o.Targets)),
+		workers:  map[string]context.CancelFunc{},
 		active:   map[string]*activeRun{},
 		starting: map[string]*activeRun{},
 	}
@@ -175,16 +186,107 @@ func New(o Options) *Runner {
 		r.waitStart = defaultServerStartWait
 	}
 	for name, t := range o.Targets {
-		tc := o.Config.Targets[name]
-		shell := strings.Fields(tc.Shell)
-		if len(shell) == 0 {
-			shell = strings.Fields(defaultShell)
-		}
-		r.targets[name] = &targetState{
-			t: t, herdr: herdr.New(t, tc.HerdrPath), shell: shell, checks: map[string]checkedAt{},
-		}
+		r.targets[name] = newTargetState(t, o.Config.Targets[name])
 	}
 	return r
+}
+
+func newTargetState(t target.Target, tc config.Target) *targetState {
+	shell := strings.Fields(tc.Shell)
+	if len(shell) == 0 {
+		shell = strings.Fields(defaultShell)
+	}
+	return &targetState{
+		t: t, conf: tc, herdr: herdr.New(t, tc.HerdrPath), shell: shell, checks: map[string]checkedAt{},
+	}
+}
+
+// target returns the named target, or nil if the runner has none.
+func (r *Runner) target(name string) *targetState {
+	r.targetsMu.RLock()
+	defer r.targetsMu.RUnlock()
+	return r.targets[name]
+}
+
+func (r *Runner) config() config.Config {
+	r.targetsMu.RLock()
+	defer r.targetsMu.RUnlock()
+	return r.cfg
+}
+
+// Reconfigure applies cfg while the runner runs: the time zone and
+// herdr_version at once, poll_interval from each poll worker's next wait,
+// and the targets as far as that is safe. A target new in cfg is added (newTarget builds it; nil leaves
+// it out) and polled from now on. A target that is gone from cfg, or
+// whose host, shell or herdr_path changed, is removed or replaced only if
+// it has no active run: replacing it forgets its reachability and its
+// preflight cache, and a run must end on the target it started on. The
+// targets that keep their old settings for that reason are returned,
+// sorted; a later call applies them once their runs have ended.
+// max_parallel is not the runner's and never defers a target.
+func (r *Runner) Reconfigure(cfg config.Config, newTarget func(name string, tc config.Target) target.Target) (deferred []string) {
+	// Under mu, so no run can start on a target between the check for
+	// active runs and its replacement: Start registers the run before it
+	// looks its target up.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	busy := map[string]bool{}
+	for _, a := range r.active {
+		busy[a.run.Target] = true
+	}
+	for _, a := range r.starting {
+		busy[a.run.Target] = true
+	}
+	r.targetsMu.Lock()
+	defer r.targetsMu.Unlock()
+	r.cfg = cfg
+	for name, ts := range r.targets {
+		tc, wanted := cfg.Targets[name]
+		if wanted && sameTarget(ts.conf, tc) {
+			continue
+		}
+		if busy[name] {
+			deferred = append(deferred, name)
+			continue
+		}
+		delete(r.targets, name)
+		// Its worker may be sleeping out the old target's backoff; a
+		// replacement gets a fresh one below.
+		if stop := r.workers[name]; stop != nil {
+			stop()
+			delete(r.workers, name)
+		}
+		if !wanted {
+			r.log.Info("target removed", "target", name)
+		}
+	}
+	for name, tc := range cfg.Targets {
+		if r.targets[name] != nil {
+			continue
+		}
+		t := newTarget(name, tc)
+		if t == nil {
+			continue
+		}
+		r.targets[name] = newTargetState(t, tc)
+		r.startWorkerLocked(name)
+		r.log.Info("target configured", "target", name)
+	}
+	for name, stop := range r.workers {
+		if r.targets[name] == nil {
+			stop()
+			delete(r.workers, name)
+		}
+	}
+	slices.Sort(deferred)
+	return deferred
+}
+
+// sameTarget reports whether a and b are the same target to the runner:
+// max_parallel is the dispatcher's.
+func sameTarget(a, b config.Target) bool {
+	a.MaxParallel, b.MaxParallel = 0, 0
+	return a == b
 }
 
 // Start runs steps 1 to 6 for task t: it reserves the run row, launches
@@ -209,32 +311,33 @@ func (r *Runner) Start(ctx context.Context, t config.Task, trigger string, sched
 
 	err := r.launch(ctx, a)
 	if obs, ok := launchObservation(err); ok {
-		r.observe(t.Target, obs, true)
+		r.observe(r.target(t.Target), t.Target, obs, true)
 	}
-	r.mu.Lock()
-	delete(r.starting, run.ID)
 	if err == nil {
+		r.mu.Lock()
+		delete(r.starting, run.ID)
 		r.active[run.ID] = a
+		r.mu.Unlock()
+		return a.run, nil
 	}
-	r.mu.Unlock()
+	// A run that failed to launch stays in starting until end takes it
+	// out, so Reconfigure cannot replace its target before the cleanup.
 	if errors.Is(err, target.ErrUnreachable) {
 		// Recorded so the missed policy can catch the fire up when the
 		// target answers again.
 		a.log.Warn("target unreachable at fire time", "err", err)
 		return r.end(context.WithoutCancel(ctx), a, store.StatusHostUnreachable, err.Error())
 	}
-	if err != nil {
-		a.log.Warn("run failed to start", "err", err)
-		return r.end(context.WithoutCancel(ctx), a, store.StatusFailed, err.Error())
-	}
-	return a.run, nil
+	a.log.Warn("run failed to start", "err", err)
+	return r.end(context.WithoutCancel(ctx), a, store.StatusFailed, err.Error())
 }
 
 // launch runs steps 2 to 6. On error, a.run holds whatever herdr ids were
 // already created, so end can clean up.
 func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 	t := a.task
-	ts, ok := r.targets[t.Target]
+	ts := r.target(t.Target)
+	ok := ts != nil
 	if !ok {
 		return fmt.Errorf("unknown target %q", t.Target)
 	}
@@ -353,7 +456,7 @@ func (r *Runner) setHerdrIDs(a *activeRun, workspace, tab, pane string) {
 
 // tabLabel is hc-<task-id>-<HHMM>, in the task's time zone.
 func (r *Runner) tabLabel(t config.Task) (string, error) {
-	loc, err := r.cfg.Location(t)
+	loc, err := r.config().Location(t)
 	if err != nil {
 		return "", err
 	}
@@ -504,7 +607,7 @@ func (r *Runner) Recover(ctx context.Context, tasks []config.Task) error {
 		a.log.Info("recovering run", "status", run.Status, "started_at", run.StartedAt, "herdr_pane", run.HerdrPane)
 		var err error
 		switch {
-		case r.targets[run.Target] == nil:
+		case r.target(run.Target) == nil:
 			_, err = r.end(ctx, a, store.StatusLost, "target "+run.Target+" not configured")
 		case run.Status == store.StatusStarting:
 			// The agent was never launched; end closes the tab if there is one.
@@ -599,7 +702,7 @@ func (r *Runner) livePane(runID string) (store.Run, *targetState, error) {
 	case run.HerdrPane == "":
 		return store.Run{}, nil, fmt.Errorf("run %s: %w", runID, ErrNoPane)
 	}
-	ts := r.targets[run.Target]
+	ts := r.target(run.Target)
 	if ts == nil {
 		return store.Run{}, nil, fmt.Errorf("run %s: unknown target %q", runID, run.Target)
 	}
@@ -619,12 +722,12 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 		}
 	}
 	r.mu.Unlock()
-	ts := r.targets[name]
+	ts := r.target(name)
 	if ts == nil {
 		return
 	}
 	if len(runs) == 0 {
-		r.probe(ctx, name)
+		r.probe(ctx, ts, name)
 		return
 	}
 	slices.SortFunc(runs, func(a, b *activeRun) int { return strings.Compare(a.run.ID, b.run.ID) })
@@ -645,7 +748,7 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 	}
 
 	panes, err := ts.herdr.PaneList(ctx)
-	r.observe(name, err, true)
+	r.observe(ts, name, err, true)
 	if herdr.IsCode(err, herdr.CodeServerNotRunning) {
 		// The server and every pane in it are gone (a host reboot, say).
 		// The next launch must start the server again.
@@ -790,7 +893,12 @@ func (r *Runner) finish(ctx context.Context, ts *targetState, a *activeRun, stat
 // for a run that failed to start or a done run with on_done: close_tab.
 func (r *Runner) end(ctx context.Context, a *activeRun, status, reason string) (store.Run, error) {
 	r.mu.Lock()
+	// The target is taken while the run still counts as active, so the
+	// cleanup below goes to the target the run started on even if
+	// Reconfigure replaces or removes it right after.
+	ts := r.target(a.run.Target)
 	delete(r.active, a.run.ID)
+	delete(r.starting, a.run.ID)
 	a.ended = true
 	r.mu.Unlock()
 	// Out of the active map, a.run is no longer read by ActiveRuns.
@@ -805,7 +913,6 @@ func (r *Runner) end(ctx context.Context, a *activeRun, status, reason string) (
 		defer r.onEnd(ctx, a.run)
 	}
 
-	ts := r.targets[a.run.Target]
 	if ts == nil {
 		return a.run, err
 	}
@@ -896,7 +1003,7 @@ func (r *Runner) stop(ctx context.Context, a *activeRun, status, reason string) 
 	if ended {
 		return a.run, nil
 	}
-	ts := r.targets[a.run.Target]
+	ts := r.target(a.run.Target)
 	if ts == nil {
 		return r.end(context.WithoutCancel(ctx), a, status, reason)
 	}
@@ -1004,26 +1111,43 @@ func (r *Runner) Run(ctx context.Context) {
 		r.cancelStop()
 		r.stops.Wait()
 	}()
-	interval := r.cfg.PollInterval.Duration
-	if interval <= 0 {
-		interval = config.DefaultPollInterval
-	}
-	var wg sync.WaitGroup
+	r.targetsMu.Lock()
+	r.runCtx = ctx
 	for name := range r.targets {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-r.clock.After(r.pollWait(name, interval)):
-					r.PollTarget(ctx, name)
-				}
-			}
-		}()
+		r.startWorkerLocked(name)
 	}
-	wg.Wait()
+	r.targetsMu.Unlock()
+	<-ctx.Done()
+	// No worker starts once runCtx is nil, so Wait cannot race an Add.
+	r.targetsMu.Lock()
+	r.runCtx = nil
+	r.targetsMu.Unlock()
+	r.polls.Wait()
+}
+
+// startWorkerLocked starts the poll worker of the named target, if Run is
+// polling and the target has none; targetsMu must be held. The worker
+// stops when Reconfigure removes or replaces the target (a replacement
+// gets a new worker), or when Run's context is done.
+func (r *Runner) startWorkerLocked(name string) {
+	if r.runCtx == nil || r.workers[name] != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(r.runCtx)
+	r.workers[name] = cancel
+	r.polls.Add(1)
+	go func() {
+		defer r.polls.Done()
+		defer cancel()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-r.clock.After(r.pollWait(name)):
+				r.PollTarget(ctx, name)
+			}
+		}
+	}()
 }
 
 // formatDuration is d without zero trailing units: 2h, 1h30m, 45s.

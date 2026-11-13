@@ -44,19 +44,25 @@ type daemon struct {
 	version   string
 	started   time.Time
 	configDir string
-	cfg       config.Config
-	tasks     []config.TaskEntry
-	store     *store.Store
-	sched     *scheduler.Scheduler
-	runner    *runner.Runner
-	disp      *dispatch.Dispatcher
-	clk       clock.Clock
-	log       *slog.Logger
+	// cfgMu guards cfg, the config the daemon runs with: read it with
+	// config(). "reload" replaces it (reload.go).
+	cfgMu  sync.RWMutex
+	cfg    config.Config
+	tasks  []config.TaskEntry
+	store  *store.Store
+	sched  *scheduler.Scheduler
+	runner *runner.Runner
+	disp   *dispatch.Dispatcher
+	clk    clock.Clock
+	log    *slog.Logger
 	// sshControlDir holds the ssh ControlMaster sockets of SSH targets.
 	sshControlDir string
 	// configFile is config.yaml, re-read by "reload".
 	configFile string
 	bus        *bus
+	// newTarget builds the target of a config.yaml entry; nil leaves the
+	// target out.
+	newTarget func(name string, tc config.Target) target.Target
 
 	// mu guards tasks, versions, deleting and globalPause, and serialises
 	// task file writes. Lock order: mu, then the scheduler's lock. Never
@@ -143,9 +149,15 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	for _, e := range tasks {
 		logTask(log, e)
 	}
-	targets := opts.Targets
-	if targets == nil {
-		targets = realTargets(cfg, p.SSHControlDir())
+	d.newTarget = d.realTarget
+	if opts.Targets != nil {
+		d.newTarget = func(name string, _ config.Target) target.Target { return opts.Targets[name] }
+	}
+	targets := map[string]target.Target{}
+	for name, tc := range cfg.Targets {
+		if t := d.newTarget(name, tc); t != nil {
+			targets[name] = t
+		}
 	}
 	notifier := notify.New(cfg.Notify, log)
 	d.notifier = notifier
@@ -265,18 +277,21 @@ func validTasks(entries []config.TaskEntry) []config.Task {
 	return out
 }
 
-// realTargets returns the targets runs can use: local, and an SSH target
-// for every other target in config.yaml.
-func realTargets(cfg config.Config, sshControlDir string) map[string]target.Target {
-	targets := map[string]target.Target{}
-	for name, t := range cfg.Targets {
-		if name == config.LocalTarget {
-			targets[name] = target.NewLocal()
-			continue
-		}
-		targets[name] = sshTarget(name, t, sshControlDir)
+// realTarget returns the target runs use for a config.yaml entry: local,
+// or an SSH target for any other name.
+func (d *daemon) realTarget(name string, tc config.Target) target.Target {
+	if name == config.LocalTarget {
+		return target.NewLocal()
 	}
-	return targets
+	return sshTarget(name, tc, d.sshControlDir)
+}
+
+// config returns the config the daemon runs with. Its maps and slices are
+// never changed in place: "reload" swaps the whole value.
+func (d *daemon) config() config.Config {
+	d.cfgMu.RLock()
+	defer d.cfgMu.RUnlock()
+	return d.cfg
 }
 
 // sshTarget is the SSH target for the config.yaml target name.
@@ -302,8 +317,9 @@ func logTask(log *slog.Logger, e config.TaskEntry) {
 }
 
 func (d *daemon) targetNames() []string {
-	names := make([]string, 0, len(d.cfg.Targets))
-	for n := range d.cfg.Targets {
+	targets := d.config().Targets
+	names := make([]string, 0, len(targets))
+	for n := range targets {
 		names = append(names, n)
 	}
 	// "local" first, then the configured targets by name.
@@ -328,7 +344,7 @@ func (d *daemon) status(context.Context, json.RawMessage) (any, error) {
 		Version:       d.version,
 		StartedAt:     d.started.Format(time.RFC3339),
 		UptimeSeconds: int64(time.Since(d.started) / time.Second),
-		Timezone:      d.cfg.Timezone,
+		Timezone:      d.config().Timezone,
 	}
 	for _, n := range d.targetNames() {
 		res.Targets = append(res.Targets, d.targetStatus(n))

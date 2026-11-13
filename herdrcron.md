@@ -210,6 +210,7 @@ Rules:
 
 - `version` is a hash of the task file. The daemon watches `tasks/` with fsnotify; a hand edit reloads that task and emits `task.changed`.
 - The daemon writes task files atomically (write temp file, then rename).
+- `reload` applies a changed `config.yaml` to the running daemon: notify, `catch_up_window`, `max_parallel` and the other global settings at once, and targets that were added, removed or changed. A target with active runs keeps its old `host`, `shell` and `herdr_path` (and a removed one stays) until a `reload` after those runs have ended; the result then has `restart_required: true` and names the target in `deferred_targets`. A `config.yaml` that does not parse leaves the running config as it is: the task files still reload, and the call then fails.
 - CLI subcommands for scripts, same API: `herdrcron list`, `herdrcron run <id>`, `herdrcron pause <id> [--until 2026-11-10T08:00]`, `herdrcron resume <id>`, `herdrcron enable|disable <id>`, `herdrcron check <target>`.
 
 ## TUI

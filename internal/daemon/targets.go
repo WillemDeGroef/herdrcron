@@ -101,7 +101,7 @@ func (d *daemon) targetsCheck(ctx context.Context, params json.RawMessage) (any,
 	if p.Name == "" {
 		return nil, api.InvalidParams(errors.New("name is required"))
 	}
-	if _, ok := d.cfg.Targets[p.Name]; !ok {
+	if _, ok := d.config().Targets[p.Name]; !ok {
 		return nil, api.InvalidParams(fmt.Errorf("unknown target %q", p.Name))
 	}
 	d.mu.Lock()

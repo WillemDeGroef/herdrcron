@@ -74,6 +74,8 @@ targets:                    # example; "local" always exists and needs no entry
     herdr_path: /usr/local/bin/herdr   # default: herdr on PATH
 ```
 
+The daemon reads `config.yaml` when it starts and on the `reload` API call, which applies changes without a restart; only a target with active runs keeps its old `host`, `shell` and `herdr_path` until a `reload` after those runs have ended.
+
 A task (`tasks/nightly-deps.yaml`; create it in the TUI with `n`, or by hand):
 
 ```yaml

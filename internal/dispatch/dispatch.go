@@ -67,10 +67,10 @@ type fire struct {
 type Dispatcher struct {
 	runs  Runner
 	store *store.Store
-	cfg   config.Config
 	log   *slog.Logger
 
-	mu sync.Mutex
+	mu  sync.Mutex
+	cfg config.Config // max_parallel per target
 	// gen counts finished Start calls and RunEnded calls. A snapshot of
 	// ActiveRuns taken while gen stayed the same agrees with the launching
 	// counts, and no run ended without seeing the state built on it.
@@ -97,6 +97,30 @@ func New(o Options) *Dispatcher {
 		queue:         map[string][]fire{},
 		draining:      map[string]bool{},
 		drainAgain:    map[string]bool{},
+	}
+}
+
+// SetConfig replaces the config max_parallel is read from. It starts
+// nothing: call Drain afterwards, so fires that waited for capacity use
+// the room a higher max_parallel gives.
+func (d *Dispatcher) SetConfig(cfg config.Config) {
+	d.mu.Lock()
+	d.cfg = cfg
+	d.mu.Unlock()
+}
+
+// Drain starts the waiting fires of every target that has capacity. Like
+// Submit, it may start runs: do not call it with a lock the runner's
+// callbacks take.
+func (d *Dispatcher) Drain(ctx context.Context) {
+	d.mu.Lock()
+	targets := make([]string, 0, len(d.queue))
+	for name := range d.queue {
+		targets = append(targets, name)
+	}
+	d.mu.Unlock()
+	for _, name := range targets {
+		d.drain(ctx, name)
 	}
 }
 

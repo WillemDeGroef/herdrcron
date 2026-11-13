@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/WillemDeGroef/herdrcron/internal/config"
 	"github.com/WillemDeGroef/herdrcron/internal/herdr"
 	"github.com/WillemDeGroef/herdrcron/internal/target"
 )
@@ -90,10 +91,12 @@ func launchObservation(err error) (error, bool) {
 // off: 30 s, doubling to 5 min, when advanceBackoff is set. A manual check
 // passes false so a failure during an outage does not push the next retry
 // further out. Anything else, nil or another error, means the target
-// answered. A change of reachability calls OnTargetChange.
-func (r *Runner) observe(name string, err error, advanceBackoff bool) {
-	ts := r.targets[name]
-	if ts == nil {
+// answered. A change of reachability calls OnTargetChange. ts is the
+// target the call was made on: if Reconfigure removed or replaced it
+// meanwhile, the result says nothing about the target that has the name
+// now, and is dropped.
+func (r *Runner) observe(ts *targetState, name string, err error, advanceBackoff bool) {
+	if ts == nil || r.target(name) != ts {
 		return
 	}
 	if errors.Is(err, context.Canceled) {
@@ -157,7 +160,7 @@ func (ts *targetState) stateLocked(name string) TargetState {
 // TargetState returns the reachability of the named target; false for a
 // target the runner does not have.
 func (r *Runner) TargetState(name string) (TargetState, bool) {
-	ts := r.targets[name]
+	ts := r.target(name)
 	if ts == nil {
 		return TargetState{}, false
 	}
@@ -180,8 +183,15 @@ func (r *Runner) knownUnreachable(ts *targetState, name string) error {
 // pollWait is how long the target's poll worker waits before its next
 // poll: until the next retry while the target is unreachable, else the
 // poll interval.
-func (r *Runner) pollWait(name string, interval time.Duration) time.Duration {
-	ts := r.targets[name]
+func (r *Runner) pollWait(name string) time.Duration {
+	interval := r.config().PollInterval.Duration
+	if interval <= 0 {
+		interval = config.DefaultPollInterval
+	}
+	ts := r.target(name)
+	if ts == nil {
+		return interval // removed; its worker is about to stop
+	}
 	ts.reachMu.Lock()
 	defer ts.reachMu.Unlock()
 	if ts.reach.state != ReachUnreachable {
@@ -194,8 +204,7 @@ func (r *Runner) pollWait(name string, interval time.Duration) time.Duration {
 // reachability is unknown, it is unreachable, or it was last seen more
 // than idleProbeEvery ago. `herdr pane list` is the probe: any answer,
 // even "server not running", means the target is reachable.
-func (r *Runner) probe(ctx context.Context, name string) {
-	ts := r.targets[name]
+func (r *Runner) probe(ctx context.Context, ts *targetState, name string) {
 	ts.reachMu.Lock()
 	due := ts.reach.state != ReachReachable || !r.clock.Now().Before(ts.reach.lastSeen.Add(idleProbeEvery))
 	ts.reachMu.Unlock()
@@ -203,5 +212,5 @@ func (r *Runner) probe(ctx context.Context, name string) {
 		return
 	}
 	_, err := ts.herdr.PaneList(ctx)
-	r.observe(name, err, true)
+	r.observe(ts, name, err, true)
 }

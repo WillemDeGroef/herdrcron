@@ -9,7 +9,6 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -140,7 +139,7 @@ func (d *daemon) draft(def api.TaskDef, prompt string) (config.Task, fieldErrors
 		fe.add("timeout", timeoutErr.Error())
 	}
 	var verr *config.ValidationError
-	if err := config.ValidateDraft(t, d.configDir, d.cfg); errors.As(err, &verr) {
+	if err := config.ValidateDraft(t, d.configDir, d.config()); errors.As(err, &verr) {
 		for field, msgs := range verr.ByField() {
 			if field == "timeout" && timeoutErr != nil {
 				continue // already said why
@@ -195,7 +194,7 @@ func (d *daemon) tasksCreate(ctx context.Context, params json.RawMessage) (any, 
 		}
 		return nil, fmt.Errorf("write task file: %w", err)
 	}
-	e := config.LoadTask(d.configDir, t.ID, d.cfg)
+	e := config.LoadTask(d.configDir, t.ID, d.config())
 	d.insertLocked(e)
 	d.log.Info("task created", logging.KeyTaskID, e.ID)
 	return d.storedLocked(ctx, e)
@@ -239,7 +238,7 @@ func (d *daemon) tasksUpdate(ctx context.Context, params json.RawMessage) (any, 
 	if err := d.noteWrite("task file", p.ID, config.WriteTask(old.File, t, false)); err != nil {
 		return nil, fmt.Errorf("write task file: %w", err)
 	}
-	e := config.LoadTask(d.configDir, p.ID, d.cfg)
+	e := config.LoadTask(d.configDir, p.ID, d.config())
 	d.tasks[i] = e
 	d.log.Info("task updated", logging.KeyTaskID, e.ID)
 	return d.storedLocked(ctx, e)
@@ -494,56 +493,6 @@ func (d *daemon) stopRunsOf(ctx context.Context, id string) ([]store.Run, error)
 	return stopped, nil
 }
 
-// reload serves "reload": it re-reads every task file, and config.yaml.
-// Tasks are validated against the config the daemon runs with. A changed
-// config.yaml is not applied (the scheduler, dispatcher and runner hold
-// the config they started with); the result says restart_required. A
-// config.yaml that does not parse still lets the task files reload, and
-// the call then fails with that error.
-func (d *daemon) reload(ctx context.Context, _ json.RawMessage) (any, error) {
-	cfg, cfgErr := config.Load(d.configFile)
-	entries, err := config.LoadTasks(d.configDir, d.cfg)
-	if err != nil {
-		return nil, err
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	old := map[string]string{}
-	for _, e := range d.tasks {
-		old[e.ID] = d.versions[e.ID]
-	}
-	d.tasks = entries
-	d.rescheduleLocked(ctx)
-	res := api.ReloadResult{Tasks: make([]api.TaskSummary, 0, len(entries))}
-	if cfgErr == nil {
-		res.RestartRequired = !reflect.DeepEqual(cfg, d.cfg)
-	}
-	for i, e := range entries {
-		v := d.fileVersion(e)
-		d.versions[e.ID] = v
-		if prev, ok := old[e.ID]; !ok || prev != v {
-			logTask(d.log, e)
-			d.publishTaskLocked(ctx, i)
-		}
-		delete(old, e.ID)
-		s, err := d.summary(ctx, e)
-		if err != nil {
-			return nil, err
-		}
-		res.Tasks = append(res.Tasks, s)
-	}
-	for id := range old {
-		delete(d.versions, id)
-		d.publishDeleted(id)
-	}
-	d.log.Info("reloaded", "tasks", len(entries), "restart_required", res.RestartRequired)
-	if cfgErr != nil {
-		d.log.Error("config.yaml not applied", "err", cfgErr)
-		return nil, &api.Error{Code: api.CodeInternalError, Message: "config.yaml: " + cfgErr.Error()}
-	}
-	return res, nil
-}
-
 // reloadOne re-reads one task file after a change on disk (a hand edit, a
 // removal, a prompt edit). Nothing happens when its files are unchanged,
 // which is the case after the daemon's own writes.
@@ -572,7 +521,7 @@ func (d *daemon) reloadOneLocked(ctx context.Context, id string) {
 		d.publishDeleted(id)
 		return
 	}
-	e := config.LoadTask(d.configDir, id, d.cfg)
+	e := config.LoadTask(d.configDir, id, d.config())
 	v := d.fileVersion(e)
 	if i >= 0 && d.versions[id] == v {
 		return

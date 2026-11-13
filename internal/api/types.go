@@ -358,12 +358,17 @@ type DeleteResult struct {
 // ReloadResult is the result of "reload".
 type ReloadResult struct {
 	Tasks []TaskSummary `json:"tasks"`
-	// RestartRequired is set when config.yaml differs from the config the
-	// daemon runs with. Tasks are always validated against the running
-	// config; a changed config.yaml takes effect after a daemon restart.
-	// A config.yaml that does not parse fails the call after the task
-	// files have been re-read.
+	// RestartRequired is set when a part of config.yaml was not applied,
+	// so the daemon still runs with older settings; DeferredTargets says
+	// which. Everything else in config.yaml applies at once. A config.yaml
+	// that does not parse fails the call after the task files have been
+	// re-read against the running config.
 	RestartRequired bool `json:"restart_required,omitempty"`
+	// DeferredTargets are the targets whose changed host, shell or
+	// herdr_path, or whose removal, was not applied because they have
+	// active runs. A reload after those runs have ended applies them; so
+	// does a daemon restart.
+	DeferredTargets []string `json:"deferred_targets,omitempty"`
 }
 
 // SubscribeResult is the result of "subscribe". After it the connection

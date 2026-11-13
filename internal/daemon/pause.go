@@ -109,7 +109,7 @@ func (d *daemon) editLocked(ctx context.Context, i int, action string, edit func
 		d.log.Error("task file replaced but directory sync failed", logging.KeyTaskID, old.ID, "err", err)
 	}
 	// Reload rather than patch the entry, so memory matches the file.
-	e := config.LoadTask(d.configDir, old.ID, d.cfg)
+	e := config.LoadTask(d.configDir, old.ID, d.config())
 	d.tasks[i] = e
 	logTask(d.log, e)
 	d.log.Info("task file written", logging.KeyTaskID, e.ID, "action", action,
@@ -152,7 +152,7 @@ func (d *daemon) setGlobalPause(ctx context.Context, params json.RawMessage, pau
 			return nil, api.InvalidParams(err)
 		}
 	}
-	if _, ok := d.cfg.Targets[p.Target]; p.Target != "" && !ok {
+	if _, ok := d.config().Targets[p.Target]; p.Target != "" && !ok {
 		return nil, api.InvalidParams(fmt.Errorf("unknown target %q", p.Target))
 	}
 	d.mu.Lock()
