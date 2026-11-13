@@ -188,6 +188,216 @@ func TestTasksUpdateChangesTheFilesAndRefusesAStaleVersion(t *testing.T) {
 	}
 }
 
+// movePrompt updates a task so that it points at another prompt file.
+func movePrompt(t *testing.T, c *api.Client, id, promptFile, prompt string) api.TaskDetail {
+	t.Helper()
+	cur := call[api.TaskDetail](t, c, api.MethodTasksGet, api.TaskIDParams{ID: id})
+	def := cur.Task
+	def.PromptFile = promptFile
+	return call[api.TaskDetail](t, c, api.MethodTasksUpdate,
+		api.TaskWriteParams{ID: id, Version: cur.Version, Task: def, Prompt: prompt})
+}
+
+func TestTasksUpdateRemovesThePromptFileItStopsUsing(t *testing.T) {
+	p := setupUTC(t)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	old := filepath.Join(p.ConfigDir, "prompts", "nightly.md")
+
+	// A refused update leaves the old prompt file alone.
+	cur := call[api.TaskDetail](t, c, api.MethodTasksGet, api.TaskIDParams{ID: "nightly"})
+	def := cur.Task
+	def.PromptFile, def.Schedule = "prompts/moved.md", "nonsense"
+	err := c.Call(context.Background(), api.MethodTasksUpdate,
+		api.TaskWriteParams{ID: "nightly", Version: cur.Version, Task: def, Prompt: "moved prompt"}, nil)
+	_ = rpcErr(t, err, api.CodeValidation)
+	if _, err := os.Stat(old); err != nil {
+		t.Fatalf("refused update removed the prompt file: %v", err)
+	}
+
+	got := movePrompt(t, c, "nightly", "prompts/moved.md", "moved prompt")
+	if got.Task.PromptFile != "prompts/moved.md" || got.Prompt != "moved prompt" {
+		t.Errorf("updated = %+v", got)
+	}
+	if data := readFile(t, filepath.Join(p.ConfigDir, "prompts", "moved.md")); data != "moved prompt" {
+		t.Errorf("new prompt file = %q", data)
+	}
+	if _, err := os.Stat(old); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("old prompt file still exists: %v", err)
+	}
+}
+
+func TestTasksUpdateKeepsAnOldPromptFileAnotherTaskUses(t *testing.T) {
+	p := setupUTC(t)
+	write(t, filepath.Join(p.TasksDir(), "twin.yaml"), `id: twin
+target: local
+schedule: "@daily"
+agent: {command: claude}
+prompt_file: prompts/nightly.md
+timeout: 1h
+`)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	before := readFile(t, filepath.Join(p.ConfigDir, "prompts", "nightly.md"))
+	movePrompt(t, c, "nightly", "prompts/moved.md", "moved prompt")
+	if data, err := os.ReadFile(filepath.Join(p.ConfigDir, "prompts", "nightly.md")); err != nil || string(data) != before {
+		t.Errorf("shared prompt file = %q, %v; want it unchanged", data, err)
+	}
+	if twin := call[api.TaskDetail](t, c, api.MethodTasksGet, api.TaskIDParams{ID: "twin"}); twin.Summary.State != api.StateIdle {
+		t.Errorf("twin = %+v", twin.Summary)
+	}
+}
+
+func TestTasksUpdateKeepsThePromptFileWhenTheNewPathIsTheSameFile(t *testing.T) {
+	p := setupUTC(t)
+	if err := os.Symlink("prompts", filepath.Join(p.ConfigDir, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	got := movePrompt(t, c, "nightly", "alias/nightly.md", "same file")
+	if got.Prompt != "same file" || got.Summary.State != api.StateIdle {
+		t.Errorf("updated = %+v", got)
+	}
+	if data := readFile(t, filepath.Join(p.ConfigDir, "prompts", "nightly.md")); data != "same file" {
+		t.Errorf("prompt file = %q", data)
+	}
+}
+
+func TestTasksUpdateKeepsAnOldPromptFileOutsideTheConfigDirectory(t *testing.T) {
+	p := setupUTC(t)
+	outside := filepath.Join(t.TempDir(), "mine.md")
+	write(t, outside, "hand written")
+	write(t, filepath.Join(p.TasksDir(), "roamer.yaml"), `id: roamer
+target: local
+schedule: "@daily"
+agent: {command: claude}
+prompt_file: `+outside+`
+timeout: 1h
+`)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	movePrompt(t, c, "roamer", "prompts/roamer.md", "moved inside")
+	if data := readFile(t, outside); data != "hand written" {
+		t.Errorf("prompt file outside the config directory = %q", data)
+	}
+}
+
+func TestTasksUpdateKeepsAnOldPromptFileBehindALinkOutOfTheConfigDirectory(t *testing.T) {
+	p := setupUTC(t)
+	outside := t.TempDir()
+	write(t, filepath.Join(outside, "roamer.md"), "hand written")
+	if err := os.Symlink(outside, filepath.Join(p.ConfigDir, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.TasksDir(), "roamer.yaml"), `id: roamer
+target: local
+schedule: "@daily"
+agent: {command: claude}
+prompt_file: alias/roamer.md
+timeout: 1h
+`)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	movePrompt(t, c, "roamer", "prompts/roamer.md", "moved inside")
+	if data := readFile(t, filepath.Join(outside, "roamer.md")); data != "hand written" {
+		t.Errorf("prompt file outside the config directory = %q", data)
+	}
+}
+
+func TestTasksUpdateKeepsTheOldPromptFileWhileATaskFileDoesNotParse(t *testing.T) {
+	p := setupUTC(t)
+	// Its prompt_file cannot be read, so it may be any file.
+	write(t, filepath.Join(p.TasksDir(), "garbled.yaml"), "id: garbled\nprompt_file: prompts/nightly.md\nschedule: [\n")
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	movePrompt(t, c, "nightly", "prompts/moved.md", "moved prompt")
+	if _, err := os.Stat(filepath.Join(p.ConfigDir, "prompts", "nightly.md")); err != nil {
+		t.Errorf("prompt file removed while garbled.yaml may use it: %v", err)
+	}
+}
+
+func TestTasksUpdateRemovesTheOldPromptFileWhenAnotherTaskHasATypeError(t *testing.T) {
+	p := setupUTC(t)
+	// timeout does not parse, but prompt_file does: it names another file.
+	write(t, filepath.Join(p.ConfigDir, "prompts", "other.md"), "other")
+	write(t, filepath.Join(p.TasksDir(), "twin.yaml"), `id: twin
+target: local
+schedule: "@daily"
+agent: {command: claude}
+prompt_file: prompts/other.md
+timeout: nope
+`)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	movePrompt(t, c, "nightly", "prompts/moved.md", "moved prompt")
+	if _, err := os.Stat(filepath.Join(p.ConfigDir, "prompts", "nightly.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("old prompt file still exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(p.ConfigDir, "prompts", "other.md")); err != nil {
+		t.Errorf("twin's prompt file = %v", err)
+	}
+}
+
+func TestTasksUpdateKeepsThePromptFileATypeErrorStillNames(t *testing.T) {
+	p := setupUTC(t)
+	write(t, filepath.Join(p.TasksDir(), "twin.yaml"), `id: twin
+target: local
+schedule: "@daily"
+agent: {command: claude}
+prompt_file: prompts/nightly.md
+timeout: nope
+`)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	movePrompt(t, c, "nightly", "prompts/moved.md", "moved prompt")
+	if _, err := os.Stat(filepath.Join(p.ConfigDir, "prompts", "nightly.md")); err != nil {
+		t.Errorf("prompt file removed while twin.yaml names it: %v", err)
+	}
+}
+
+func TestTasksUpdateKeepsAPromptFileAHandEditStillNames(t *testing.T) {
+	p := setupUTC(t)
+	write(t, filepath.Join(p.ConfigDir, "prompts", "other.md"), "other")
+	write(t, filepath.Join(p.TasksDir(), "twin.yaml"), `id: twin
+target: local
+schedule: "@daily"
+agent: {command: claude}
+prompt_file: prompts/other.md
+timeout: 1h
+`)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	// Loaded as prompts/other.md. Rewrite the file and update nightly
+	// before the watcher reloads twin; do not tasks.get twin, that reloads it.
+	write(t, filepath.Join(p.TasksDir(), "twin.yaml"), `id: twin
+target: local
+schedule: "@daily"
+agent: {command: claude}
+prompt_file: prompts/nightly.md
+timeout: 1h
+`)
+	movePrompt(t, c, "nightly", "prompts/moved.md", "moved prompt")
+	if _, err := os.Stat(filepath.Join(p.ConfigDir, "prompts", "nightly.md")); err != nil {
+		t.Errorf("prompt file removed while twin.yaml still names it: %v", err)
+	}
+}
+
+func TestTasksUpdateRemovesTheOldPromptFileOfAnInvalidTask(t *testing.T) {
+	p := setupUTC(t)
+	write(t, filepath.Join(p.ConfigDir, "prompts", "stray.md"), "stray")
+	write(t, filepath.Join(p.TasksDir(), "stray.yaml"), `id: stray
+target: nowhere
+schedule: "@daily"
+agent: {command: claude}
+prompt_file: prompts/stray.md
+timeout: 1h
+`)
+	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
+	cur := call[api.TaskDetail](t, c, api.MethodTasksGet, api.TaskIDParams{ID: "stray"})
+	def := cur.Task
+	def.Target, def.PromptFile = "local", "prompts/moved.md"
+	got := call[api.TaskDetail](t, c, api.MethodTasksUpdate,
+		api.TaskWriteParams{ID: "stray", Version: cur.Version, Task: def, Prompt: cur.Prompt})
+	if got.Summary.State != api.StateIdle {
+		t.Errorf("fixed task = %+v", got.Summary)
+	}
+	if _, err := os.Stat(filepath.Join(p.ConfigDir, "prompts", "stray.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("old prompt file still exists: %v", err)
+	}
+}
+
 func TestTasksUpdateCannotRenameATask(t *testing.T) {
 	p := setupUTC(t)
 	c := startWith(t, p, daemon.Options{Version: "test", Clock: clock.NewFake(noon), Targets: fakeTargets()})
