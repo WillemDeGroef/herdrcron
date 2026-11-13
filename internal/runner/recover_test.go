@@ -265,3 +265,66 @@ func TestRecoverLogsAStoreErrorOnlyForItsRun(t *testing.T) {
 		t.Errorf("cannot-store lines = %v, want one for %s", lines, bad.ID)
 	}
 }
+
+// herdr restores its session when the server starts again after a crash:
+// the run's pane id exists again, but it is a new shell without the agent.
+func TestPollEndsARunLostWhenARestartedHerdrServerRestoredItsPane(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.script(working, working, working)
+	run := e.start(deps())
+	if got := e.poll(run.ID); got != store.StatusRunning {
+		t.Fatalf("status = %s, want running", got)
+	}
+	e.herdr.restartServer()
+
+	e.poll(run.ID)
+	got := e.get(run.ID)
+	if got.Status != store.StatusLost || got.ExitReason != "pane replaced: herdr server restarted" || got.EndedAt.IsZero() {
+		t.Errorf("run = %s %q ended %v, want lost %q", got.Status, got.ExitReason, got.EndedAt, "pane replaced: herdr server restarted")
+	}
+	if e.runner.Active(run.ID) {
+		t.Errorf("lost run is still tracked")
+	}
+	notes := e.notifications()
+	if len(notes) != 1 || notes[0].event != config.EventLost {
+		t.Errorf("notifications = %+v, want one lost", notes)
+	}
+	if n := e.herdr.count("herdr", "pane", "read"); n != 0 {
+		t.Errorf("%d pane reads of a pane that is not the run's", n)
+	}
+}
+
+// The daemon was down while the herdr server restarted: recovery must not
+// adopt the restored pane either.
+func TestRecoverMarksARunLostWhenARestartedHerdrServerRestoredItsPane(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.script(working, working)
+	run := e.start(deps())
+	e.poll(run.ID)
+	e.herdr.restartServer()
+
+	e.restart(deps())
+	got := e.get(run.ID)
+	if got.Status != store.StatusLost || got.ExitReason != "pane replaced: herdr server restarted" || got.EndedAt.IsZero() {
+		t.Errorf("run = %s %q ended %v, want lost %q", got.Status, got.ExitReason, got.EndedAt, "pane replaced: herdr server restarted")
+	}
+}
+
+// A run stored before runs.herdr_terminal existed has no terminal id to
+// compare: it is tracked by its pane id, as before.
+func TestRecoverTracksARunStoredWithoutATerminalID(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.script(working, working, working)
+	run := e.start(deps())
+	e.poll(run.ID)
+	old := e.get(run.ID)
+	old.HerdrTerminal = ""
+	if err := e.store.UpdateRun(e.ctx, old); err != nil {
+		t.Fatal(err)
+	}
+
+	e.restart(deps())
+	if got := e.poll(run.ID); got != store.StatusRunning || !e.runner.Active(run.ID) {
+		t.Errorf("status = %s, want running and tracked", got)
+	}
+}

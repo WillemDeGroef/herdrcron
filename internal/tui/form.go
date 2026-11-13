@@ -100,12 +100,14 @@ type (
 	formReloadMsg struct{ seq int }
 )
 
-// newTask is the definition a new task starts from: the daemon's defaults
-// (config.DefaultTask) and the first target.
+// newTask is the definition a new task starts from: config.NewTask (the
+// daemon's defaults, an agent command and a timeout) and the first target.
 func (m Model) newTask() api.TaskDef {
-	d := config.DefaultTask("")
+	d := config.NewTask("")
 	def := api.TaskDef{Enabled: d.Enabled, Overlap: d.Overlap, Missed: d.Missed,
-		OnDone: d.OnDone, OnBlocked: d.OnBlocked, Target: config.LocalTarget}
+		OnDone: d.OnDone, OnBlocked: d.OnBlocked, Target: config.LocalTarget,
+		Agent:   api.AgentDef{Command: d.Agent.Command, Args: d.Agent.Args},
+		Timeout: config.FormatDuration(d.Timeout.Duration)}
 	if len(m.status.Targets) > 0 {
 		def.Target = m.status.Targets[0].Name
 	}
