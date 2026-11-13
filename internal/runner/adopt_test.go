@@ -202,6 +202,33 @@ func TestAdoptLostFailsWhileTheTargetIsUnreachable(t *testing.T) {
 	}
 }
 
+// A herdr server restart reuses the pane id under a new terminal id. Stale
+// scrollback that still shows the launch line must not adopt the run; the
+// tab is left alone so catch-up can start a fresh agent.
+func TestAdoptLostDoesNotAdoptARestoredPaneWhoseTerminalChanged(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.script(shell)
+	lost := e.startLost()
+	e.herdr.restartServer()
+	e.herdr.mu.Lock()
+	e.herdr.output = "$ claude \"$(cat \"$HOME\"/.herdrcron/prompts/" + lost.ID + ".md)\"\n"
+	e.herdr.mu.Unlock()
+	e.reconnect()
+	closes := e.herdr.count("herdr", "tab", "close")
+	if _, adopted, err := e.adopt(); err != nil || adopted {
+		t.Fatalf("AdoptLost = %v, %v, want nothing adopted", adopted, err)
+	}
+	if !e.herdr.tabOpen(lost.HerdrTab) {
+		t.Error("the restored pane's tab was closed")
+	}
+	if got := e.get(lost.ID); got.Status != store.StatusHostUnreachable || !strings.Contains(got.ExitReason, "no agent found") {
+		t.Errorf("stored run = %s %q, want host_unreachable settled as no agent", got.Status, got.ExitReason)
+	}
+	if n := e.herdr.count("herdr", "tab", "close") - closes; n != 0 {
+		t.Errorf("%d tab closes during adoption, want none", n)
+	}
+}
+
 // The agent of the lost launch has exited by the time the target answers:
 // the pane is a shell at its prompt, and its output shows the launch line.
 // The run is adopted, so the fire is not run a second time, and the next

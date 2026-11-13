@@ -158,6 +158,23 @@ func DefaultTask(id string) Task {
 	}
 }
 
+// What a new task starts with for the two required fields that have no
+// file default: the agent command and the timeout of the spec's example.
+const (
+	DefaultAgentCommand = "claude"
+	DefaultTimeout      = 2 * time.Hour
+)
+
+// NewTask is the task a new-task form starts from: DefaultTask plus a
+// pre-filled agent command and timeout. They are not in DefaultTask
+// because a task file that leaves them out is invalid, not defaulted.
+func NewTask(id string) Task {
+	t := DefaultTask(id)
+	t.Agent.Command = DefaultAgentCommand
+	t.Timeout = Duration{DefaultTimeout}
+	return t
+}
+
 func defaultPromptFile(fileID string) string { return filepath.Join("prompts", fileID+".md") }
 
 func loadTask(path, fileID, configDir string, cfg Config) (Task, error) {

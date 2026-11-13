@@ -120,6 +120,9 @@ func (r *Runner) launchArrived(ctx context.Context, ts *targetState, run store.R
 	if i < 0 {
 		return false, nil
 	}
+	if terminalReplaced(run, panes[i]) {
+		return false, nil
+	}
 	tabs, err := ts.herdr.TabList(ctx, run.HerdrWorkspace)
 	if herdr.IsCode(err, herdr.CodeWorkspaceNotFound) {
 		return false, nil

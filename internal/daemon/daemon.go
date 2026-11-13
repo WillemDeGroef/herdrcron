@@ -172,6 +172,12 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		log.Error("cannot recover open runs", "err", err)
 		return err
 	}
+	// The fires the previous daemon left waiting come back before the
+	// scheduler can submit new ones, so they keep their place in the queue.
+	if err := d.disp.Restore(ctx, validTasks(tasks), clk.Now()); err != nil {
+		log.Error("cannot restore queued fires", "err", err)
+		return err
+	}
 	if err := d.sched.SetTasks(ctx, tasks); err != nil {
 		log.Error("cannot schedule tasks", "err", err)
 		return err
@@ -237,6 +243,11 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		defer close(watchDone)
 		d.watchFiles(ctx, w) // returns when ctx is done
 	}()
+	resumeDone := make(chan struct{})
+	go func() {
+		defer close(resumeDone)
+		d.disp.Resume(ctx) // starts the restored fires that have a free slot
+	}()
 	publishDone := make(chan struct{})
 	go func() {
 		defer close(publishDone)
@@ -248,6 +259,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	<-runnerDone
 	<-watchDone
 	<-publishDone
+	<-resumeDone
 	d.stopCatchUps()
 	d.bg.Wait()
 	log.Info("daemon stopped")
