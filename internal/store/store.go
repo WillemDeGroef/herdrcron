@@ -41,7 +41,7 @@ var ErrNotFound = errors.New("not found")
 
 // schemaVersion is stored in PRAGMA user_version so later versions can
 // migrate the schema.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // schema creates the tables if they are missing.
 const schema = `
@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS runs (
 	herdr_workspace TEXT,
 	herdr_tab       TEXT,
 	herdr_pane      TEXT,
+	herdr_terminal  TEXT,
 	exit_reason     TEXT,
 	output_tail     TEXT
 );
@@ -101,8 +102,13 @@ type Run struct {
 	HerdrWorkspace string
 	HerdrTab       string
 	HerdrPane      string
-	ExitReason     string // Short human text, for example "timeout after 2h".
-	OutputTail     string // Last lines of pane output at the end of the run.
+	// HerdrTerminal is the pane's terminal_id at launch. herdr reuses pane
+	// ids when a restarted server restores its session; the terminal id
+	// tells the run's pane from the shell that replaced it. Empty for runs
+	// stored before schema version 2.
+	HerdrTerminal string
+	ExitReason    string // Short human text, for example "timeout after 2h".
+	OutputTail    string // Last lines of pane output at the end of the run.
 }
 
 // Open opens the database at path, creating the file and tables if missing.
@@ -124,7 +130,7 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// migrate creates the tables, and refuses a database written by a newer
+// migrate creates the tables, upgrades an older schema, and refuses a database written by a newer
 // schema.
 func migrate(db *sql.DB) error {
 	var version int
@@ -136,6 +142,25 @@ func migrate(db *sql.DB) error {
 	}
 	if _, err := db.Exec(schema); err != nil {
 		return err
+	}
+	// Version 2 added runs.herdr_terminal. CREATE TABLE IF NOT EXISTS
+	// leaves an older table as it was: version 1, or version 0 when a
+	// daemon died after creating the table and before writing
+	// user_version. A fresh database is also version 0; its CREATE
+	// already added the column.
+	// The column is looked up, not assumed missing: a daemon that died
+	// between the ALTER and the version write must still open.
+	if version < 2 {
+		var n int
+		err := db.QueryRow("SELECT count(*) FROM pragma_table_info('runs') WHERE name = 'herdr_terminal'").Scan(&n)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec("ALTER TABLE runs ADD COLUMN herdr_terminal TEXT"); err != nil {
+				return err
+			}
+		}
 	}
 	_, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion))
 	return err
@@ -152,8 +177,8 @@ func NewRunID(t time.Time) string {
 }
 
 const runColumns = `id, task_id, target, trigger, scheduled_at, started_at,
-	ended_at, status, herdr_workspace, herdr_tab, herdr_pane, exit_reason,
-	output_tail`
+	ended_at, status, herdr_workspace, herdr_tab, herdr_pane, herdr_terminal,
+	exit_reason, output_tail`
 
 // InsertRun adds a new run. r.ID must be set.
 func (s *Store) InsertRun(ctx context.Context, r Run) error {
@@ -161,10 +186,10 @@ func (s *Store) InsertRun(ctx context.Context, r Run) error {
 		return errors.New("insert run: empty id")
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO runs (`+runColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO runs (`+runColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.TaskID, r.Target, r.Trigger, timeValue(r.ScheduledAt),
 		timeValue(r.StartedAt), timeValue(r.EndedAt), r.Status,
-		r.HerdrWorkspace, r.HerdrTab, r.HerdrPane, r.ExitReason, r.OutputTail)
+		r.HerdrWorkspace, r.HerdrTab, r.HerdrPane, r.HerdrTerminal, r.ExitReason, r.OutputTail)
 	if err != nil {
 		return fmt.Errorf("insert run %s: %w", r.ID, err)
 	}
@@ -196,15 +221,17 @@ func scanRun(sc scanner) (Run, error) {
 		r                         Run
 		scheduled, started, ended sql.NullString
 		workspace, tab, pane      sql.NullString
+		terminal                  sql.NullString
 		exitReason, outputTail    sql.NullString
 	)
 	err := sc.Scan(&r.ID, &r.TaskID, &r.Target, &r.Trigger, &scheduled,
-		&started, &ended, &r.Status, &workspace, &tab, &pane, &exitReason,
-		&outputTail)
+		&started, &ended, &r.Status, &workspace, &tab, &pane, &terminal,
+		&exitReason, &outputTail)
 	if err != nil {
 		return Run{}, err
 	}
 	r.HerdrWorkspace, r.HerdrTab, r.HerdrPane = workspace.String, tab.String, pane.String
+	r.HerdrTerminal = terminal.String
 	r.ExitReason, r.OutputTail = exitReason.String, outputTail.String
 	if r.ScheduledAt, err = parseTime(scheduled); err != nil {
 		return Run{}, err
@@ -255,11 +282,11 @@ func (s *Store) UpdateRun(ctx context.Context, r Run) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE runs SET
 		target = ?, trigger = ?, scheduled_at = ?, started_at = ?,
 		ended_at = ?, status = ?, herdr_workspace = ?, herdr_tab = ?,
-		herdr_pane = ?, exit_reason = ?, output_tail = ?
+		herdr_pane = ?, herdr_terminal = ?, exit_reason = ?, output_tail = ?
 		WHERE id = ?`,
 		r.Target, r.Trigger, timeValue(r.ScheduledAt), timeValue(r.StartedAt),
 		timeValue(r.EndedAt), r.Status, r.HerdrWorkspace, r.HerdrTab,
-		r.HerdrPane, r.ExitReason, r.OutputTail, r.ID)
+		r.HerdrPane, r.HerdrTerminal, r.ExitReason, r.OutputTail, r.ID)
 	if err != nil {
 		return fmt.Errorf("update run %s: %w", r.ID, err)
 	}

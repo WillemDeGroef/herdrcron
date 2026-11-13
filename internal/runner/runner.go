@@ -43,6 +43,9 @@ const (
 	// stopGrace the wait after them before the tab is closed.
 	stopKeyGap = 2 * time.Second
 	stopGrace  = 10 * time.Second
+	// reasonPaneReplaced is why a run ends lost when its pane id comes
+	// back as a new shell after a herdr server restart.
+	reasonPaneReplaced = "pane replaced: herdr server restarted"
 )
 
 // ErrNotActive is returned by Stop, ReadOutput and PaneHasAgent for a run
@@ -329,14 +332,14 @@ func (r *Runner) openTab(ctx context.Context, ts *targetState, a *activeRun, cwd
 		if err != nil {
 			return fmt.Errorf("create tab: %w", err)
 		}
-		r.setHerdrIDs(a, res.Tab.WorkspaceID, res.Tab.TabID, res.RootPane.PaneID)
+		r.setHerdrIDs(a, res.Tab.WorkspaceID, res.Tab.TabID, res.RootPane)
 		return nil
 	}
 	res, err := ts.herdr.WorkspaceCreate(ctx, cwd, wsLabel, env)
 	if err != nil {
 		return fmt.Errorf("create workspace: %w", err)
 	}
-	r.setHerdrIDs(a, res.Workspace.WorkspaceID, res.Tab.TabID, res.RootPane.PaneID)
+	r.setHerdrIDs(a, res.Workspace.WorkspaceID, res.Tab.TabID, res.RootPane)
 	if err := ts.herdr.TabRename(ctx, res.Tab.TabID, label); err != nil {
 		return fmt.Errorf("rename tab: %w", err)
 	}
@@ -345,10 +348,11 @@ func (r *Runner) openTab(ctx context.Context, ts *targetState, a *activeRun, cwd
 
 // setHerdrIDs stores a starting run's herdr ids under r.mu, which LiveRuns
 // reads it with.
-func (r *Runner) setHerdrIDs(a *activeRun, workspace, tab, pane string) {
+func (r *Runner) setHerdrIDs(a *activeRun, workspace, tab string, pane herdr.PaneInfo) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	a.run.HerdrWorkspace, a.run.HerdrTab, a.run.HerdrPane = workspace, tab, pane
+	a.run.HerdrWorkspace, a.run.HerdrTab = workspace, tab
+	a.run.HerdrPane, a.run.HerdrTerminal = pane.PaneID, pane.TerminalID
 }
 
 // tabLabel is hc-<task-id>-<HHMM>, in the task's time zone.
@@ -682,6 +686,16 @@ func (r *Runner) PollTarget(ctx context.Context, name string) {
 				r.finish(ctx, ts, a, store.StatusLost, "pane gone")
 				return
 			}
+			// A herdr server that crashed and started again restores its
+			// session: the pane id exists again, as a new shell with
+			// another terminal id. The run's processes went with the old
+			// server. Runs stored without a terminal id skip the check.
+			// stop checks again, because a timeout is decided before this
+			// list and a user stop does not come through here.
+			if terminalReplaced(a.run, p) {
+				r.finish(ctx, ts, a, store.StatusLost, reasonPaneReplaced)
+				return
+			}
 			r.track(ctx, ts, a, p)
 		})
 	}
@@ -880,12 +894,45 @@ func (r *Runner) beginStopLocked(a *activeRun, status, reason string) bool {
 	return true
 }
 
+// terminalReplaced reports whether pane is a new shell under run's pane
+// id. Runs stored before herdr_terminal existed have no id to compare.
+func terminalReplaced(run store.Run, pane herdr.PaneInfo) bool {
+	return run.HerdrTerminal != "" && pane.TerminalID != run.HerdrTerminal
+}
+
+// endIfPaneReplaced ends the run lost when herdr lists its pane id with
+// another terminal id than at launch. The restored shell is not the run:
+// it is left open and no keys are sent. A run with no stored terminal id
+// is not checked. A failed pane list is not a replacement, so the caller
+// still stops and a timeout still ends the run while the target does not
+// answer. The bool is true when this call ended the run.
+func (r *Runner) endIfPaneReplaced(ctx context.Context, ts *targetState, a *activeRun) (bool, error) {
+	if a.run.HerdrTerminal == "" || a.run.HerdrPane == "" {
+		return false, nil
+	}
+	panes, err := ts.herdr.PaneList(ctx)
+	if err != nil {
+		a.log.Warn("cannot check the pane terminal", "err", err)
+		return false, nil
+	}
+	for _, p := range panes {
+		if p.PaneID != a.run.HerdrPane || !terminalReplaced(a.run, p) {
+			continue
+		}
+		a.log.Info("pane replaced since the last poll")
+		_, err = r.end(context.WithoutCancel(ctx), a, store.StatusLost, reasonPaneReplaced)
+		return true, err
+	}
+	return false, nil
+}
+
 // stop runs step 10 as adapted in docs/herdr-findings.md: esc (dismisses a
 // question dialog), Ctrl-C twice in one call (exits Claude Code), again
 // after 2 s, then after 10 s the output tail is read and the tab closed,
 // whatever on_done says. Key, read and close errors are logged and do not
 // keep the run from ending. If ctx ends during a wait (the daemon stops),
-// the run stays open for Recover.
+// the run stays open for Recover. A pane the server restored under the
+// same id since the last poll ends the run lost instead of stopping.
 func (r *Runner) stop(ctx context.Context, a *activeRun, status, reason string) (store.Run, error) {
 	// Wait for a poll that is tracking the run; it may have ended it.
 	a.mu.Lock()
@@ -899,6 +946,9 @@ func (r *Runner) stop(ctx context.Context, a *activeRun, status, reason string) 
 	ts := r.targets[a.run.Target]
 	if ts == nil {
 		return r.end(context.WithoutCancel(ctx), a, status, reason)
+	}
+	if lost, err := r.endIfPaneReplaced(ctx, ts, a); lost || err != nil {
+		return a.run, err
 	}
 	a.log.Info("stopping run", "status", status, "exit_reason", reason)
 	pane := a.run.HerdrPane

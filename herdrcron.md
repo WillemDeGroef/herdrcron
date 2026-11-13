@@ -167,11 +167,11 @@ A `herdr` package on top of `Target` wraps the herdr CLI commands and parses JSO
    - `working` → `running`.
    - `blocked` → `blocked`; on the first change, notify (see Configuration). With `on_blocked: stop`, stop the run.
    - `done` or `idle` for 2 polls in a row (debounce) → `done`.
-   - Pane gone → `lost`.
+   - Pane gone → `lost`. (For herdr 0.9.1, `docs/herdr-findings.md` also ends a run `lost` when a restarted herdr server restored its pane id as a new shell.)
    - Unknown or no status (no herdr agent integration) → stay `running`; the timeout still applies. (For herdr 0.9.1, `docs/herdr-findings.md` ends a run whose `agent` is absent when a later `pane process-info` sample shows the shell back in the foreground.)
 8. Timeout: when `started_at + timeout` passes, stop the run (step 10) with status `timeout`.
 9. Finish: read the last 200 lines (`herdr pane read <pane> --source recent --lines 200`) into `output_tail`. Set `ended_at`. With `on_done: close_tab`, close the tab; else keep it for the user to read. Delete the remote prompt file. (For herdr 0.9.1, `docs/herdr-findings.md` uses `--source recent-unwrapped` so soft wraps are joined. `--source recent --lines N` does work and keeps the wraps.)
-10. Stop (timeout, user stop, or `on_blocked: stop`): send Ctrl-C to the pane twice, 2 s apart; wait 10 s; then close the tab. Status `stopped` or `timeout`. (For herdr 0.9.1, `docs/herdr-findings.md` replaces this with `esc`, then `ctrl+c ctrl+c` in one call: two calls 2 s apart do not exit Claude Code.)
+10. Stop (timeout, user stop, or `on_blocked: stop`): send Ctrl-C to the pane twice, 2 s apart; wait 10 s; then close the tab. Status `stopped` or `timeout`. (For herdr 0.9.1, `docs/herdr-findings.md` replaces this with `esc`, then `ctrl+c ctrl+c` in one call: two calls 2 s apart do not exit Claude Code. If that pane id was restored as a new shell, the run ends `lost` and no keys are sent.)
 
 ### Recovery and failures
 

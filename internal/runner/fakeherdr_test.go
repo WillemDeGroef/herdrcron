@@ -39,6 +39,7 @@ var (
 
 type fakePane struct {
 	id, tab, ws string
+	terminal    string // changes when a restarted server restores the pane
 	script      []sample
 	polls       int // pane lists since pane run
 	command     string
@@ -77,6 +78,7 @@ type fakeHerdr struct {
 	order      []string // pane ids in creation order
 	scripts    [][]sample
 	nextID     int
+	terminals  int
 
 	serverDown   bool   // herdr calls fail with server_not_running
 	unreachable  bool   // herdr calls fail as an ssh target that does not answer
@@ -204,7 +206,7 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 			if s.gone {
 				continue
 			}
-			info := herdr.PaneInfo{PaneID: p.id, TabID: p.tab, WorkspaceID: p.ws, AgentStatus: s.status}
+			info := herdr.PaneInfo{PaneID: p.id, TabID: p.tab, WorkspaceID: p.ws, TerminalID: p.terminal, AgentStatus: s.status}
 			if s.agent != "" {
 				info.Agent = &s.agent
 			}
@@ -299,13 +301,34 @@ func (f *fakeHerdr) newTab(ws, label string) (string, herdr.PaneInfo) {
 	pane := fmt.Sprintf("%s:p%d", ws, f.nextID)
 	f.tabs[tab] = ws
 	f.tabLabels[tab] = label
-	p := &fakePane{id: pane, tab: tab, ws: ws}
+	p := &fakePane{id: pane, tab: tab, ws: ws, terminal: f.newTerminal()}
 	if len(f.scripts) > 0 {
 		p.script, f.scripts = f.scripts[0], f.scripts[1:]
 	}
 	f.panes[pane] = p
 	f.order = append(f.order, pane)
-	return tab, herdr.PaneInfo{PaneID: pane, TabID: tab, WorkspaceID: ws, AgentStatus: herdr.AgentStatusUnknown}
+	return tab, herdr.PaneInfo{PaneID: pane, TabID: tab, WorkspaceID: ws, TerminalID: p.terminal, AgentStatus: herdr.AgentStatusUnknown}
+}
+
+func (f *fakeHerdr) newTerminal() string {
+	f.terminals++
+	return fmt.Sprintf("term_%d", f.terminals)
+}
+
+// restartServer plays a herdr server that crashed and was started again,
+// as herdr 0.9.1 does it: the session is restored, so every workspace, tab
+// and pane keeps its id, but each pane is a new shell with a new terminal
+// id and the processes that ran in it are gone.
+func (f *fakeHerdr) restartServer() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.panes {
+		if p.closed {
+			continue
+		}
+		p.terminal = f.newTerminal()
+		p.script, p.polls, p.command, p.interrupted = nil, 0, "", false
+	}
 }
 
 // preflightCheck answers the shell script that checks the agent command and

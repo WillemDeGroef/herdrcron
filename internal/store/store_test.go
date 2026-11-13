@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"slices"
@@ -45,6 +46,7 @@ func TestInsertGetRoundtrip(t *testing.T) {
 		HerdrWorkspace: "ws1",
 		HerdrTab:       "tab1",
 		HerdrPane:      "pane1",
+		HerdrTerminal:  "term_1",
 		ExitReason:     "done",
 		OutputTail:     "line1\nline2\n",
 	}
@@ -557,6 +559,139 @@ func TestGlobalPauseSurvivesReopen(t *testing.T) {
 	assertGlobalPause(t, s, true, "vps")
 }
 
+// A database written by schema version 1 has no runs.herdr_terminal: Open
+// adds the column and keeps the rows.
+func TestOpenUpgradesSchemaVersion1(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+CREATE TABLE runs (
+	id              TEXT PRIMARY KEY,
+	task_id         TEXT NOT NULL,
+	target          TEXT NOT NULL,
+	trigger         TEXT NOT NULL,
+	scheduled_at    TIMESTAMP,
+	started_at      TIMESTAMP NOT NULL,
+	ended_at        TIMESTAMP,
+	status          TEXT NOT NULL,
+	herdr_workspace TEXT,
+	herdr_tab       TEXT,
+	herdr_pane      TEXT,
+	exit_reason     TEXT,
+	output_tail     TEXT
+);
+INSERT INTO runs (id, task_id, target, trigger, started_at, status, herdr_pane)
+	VALUES ('old', 'backup', 'local', 'manual', '2026-01-02T03:04:05Z', 'running', 'w1:p1');
+PRAGMA user_version = 1;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	for range 2 { // the second Open finds the column already there
+		s, err := store.Open(path)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		run, err := s.GetRun(ctx, "old")
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if run.HerdrPane != "w1:p1" || run.HerdrTerminal != "" {
+			t.Errorf("old run = pane %q terminal %q, want w1:p1 and no terminal", run.HerdrPane, run.HerdrTerminal)
+		}
+		run.HerdrTerminal = "term_1"
+		if err := s.UpdateRun(ctx, run); err != nil {
+			t.Fatalf("UpdateRun: %v", err)
+		}
+		if got, _ := s.GetRun(ctx, "old"); got.HerdrTerminal != "term_1" {
+			t.Errorf("terminal after update = %q, want term_1", got.HerdrTerminal)
+		}
+		run.HerdrTerminal = ""
+		if err := s.UpdateRun(ctx, run); err != nil {
+			t.Fatalf("UpdateRun: %v", err)
+		}
+		// A daemon that died after adding the column, before storing
+		// the new version, left version 1 with the column.
+		if err := s.SetUserVersionForTest(1); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A daemon that died after creating the version 1 table and before
+// writing user_version left version 0. Open must add herdr_terminal;
+// stamping version 2 without the column makes every later read fail.
+func TestOpenUpgradesSchemaLeftAtVersion0(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+CREATE TABLE runs (
+	id              TEXT PRIMARY KEY,
+	task_id         TEXT NOT NULL,
+	target          TEXT NOT NULL,
+	trigger         TEXT NOT NULL,
+	scheduled_at    TIMESTAMP,
+	started_at      TIMESTAMP NOT NULL,
+	ended_at        TIMESTAMP,
+	status          TEXT NOT NULL,
+	herdr_workspace TEXT,
+	herdr_tab       TEXT,
+	herdr_pane      TEXT,
+	exit_reason     TEXT,
+	output_tail     TEXT
+);
+INSERT INTO runs (id, task_id, target, trigger, started_at, status, herdr_pane)
+	VALUES ('old', 'backup', 'local', 'manual', '2026-01-02T03:04:05Z', 'running', 'w1:p1');
+PRAGMA user_version = 0;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	run, err := s.GetRun(context.Background(), "old")
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if run.HerdrPane != "w1:p1" || run.HerdrTerminal != "" {
+		t.Errorf("old run = pane %q terminal %q, want w1:p1 and no terminal", run.HerdrPane, run.HerdrTerminal)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 {
+		t.Errorf("user_version = %d, want 2", version)
+	}
+}
+
 func TestQueuedFiresRoundtripInQueueOrder(t *testing.T) {
 	s := openStore(t)
 	ctx := context.Background()
@@ -599,5 +734,88 @@ func TestQueuedFiresRoundtripInQueueOrder(t *testing.T) {
 	}
 	if got, _ = s.ListQueuedFires(ctx); !slices.Equal(got, []store.QueuedFire{released}) {
 		t.Fatalf("after delete: %+v, want %+v", got, []store.QueuedFire{released})
+	}
+}
+
+// A version 1 database can already hold queued fires: queued_fires came
+// without a version bump. The upgrade to version 2 keeps them, and a
+// version 1 database written before queued_fires existed gets the table.
+func TestOpenUpgradesSchemaVersion1KeepsQueuedFires(t *testing.T) {
+	const runsV1 = `
+CREATE TABLE runs (
+	id              TEXT PRIMARY KEY,
+	task_id         TEXT NOT NULL,
+	target          TEXT NOT NULL,
+	trigger         TEXT NOT NULL,
+	scheduled_at    TIMESTAMP,
+	started_at      TIMESTAMP NOT NULL,
+	ended_at        TIMESTAMP,
+	status          TEXT NOT NULL,
+	herdr_workspace TEXT,
+	herdr_tab       TEXT,
+	herdr_pane      TEXT,
+	exit_reason     TEXT,
+	output_tail     TEXT
+);`
+	const queuedV1 = `
+CREATE TABLE queued_fires (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	task_id      TEXT NOT NULL,
+	target       TEXT NOT NULL,
+	trigger      TEXT NOT NULL,
+	scheduled_at TIMESTAMP,
+	pending      INTEGER NOT NULL
+);
+INSERT INTO queued_fires (task_id, target, trigger, pending) VALUES ('backup', 'local', 'manual', 0);`
+
+	for name, tc := range map[string]struct {
+		ddl  string
+		want int
+	}{
+		"with queued fires":   {runsV1 + queuedV1, 1},
+		"before queued_fires": {runsV1, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			db, err := sql.Open("sqlite", "file:"+path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(tc.ddl + "\nPRAGMA user_version = 1;"); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			s, err := store.Open(path)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer func() { _ = s.Close() }()
+			ctx := context.Background()
+			fires, err := s.ListQueuedFires(ctx)
+			if err != nil {
+				t.Fatalf("ListQueuedFires: %v", err)
+			}
+			if len(fires) != tc.want {
+				t.Fatalf("queued fires = %+v, want %d", fires, tc.want)
+			}
+			if tc.want == 1 && (fires[0].TaskID != "backup" || fires[0].Trigger != store.TriggerManual) {
+				t.Errorf("queued fire = %+v, want the manual backup fire", fires[0])
+			}
+			if _, err := s.AddQueuedFire(ctx, store.QueuedFire{TaskID: "b", Target: "local", Trigger: store.TriggerManual}); err != nil {
+				t.Fatalf("AddQueuedFire: %v", err)
+			}
+			// The runs table took the version 2 column too.
+			run := store.Run{ID: "r1", TaskID: "backup", Target: "local", Trigger: store.TriggerManual,
+				StartedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), Status: store.StatusRunning, HerdrTerminal: "term_1"}
+			if err := s.InsertRun(ctx, run); err != nil {
+				t.Fatalf("InsertRun: %v", err)
+			}
+			if got, err := s.GetRun(ctx, "r1"); err != nil || got.HerdrTerminal != "term_1" {
+				t.Errorf("GetRun = terminal %q, err %v; want term_1", got.HerdrTerminal, err)
+			}
+		})
 	}
 }
