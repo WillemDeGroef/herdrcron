@@ -190,6 +190,13 @@ func TestPollWorkerStopsATimedOutRunWhenTheTargetReturns(t *testing.T) {
 	if e.interrupted() {
 		t.Fatalf("Ctrl-C reached the agent on an unreachable target")
 	}
+	// The timeout can pass before the worker has seen the outage, or as the
+	// backoff expires: the stop then tries esc once. That call does not get
+	// through, and nothing else is sent.
+	tried := e.stopSteps()
+	if len(tried) > 1 || (len(tried) == 1 && tried[0] != "keys esc") {
+		t.Fatalf("stop calls while the target was down = %q, want at most the esc that discovered the outage", tried)
+	}
 
 	e.setUnreachable(false)
 	e.waitFor("the worker to finish the stop", func() bool {
@@ -203,8 +210,8 @@ func TestPollWorkerStopsATimedOutRunWhenTheTargetReturns(t *testing.T) {
 	if !e.interrupted() || e.herdr.tabOpen(run.HerdrTab) {
 		t.Errorf("interrupted %v, tab open %v; want the agent stopped and the tab closed", e.interrupted(), e.herdr.tabOpen(run.HerdrTab))
 	}
-	if steps := e.stopSteps(); !slices.Equal(steps, stopSequence) {
-		t.Errorf("stop calls = %q, want %q", steps, stopSequence)
+	if steps := e.stopSteps()[len(tried):]; !slices.Equal(steps, stopSequence) {
+		t.Errorf("stop calls once the target answers = %q, want %q", steps, stopSequence)
 	}
 	if n := len(e.notifications()); n != 1 {
 		t.Errorf("%d notifications %v, want 1 for the timeout", n, e.notifications())
