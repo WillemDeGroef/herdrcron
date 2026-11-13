@@ -853,3 +853,68 @@ func TestRestoreDropsAScheduledFireOlderThanCatchUpWindow(t *testing.T) {
 		t.Errorf("stored fires = %+v err=%v, want none", fires, err)
 	}
 }
+
+// A's pending fire was stored before B joined the capacity queue. A's run
+// ended while the daemon was down, so the pending fire is released behind
+// B, as it would be when a live run ends.
+func TestRestoreReleasesAnIdlePendingFireBehindFiresAlreadyQueued(t *testing.T) {
+	st := openStore(t)
+	a, b := task("a", "local", "queue"), task("b", "local", "parallel")
+	h := newHarness(t, oneSlot(), st)
+	submit(t, h, a, store.TriggerSchedule, t0, false)
+	if !submit(t, h, a, store.TriggerSchedule, t0.Add(time.Hour), false).Queued {
+		t.Fatal("want a's second fire pending")
+	}
+	if !submit(t, h, b, store.TriggerSchedule, t0.Add(time.Minute), false).Queued {
+		t.Fatal("want b queued for a free slot")
+	}
+
+	h = restart(t, oneSlot(), st) // a's run did not survive
+	restore(t, h, a, b)
+	starts := h.runs.startCalls()
+	if len(starts) != 1 || starts[0].TaskID != "b" {
+		t.Fatalf("starts = %+v, want b, which was already waiting for the slot", starts)
+	}
+	h.runs.end(t, starts[0].ID)
+	starts = h.runs.startCalls()
+	if len(starts) != 2 || starts[1].TaskID != "a" || !starts[1].ScheduledAt.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("after b ended: starts = %+v, want a's pending fire", starts)
+	}
+}
+
+// A failed delete leaves the row. Starting the fire anyway would start it
+// a second time after a restart, so the drain leaves it queued.
+func TestDrainDoesNotStartAFireWhoseRowCannotBeDeleted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := task("a", "local", "parallel"), task("b", "local", "parallel")
+	h := newHarness(t, oneSlot(), st)
+	first := submit(t, h, a, store.TriggerSchedule, t0, false)
+	if !submit(t, h, b, store.TriggerSchedule, t0.Add(time.Minute), false).Queued {
+		t.Fatal("want b queued")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	h.runs.end(t, first.Run.ID)
+	if starts := h.runs.startCalls(); len(starts) != 1 {
+		t.Fatalf("starts = %+v, want only a: b stays queued when its row cannot be deleted", starts)
+	}
+	if !strings.Contains(h.logs.String(), "cannot remove queued fire") {
+		t.Errorf("log does not tell the delete failed:\n%s", h.logs.String())
+	}
+
+	reopened, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	fires, err := reopened.ListQueuedFires(context.Background())
+	if err != nil || len(fires) != 1 || fires[0].TaskID != "b" {
+		t.Fatalf("stored fires = %+v err=%v, want b still queued", fires, err)
+	}
+}

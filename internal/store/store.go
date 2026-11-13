@@ -70,6 +70,9 @@ CREATE TABLE IF NOT EXISTS task_state (
 CREATE TABLE IF NOT EXISTS global_pause (
 	target TEXT PRIMARY KEY -- "" means all targets.
 );
+-- queued_fires is created on every open, including a database whose
+-- user_version is already current. It is not part of a schemaVersion bump,
+-- so a later upgrade that only alters older versions still creates it.
 CREATE TABLE IF NOT EXISTS queued_fires (
 	id           INTEGER PRIMARY KEY AUTOINCREMENT, -- queue order
 	task_id      TEXT NOT NULL,
