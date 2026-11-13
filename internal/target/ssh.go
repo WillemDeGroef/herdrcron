@@ -64,6 +64,11 @@ type SSHConfig struct {
 // SSH is a Target on a remote machine, reached with the system ssh binary
 // so ~/.ssh/config, agents, keys and ProxyJump work as for the user. Every
 // command runs through the target's shell, each argument shell-quoted.
+//
+// The remote user's login shell need not be a POSIX shell: it only starts
+// /bin/sh (see neutralLine). A call that is cancelled or passes its
+// deadline also stops its command on the remote machine (see
+// watchedScript); that needs /bin/sh, and head for calls with stdin data.
 type SSH struct {
 	cfg SSHConfig
 }
@@ -82,7 +87,8 @@ func NewSSH(cfg SSHConfig) *SSH {
 func (s *SSH) Name() string { return s.cfg.Name }
 
 // Exec runs argv on the remote machine through the target shell, feeding
-// it stdin if non-nil, and returns its stdout. ssh exiting 255 gives an
+// it stdin if non-nil, and returns its stdout. stdin is read to its end
+// before ssh starts. ssh exiting 255 gives an
 // *UnreachableError; any other non-zero exit an *ExitError with the
 // remote argv and stderr.
 func (s *SSH) Exec(ctx context.Context, argv []string, stdin io.Reader) ([]byte, error) {
@@ -121,33 +127,114 @@ func (s *SSH) RemoveFile(ctx context.Context, p string) error {
 // InteractiveArgv is the local argv that runs remoteArgv on the target
 // with a TTY (ssh -t), through the target shell. It is for a user at a
 // terminal, so it leaves out BatchMode: ssh may ask for a passphrase. It
-// creates the ControlMaster directory if it can.
+// creates the ControlMaster directory if it can. The TTY already ends the
+// remote command with the connection (hangup), so there is no watcher.
 func (s *SSH) InteractiveArgv(remoteArgv []string) []string {
 	_ = s.ensureControlDir()
 	argv := append([]string{"ssh", "-t"}, s.options()...)
-	return append(argv, "--", s.cfg.Host, s.commandLine(shellquote.Join(remoteArgv...)))
+	return append(argv, "--", s.cfg.Host, neutralLine(s.commandLine(shellquote.Join(remoteArgv...))))
 }
 
 // run runs the shell command line cmd on the remote machine. name is the
 // argv reported in an *ExitError; keep prompt text and env values out of
 // its first three elements.
+//
+// ssh's stdin stays open until the call ends, after any data from stdin:
+// its closing is what tells the remote side that the call was cancelled
+// (see watchedScript).
 func (s *SSH) run(ctx context.Context, name []string, cmd string, stdin io.Reader) ([]byte, error) {
 	if err := s.ensureControlDir(); err != nil {
 		return nil, fmt.Errorf("ssh %s: %w", s.cfg.Name, err)
 	}
+	var data []byte
+	if stdin != nil {
+		var err error
+		if data, err = io.ReadAll(stdin); err != nil {
+			return nil, fmt.Errorf("ssh %s: read stdin: %w", s.cfg.Name, err)
+		}
+	}
 	argv := append([]string{"-o", "BatchMode=yes"}, s.options()...)
-	argv = append(argv, "--", s.cfg.Host, s.commandLine(cmd))
+	argv = append(argv, "--", s.cfg.Host, neutralLine(watchedScript(s.commandLine(cmd), len(data))))
 	c := exec.CommandContext(ctx, "ssh", argv...)
 	c.Env = environ()
 	c.WaitDelay = sshWaitDelay
-	if stdin != nil {
-		c.Stdin = stdin
-	}
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr
-	err := c.Run()
+	in, err := c.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("ssh %s: %w", s.cfg.Name, err)
+	}
+	c.Cancel = func() error {
+		_ = in.Close()
+		return c.Process.Kill()
+	}
+	if err := c.Start(); err != nil {
+		return sshCallResult(ctx, s.cfg.Name, name, nil, err, &stdout, &stderr)
+	}
+	if len(data) > 0 {
+		// Wait closes the pipe when ssh exits, which ends a blocked Write.
+		go func() { _, _ = in.Write(data) }()
+	}
+	err = c.Wait()
 	return sshCallResult(ctx, s.cfg.Name, name, c.ProcessState, err, &stdout, &stderr)
+}
+
+// watchedScript is the /bin/sh script that runs the remote command line
+// line and stops it when the call is cancelled. Killing the local ssh
+// signals nothing on the remote machine (there is no TTY: a TTY would
+// alter stdin and stdout); the remote side only sees ssh's stdin close. So
+// the local side keeps stdin open for the whole call, and the script:
+//
+//   - feeds the command the stdinLen bytes of stdin data (head -c), or an
+//     empty stdin when there are none;
+//   - leaves a watcher reading the rest of stdin, which is nothing until
+//     it closes: either ssh is gone, or the command finished and sshd
+//     closed the session. The watcher then signals the script (USR1),
+//     which has exited in the second case;
+//   - on USR1 sends TERM to its whole process group only when this script
+//     leads that group (it replaced the login shell sshd started with
+//     setsid). A parent that leads the group is not enough: that parent
+//     may be an interactive login shell, and the group then holds jobs
+//     this command did not start. Otherwise it sends TERM to the command
+//     and its descendants, found with ps, and to nothing else.
+//
+// The watcher holds neither stdout nor stderr, so it never delays the end
+// of the ssh call. It starts once the stdin data has gone to the command:
+// a command that does not read more than a pipe buffer of data is not
+// stopped by a cancel.
+func watchedScript(line string, stdinLen int) string {
+	feed := ""
+	if stdinLen > 0 {
+		feed = fmt.Sprintf("head -c %d <&3; ", stdinLen)
+	}
+	return `exec 3<&0
+k() { for p in $(printf '%s\n' "$s" | while read -r a b; do [ "$b" = "$1" ] && echo "$a"; done); do k "$p"; done; kill -TERM "$1" 2>/dev/null; }
+trap 'trap "" TERM; g=$(ps -o pgid= -p $$ 2>/dev/null); case " $(echo $g) " in " $$ ") kill -TERM 0;; *) s=$(ps -A -o pid= -o ppid= 2>/dev/null); k $!;; esac; exit 143' USR1
+{ ` + feed + `{ read -r _ <&3; kill -USR1 $$; } >/dev/null 2>&1 & } | ` + line + ` 3<&- &
+wait $!`
+}
+
+// neutralLine is the command line ssh sends for the /bin/sh script script.
+// sshd hands that line to the remote user's login shell, which may be
+// bash, zsh, fish or tcsh, and they do not agree on quoting. They do agree
+// on a single-quoted word without a quote, a newline, "!" (csh history) or
+// a backslash before a quote or backslash (fish escapes). So the line is
+// /bin/sh with two such words: a fixed decoder, and the script with every
+// other byte as a printf %b octal escape (\0ooo).
+func neutralLine(script string) string {
+	var b strings.Builder
+	b.WriteString(`/bin/sh -c 'eval "$(printf %b "$0")"' '`)
+	for i := 0; i < len(script); i++ {
+		c := script[i]
+		if c < ' ' || c > '~' || c == '\'' || c == '\\' || c == '!' {
+			fmt.Fprintf(&b, `\0%03o`, c)
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('\'')
+	return b.String()
 }
 
 // sshCallResult classifies one ssh invocation. A process that already
@@ -211,8 +298,8 @@ func SSHControlSocketPath(controlDir, host string) string {
 	return filepath.Join(controlDir, "cm-"+short)
 }
 
-// commandLine is the one string ssh hands to the remote login shell: the
-// target shell (the user's config, used as is) and cmd as one quoted word.
+// commandLine runs cmd through the target shell: the shell (the user's
+// config, used as is) and cmd as one quoted word, for /bin/sh to read.
 func (s *SSH) commandLine(cmd string) string {
 	return s.cfg.Shell + " " + shellquote.Quote(cmd)
 }

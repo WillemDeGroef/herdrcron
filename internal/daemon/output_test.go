@@ -298,7 +298,7 @@ func TestAttachCmdOnARemoteTargetUsesSSHWithATTY(t *testing.T) {
 		"-o", "ControlPersist=10m",
 		"-o", "ConnectTimeout=10",
 		"--", "vps-alias",
-		"bash -lc '/opt/herdr agent attach " + run.HerdrPane + "'",
+		`/bin/sh -c 'eval "$(printf %b "$0")"' 'bash -lc \0047/opt/herdr agent attach ` + run.HerdrPane + `\0047'`,
 	}
 	if !slices.Equal(got.Argv, want) || got.Mode != api.AttachPane {
 		t.Errorf("runs.attach_cmd = %+v,\nwant argv %q in pane mode", got, want)
