@@ -106,7 +106,10 @@ A target other than `local` is reached with `ssh` from the always-on host (conne
 - herdr's Claude integration: `herdr integration install claude`;
 - the agent CLI installed and logged in (for example `claude` after `claude login`);
 - the repos cloned at the tasks' `cwd`;
-- SSH key access from the always-on host without a password prompt (an alias in `~/.ssh/config` works as `host`).
+- SSH key access from the always-on host without a password prompt (an alias in `~/.ssh/config` works as `host`);
+- `/bin/sh` with `printf`, `head` and `ps` (any Linux, macOS or BSD has them).
+
+The remote user's login shell can be anything (bash, zsh, fish, tcsh): it only starts `/bin/sh`, which runs the command through the target's `shell`. When herdrcron gives up on a remote command (a timeout, a shutdown), the command is stopped on the remote machine too, with SIGTERM.
 
 herdrcron starts the remote `herdr server` itself when none runs. `herdrcron check <target>` (or `t` in the TUI) checks reachability, the herdr server, its version, and the agent command and cwd of every task on that target. When a target does not answer, fires are recorded as `host_unreachable` and polls back off up to 5 minutes; with `missed: run_once` a missed fire runs once when the target is back, within `catch_up_window`.
 
