@@ -87,8 +87,10 @@ func (h hold) endless() bool { return h.global != "" || h.indefinite }
 
 // from is the time after which the schedule expr fires again: the end of a
 // timed pause, else now. A cron fire at the very end of the pause runs, so
-// the result is just before it. An @every interval counts from the end of
-// the pause.
+// the result is just before it. An @every interval has no wall-clock slot.
+// Without the daemon's next fire time the preview counts one interval from
+// the end of the pause; everyPhaseAfter keeps the daemon's phase when that
+// time is known.
 func (h hold) from(expr string, now time.Time) time.Time {
 	switch {
 	case h.until.IsZero():
@@ -97,6 +99,50 @@ func (h hold) from(expr string, now time.Time) time.Time {
 		return h.until
 	}
 	return h.until.Add(-time.Nanosecond)
+}
+
+// everyPhaseAfter is the `after` to pass to nextFires so an @every schedule
+// continues the phase of nextFire (the daemon's next_fire_at) and the first
+// previewed fire is the first one the pause does not cover. A fire at the
+// pause end runs. It reports false when there is no timed pause, the
+// expression is not @every, or nextFire is missing or unusable: from's
+// estimate stands then.
+func everyPhaseAfter(expr, nextFire string, h hold) (time.Time, bool) {
+	if h.until.IsZero() || nextFire == "" || !strings.HasPrefix(strings.TrimSpace(expr), "@every") {
+		return time.Time{}, false
+	}
+	anchor, err := time.Parse(time.RFC3339Nano, nextFire)
+	if err != nil {
+		return time.Time{}, false
+	}
+	s, err := schedule.Parse(expr, time.UTC)
+	if err != nil {
+		return time.Time{}, false
+	}
+	nxt := s.Next(anchor)
+	delay := nxt.Sub(anchor)
+	if nxt.IsZero() || delay <= 0 {
+		return time.Time{}, false
+	}
+	if anchor.Before(h.until) {
+		anchor = anchor.Add((h.until.Sub(anchor) / delay) * delay)
+		if anchor.Before(h.until) {
+			anchor = anchor.Add(delay)
+		}
+	}
+	return anchor.Add(-delay), true
+}
+
+// pauseEnded reports whether pausedUntil is a timestamp that is no longer
+// in the future. Empty, "indefinite" and anything that does not parse have
+// not ended: a paused task with no time is waiting on a global pause the
+// status read has not shown yet.
+func pauseEnded(pausedUntil string, now time.Time) bool {
+	until, err := time.Parse(time.RFC3339Nano, pausedUntil)
+	if err != nil {
+		return false
+	}
+	return !until.After(now)
 }
 
 // text says what holds the schedule, in loc: a full line for an endless

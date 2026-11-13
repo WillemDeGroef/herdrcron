@@ -336,7 +336,11 @@ func (m Model) fireLines() []string {
 	if sum.State != api.StateOff && sum.State != api.StateInvalid {
 		h = m.holdOn(sum.Target, sum.PausedUntil)
 	}
-	fires, err := nextFires(def.Schedule, def.Timezone, m.status.Timezone, m.loc, h.from(def.Schedule, m.now()), 5)
+	after := h.from(def.Schedule, m.now())
+	if phase, ok := everyPhaseAfter(def.Schedule, sum.NextFireAt, h); ok {
+		after = phase
+	}
+	fires, err := nextFires(def.Schedule, def.Timezone, m.status.Timezone, m.loc, after, 5)
 	if err != nil {
 		return []string{m.st.critical.Render("  " + err.Error())}
 	}
@@ -346,9 +350,9 @@ func (m Model) fireLines() []string {
 		return []string{m.st.dim.Render("  " + h.text(m.loc))}
 	case !h.none():
 		out = append(out, m.st.dim.Render("  "+h.text(m.loc)))
-	case sum.State == api.StateOff, sum.State == api.StatePaused, sum.State == api.StateInvalid:
-		// Paused lands here only when the status read is behind the task
-		// (the pause is not visible yet, or just ran out).
+	case sum.State == api.StatePaused && !pauseEnded(sum.PausedUntil, m.now()):
+		return []string{m.st.dim.Render("  paused: no fires until resumed")}
+	case sum.State == api.StateOff, sum.State == api.StateInvalid:
 		out = append(out, m.st.dim.Render("  (task is "+sum.State+": the schedule would fire at)"))
 	}
 	if len(fires) == 0 {

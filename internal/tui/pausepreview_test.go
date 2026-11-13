@@ -153,6 +153,28 @@ func TestDetailExpiredPauseShowsFires(t *testing.T) {
 	}
 }
 
+// Same moment, with the summary still saying paused: the time has passed,
+// so the fires are shown. A paused task with no time is the other case
+// (a global pause the status read has not shown) and lists none.
+func TestDetailEndedPauseShowsFires(t *testing.T) {
+	view := finalView(t, openDetail(t, fixture(), pausedDetail(ts(-time.Minute))))
+	if !strings.Contains(view, "Thu Nov 5 10:30") || strings.Contains(view, "no fires until resumed") {
+		t.Errorf("an ended pause still hides the fires:\n%s", view)
+	}
+}
+
+func TestDetailPausedStateWithoutVisiblePauseHidesFires(t *testing.T) {
+	d := coordinatorDetail()
+	d.Summary.State = api.StatePaused
+	view := finalView(t, openDetail(t, fixture(), d))
+	if !strings.Contains(view, "paused: no fires until resumed") {
+		t.Errorf("detail does not say the task is paused:\n%s", view)
+	}
+	if strings.Contains(view, "Thu Nov 5 10:30") {
+		t.Errorf("detail previews a fire for a paused task with no end:\n%s", view)
+	}
+}
+
 func TestFormSchedulePreviewFollowsPauses(t *testing.T) {
 	open := func(t *testing.T, f *fakeBackend, until string) string {
 		t.Helper()
@@ -192,13 +214,48 @@ func TestFormSchedulePreviewFollowsPauses(t *testing.T) {
 	})
 }
 
-// An @every interval counts from the end of the pause, not from a fire time.
+// An @every interval with no daemon next-fire time counts from the end of
+// the pause: the TUI does not know the phase.
 func TestDetailPausedUntilCountsEveryFromThePauseEnd(t *testing.T) {
 	d := pausedDetail(pausedUntilNov10)
 	d.Summary.Schedule, d.Task.Schedule = "@every 2h", "@every 2h"
 	view := finalView(t, openDetail(t, fixture(), d))
 	if !strings.Contains(view, "then\n  Tue Nov 10 10:00 UTC\n  Tue Nov 10 12:00 UTC") {
 		t.Errorf("@every does not count from the pause end:\n%s", view)
+	}
+}
+
+// When the daemon has a next fire time, @every keeps that phase. A fire at
+// the pause end runs; the preview does not start a new phase there.
+func TestDetailEveryPauseKeepsTheDaemonPhase(t *testing.T) {
+	d := pausedDetail(pausedUntilNov10)
+	d.Summary.Schedule, d.Task.Schedule = "@every 2h", "@every 2h"
+	// 10:00, 12:00, … lands on Tue 08:00, the pause end.
+	d.Summary.NextFireAt = now.Format(time.RFC3339)
+	view := finalView(t, openDetail(t, fixture(), d))
+	if !strings.Contains(view, "then\n  Tue Nov 10 08:00 UTC\n  Tue Nov 10 10:00 UTC") {
+		t.Errorf("@every did not keep the daemon phase:\n%s", view)
+	}
+	if strings.Contains(view, "Tue Nov 10 06:00") {
+		t.Errorf("detail previews a fire inside the pause:\n%s", view)
+	}
+}
+
+func TestEveryPhaseAfterSkipsThePause(t *testing.T) {
+	until := time.Date(2026, 11, 10, 8, 0, 0, 0, time.UTC)
+	h := hold{until: until}
+	// 11:00, 13:00, … : the first fire the pause does not cover is 09:00.
+	after, ok := everyPhaseAfter("@every 2h", now.Add(time.Hour).Format(time.RFC3339), h)
+	if !ok {
+		t.Fatal("everyPhaseAfter rejected a usable next fire")
+	}
+	fires, err := nextFires("@every 2h", "", "", time.UTC, after, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []time.Time{until.Add(time.Hour), until.Add(3 * time.Hour)}
+	if len(fires) != len(want) || !fires[0].Equal(want[0]) || !fires[1].Equal(want[1]) {
+		t.Errorf("fires = %v, want %v", fires, want)
 	}
 }
 
@@ -223,8 +280,21 @@ func TestMainScreenExpiredPauseShowsNextFire(t *testing.T) {
 	}
 }
 
-// A task the daemon calls paused never shows a fire time, even when the
-// status read does not show the global pause yet.
+// The summary can still say paused in the moment paused_until passes. The
+// pause no longer holds, so NEXT is the next fire, not "paused".
+func TestMainScreenEndedPauseShowsNextFire(t *testing.T) {
+	f := fixture()
+	editTask(t, f, "e2e-timeout", func(s *api.TaskSummary) {
+		s.State, s.PausedUntil = api.StatePaused, ts(-time.Minute)
+	})
+	row := nextCell(t, finalView(t, start(t, newTestModel(f, plain()))), "e2e-timeout")
+	if !strings.HasSuffix(strings.TrimSpace(row), "Thu 10:20") {
+		t.Errorf("row = %q, want the next fire Thu 10:20", row)
+	}
+}
+
+// A task paused with no time of its own (a global pause the status read
+// has not shown yet) shows "paused", not a fire time.
 func TestMainScreenPausedStateWithoutVisiblePauseShowsPaused(t *testing.T) {
 	f := fixture()
 	editTask(t, f, "e2e-timeout", func(s *api.TaskSummary) { s.State = api.StatePaused })

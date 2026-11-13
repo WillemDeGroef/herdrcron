@@ -255,10 +255,15 @@ func (m Model) nextText(t api.TaskSummary) string {
 	}
 	h := m.holdOn(t.Target, t.PausedUntil)
 	switch {
-	case h.endless(), h.none() && t.State == api.StatePaused:
+	case h.endless():
 		return "paused"
 	case !h.none():
 		return "until " + m.when(t.PausedUntil)
+	case t.State == api.StatePaused && !pauseEnded(t.PausedUntil, m.now()):
+		// Paused with no time of its own: a global pause the status read
+		// has not shown yet. A timestamp that has passed does not land
+		// here; that pause has ended and the next fire stands.
+		return "paused"
 	case t.NextFireAt == "":
 		return "—"
 	}
