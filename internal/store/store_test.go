@@ -627,3 +627,67 @@ PRAGMA user_version = 1;`)
 		}
 	}
 }
+
+// A daemon that died after creating the version 1 table and before
+// writing user_version left version 0. Open must add herdr_terminal;
+// stamping version 2 without the column makes every later read fail.
+func TestOpenUpgradesSchemaLeftAtVersion0(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+CREATE TABLE runs (
+	id              TEXT PRIMARY KEY,
+	task_id         TEXT NOT NULL,
+	target          TEXT NOT NULL,
+	trigger         TEXT NOT NULL,
+	scheduled_at    TIMESTAMP,
+	started_at      TIMESTAMP NOT NULL,
+	ended_at        TIMESTAMP,
+	status          TEXT NOT NULL,
+	herdr_workspace TEXT,
+	herdr_tab       TEXT,
+	herdr_pane      TEXT,
+	exit_reason     TEXT,
+	output_tail     TEXT
+);
+INSERT INTO runs (id, task_id, target, trigger, started_at, status, herdr_pane)
+	VALUES ('old', 'backup', 'local', 'manual', '2026-01-02T03:04:05Z', 'running', 'w1:p1');
+PRAGMA user_version = 0;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	run, err := s.GetRun(context.Background(), "old")
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if run.HerdrPane != "w1:p1" || run.HerdrTerminal != "" {
+		t.Errorf("old run = pane %q terminal %q, want w1:p1 and no terminal", run.HerdrPane, run.HerdrTerminal)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 {
+		t.Errorf("user_version = %d, want 2", version)
+	}
+}

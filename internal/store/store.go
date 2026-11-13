@@ -131,11 +131,14 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(schema); err != nil {
 		return err
 	}
-	// Version 2 added runs.herdr_terminal; CREATE TABLE IF NOT EXISTS
-	// leaves a version 1 table as it was.
+	// Version 2 added runs.herdr_terminal. CREATE TABLE IF NOT EXISTS
+	// leaves an older table as it was: version 1, or version 0 when a
+	// daemon died after creating the table and before writing
+	// user_version. A fresh database is also version 0; its CREATE
+	// already added the column.
 	// The column is looked up, not assumed missing: a daemon that died
 	// between the ALTER and the version write must still open.
-	if version == 1 {
+	if version < 2 {
 		var n int
 		err := db.QueryRow("SELECT count(*) FROM pragma_table_info('runs') WHERE name = 'herdr_terminal'").Scan(&n)
 		if err != nil {

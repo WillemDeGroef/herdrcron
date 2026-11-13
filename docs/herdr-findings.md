@@ -115,7 +115,7 @@ Reason: the always-on host loses its herdr server on every reboot, and failing e
 - When the server starts again it restores the session from `session.json`: the same workspaces, tabs and labels, and the same pane ids (`w1:p1`), each a new shell in the old cwd. Only `terminal_id` differs (`term_66024df88e3dc1` before, `term_66024dff78c4b1` after). Verified on 0.9.1 with an isolated session (`hc-i34-exp`): `kill -9` of the server, then `herdr server` again.
 - So a pane id alone does not identify a run's pane. If the server restarts between two polls, the poll finds the pane id and would track the empty shell: the run stays `running` (no agent was ever detected in that shell), or ends on a wrong reading.
 
-**Decision: a run stores the pane's `terminal_id` at launch** (`runs.herdr_terminal`, from `root_pane` of `workspace create` / `tab create`). A poll, and recovery at daemon start, end the run `lost` when its pane id is listed with another `terminal_id`. Runs stored before this column existed have no terminal id and skip the check. The restored tab is left open, as for every `lost` run.
+**Decision: a run stores the pane's `terminal_id` at launch** (`runs.herdr_terminal`, from `root_pane` of `workspace create` / `tab create`). A poll, recovery at daemon start, and a stop or timeout that lands before the next poll, end the run `lost` when its pane id is listed with another `terminal_id`. They do not send keys to that shell or close its tab. Runs stored before this column existed have no terminal id and skip the check. The restored tab is left open, as for every `lost` run. A pane list that fails is not a replacement: a timeout still ends the run while the target does not answer.
 
 ## Attach
 
