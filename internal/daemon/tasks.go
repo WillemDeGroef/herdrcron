@@ -216,9 +216,10 @@ func (d *daemon) tasksUpdate(ctx context.Context, params json.RawMessage) (any, 
 		return nil, api.InvalidParams(fmt.Errorf("unknown task %q", p.ID))
 	}
 	old := d.tasks[i]
-	// Before the task file is rewritten: an invalid entry's prompt path is
-	// read from that file.
-	oldPrompt := d.promptPathOf(old)
+	// Before the task file is rewritten: the prompt path to drop is what the
+	// task file on disk names now, not the in-memory entry (promptPathOf
+	// falls back when the load had a syntax error).
+	oldPrompt, oldPromptKnown := d.promptPathInFile(old)
 	// Compare with the files, not memory: a hand edit the watcher has not
 	// reloaded yet must still refuse the write.
 	if cur := d.fileVersion(old); p.Version == "" || p.Version != cur {
@@ -245,8 +246,10 @@ func (d *daemon) tasksUpdate(ctx context.Context, params json.RawMessage) (any, 
 	e := config.LoadTask(d.configDir, p.ID, d.cfg)
 	d.tasks[i] = e
 	// The task points at its new prompt file now; the old one goes unless
-	// it is still in use.
-	d.removeUnusedPromptLocked(p.ID, oldPrompt)
+	// it is still in use. When the old path is unknown, nothing is removed.
+	if oldPromptKnown {
+		d.removeUnusedPromptLocked(p.ID, oldPrompt)
+	}
 	d.log.Info("task updated", logging.KeyTaskID, e.ID)
 	return d.storedLocked(ctx, e)
 }
@@ -311,14 +314,16 @@ func (d *daemon) tasksDelete(ctx context.Context, params json.RawMessage) (any, 
 		return res, nil // a reload removed it meanwhile
 	}
 	e := d.tasks[i]
-	promptPath := d.promptPathOf(e)
+	promptPath, promptKnown := d.promptPathInFile(e)
 	if err := os.Remove(e.File); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		d.rescheduleLocked(ctx)
 		return nil, fmt.Errorf("remove task file: %w", err)
 	}
 	d.tasks = slices.Delete(d.tasks, i, i+1)
 	delete(d.versions, p.ID)
-	d.removeUnusedPromptLocked(p.ID, promptPath)
+	if promptKnown {
+		d.removeUnusedPromptLocked(p.ID, promptPath)
+	}
 	if err := d.store.DeleteTaskState(ctx, p.ID); err != nil {
 		d.log.Warn("cannot remove task state", logging.KeyTaskID, p.ID, "err", err)
 	}
