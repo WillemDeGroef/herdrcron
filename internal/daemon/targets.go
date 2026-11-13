@@ -42,15 +42,22 @@ func rfc3339(t time.Time) string {
 // targetChanged is the runner's OnTargetChange: it publishes
 // "target.changed", notifies target_unreachable (if notify.on lists it),
 // and when the target answers again applies the missed policy to the
-// fires it missed.
+// fires it missed. A result whose generation is no longer the target's
+// is dropped: the call was on a machine reload has since replaced.
 func (d *daemon) targetChanged(st runner.TargetState) {
+	if !d.runner.HasGen(st.Name, st.Gen) {
+		return
+	}
 	d.bus.publish(api.EventTargetChanged, api.TargetChangedEvent{Target: d.targetStatus(st.Name)})
 	switch st.Reachability {
 	case runner.ReachUnreachable:
+		if !d.runner.HasGen(st.Name, st.Gen) {
+			return
+		}
 		d.notifier.Notify(config.EventTargetUnreachable,
 			fmt.Sprintf("herdrcron: target %s unreachable: %s", st.Name, st.LastError), nil)
 	case runner.ReachReachable:
-		d.catchUp(st.Name)
+		d.catchUp(st.Name, st.Gen)
 	}
 }
 
@@ -70,21 +77,39 @@ func (d *daemon) stopCatchUps() {
 }
 
 // catchUp starts, in the background, the catch_up runs of the tasks on
-// target whose last fire found it unreachable. Before the daemon serves
-// (during Recover) and once it is stopping it does nothing: Run calls it
-// again once the scheduler has its tasks.
-func (d *daemon) catchUp(target string) {
+// target whose last fire found it unreachable. gen is the target
+// generation that answered; a reload that replaced it makes the runs not
+// start. Before the daemon serves (during Recover) and once it is stopping
+// it does nothing: Run calls it again once the scheduler has its tasks.
+func (d *daemon) catchUp(target string, gen uint64) {
 	d.checkMu.Lock()
 	defer d.checkMu.Unlock()
 	ctx := d.ctx
 	if ctx == nil || ctx.Err() != nil {
 		return
 	}
+	ctx = contextWithCatchGen(ctx, gen)
 	d.bg.Add(1) // under checkMu, so it cannot follow Run's setCtx(nil)
 	go func() {
 		defer d.bg.Done()
+		if !d.runner.HasGen(target, gen) {
+			return
+		}
 		d.sched.CatchUpTarget(ctx, target)
 	}()
+}
+
+// catchGenKey is the context value of the target generation a catch-up is
+// for. latestDef refuses the run when the target has since been replaced.
+type catchGenKey struct{}
+
+func contextWithCatchGen(ctx context.Context, gen uint64) context.Context {
+	return context.WithValue(ctx, catchGenKey{}, gen)
+}
+
+func catchGenFrom(ctx context.Context) (uint64, bool) {
+	gen, ok := ctx.Value(catchGenKey{}).(uint64)
+	return gen, ok
 }
 
 // checkTimeout bounds one "targets.check".
@@ -101,9 +126,15 @@ func (d *daemon) targetsCheck(ctx context.Context, params json.RawMessage) (any,
 	if p.Name == "" {
 		return nil, api.InvalidParams(errors.New("name is required"))
 	}
-	if _, ok := d.cfg.Targets[p.Name]; !ok {
+	if _, ok := d.config().Targets[p.Name]; !ok {
 		return nil, api.InvalidParams(fmt.Errorf("unknown target %q", p.Name))
 	}
+	// Taken before the check, which can take a minute. installConfig
+	// advances it when the machine changes, and the report is kept only
+	// when it is still the one we started with.
+	d.checkMu.Lock()
+	epoch := d.checkEpoch[p.Name]
+	d.checkMu.Unlock()
 	d.mu.Lock()
 	var tasks []config.Task
 	for _, e := range d.tasks {
@@ -130,6 +161,11 @@ func (d *daemon) targetsCheck(ctx context.Context, params json.RawMessage) (any,
 		})
 	}
 	d.checkMu.Lock()
+	if d.checkEpoch[p.Name] != epoch {
+		d.checkMu.Unlock()
+		d.log.Info("dropping target check: the target changed while it ran", "target", p.Name)
+		return res, nil
+	}
 	d.lastChecks[p.Name] = res
 	d.checkMu.Unlock()
 	d.bus.publish(api.EventTargetChanged, api.TargetChangedEvent{Target: d.targetStatus(p.Name)})

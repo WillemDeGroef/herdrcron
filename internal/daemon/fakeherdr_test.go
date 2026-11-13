@@ -58,6 +58,8 @@ type fakeHerdr struct {
 	readErr      error         // pane read --format ansi fails with it
 	putGate      chan struct{} // PutFile waits until it is closed
 	execGate     chan struct{} // Exec waits until it is closed
+	execHeld     chan struct{} // closed when an Exec reaches execGate
+	execHeldOnce *sync.Once
 }
 
 func newFakeHerdr() *fakeHerdr {
@@ -150,12 +152,21 @@ func (f *fakeHerdr) holdExec() (release func()) {
 	defer f.mu.Unlock()
 	gate := make(chan struct{})
 	f.execGate = gate
+	f.execHeld = make(chan struct{})
+	f.execHeldOnce = &sync.Once{}
 	return sync.OnceFunc(func() {
 		f.mu.Lock()
 		f.execGate = nil
 		f.mu.Unlock()
 		close(gate)
 	})
+}
+
+// execHeldCh is closed when an Exec reaches the holdExec gate.
+func (f *fakeHerdr) execHeldCh() <-chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.execHeld
 }
 
 // holdPutFile makes PutFile (the prompt write, after the tab is opened)
@@ -239,7 +250,11 @@ func ok[T any](v T) ([]byte, error) {
 func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte, error) {
 	f.mu.Lock()
 	gate := f.execGate
+	held, once := f.execHeld, f.execHeldOnce
 	f.mu.Unlock()
+	if once != nil {
+		once.Do(func() { close(held) })
+	}
 	if gate != nil {
 		<-gate
 	}

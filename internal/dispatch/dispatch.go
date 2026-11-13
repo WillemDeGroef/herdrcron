@@ -73,10 +73,10 @@ type fire struct {
 type Dispatcher struct {
 	runs  Runner
 	store *store.Store
-	cfg   config.Config
 	log   *slog.Logger
 
-	mu sync.Mutex
+	mu  sync.Mutex
+	cfg config.Config // max_parallel per target
 	// gen counts finished Start calls and RunEnded calls. A snapshot of
 	// ActiveRuns taken while gen stayed the same agrees with the launching
 	// counts, and no run ended without seeing the state built on it.
@@ -87,6 +87,7 @@ type Dispatcher struct {
 	queue         map[string][]fire // target -> fires waiting for capacity, FIFO
 	draining      map[string]bool   // target -> a drain loop is running
 	drainAgain    map[string]bool   // target -> the running drain must look again
+	gone          map[string]bool   // target was removed; its waiting fires must not start
 }
 
 // New returns a Dispatcher.
@@ -103,6 +104,77 @@ func New(o Options) *Dispatcher {
 		queue:         map[string][]fire{},
 		draining:      map[string]bool{},
 		drainAgain:    map[string]bool{},
+		gone:          map[string]bool{},
+	}
+}
+
+// SetConfig replaces the config max_parallel is read from. It starts
+// nothing: call Drain afterwards, so fires that waited for capacity use
+// the room a higher max_parallel gives. A target DropTargets marked gone
+// is runnable again when cfg lists it.
+func (d *Dispatcher) SetConfig(cfg config.Config) {
+	d.mu.Lock()
+	d.cfg = cfg
+	for name := range d.gone {
+		if _, ok := cfg.Targets[name]; ok {
+			delete(d.gone, name)
+		}
+	}
+	d.mu.Unlock()
+}
+
+// DropTargets discards waiting fires for targets reload removed: the
+// max_parallel queue and a task's pending overlap fire. A fire already
+// handed to Start is dropped there too. A later SetConfig that lists the
+// target again lets new fires run.
+func (d *Dispatcher) DropTargets(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	gone := make(map[string]bool, len(names))
+	for _, name := range names {
+		gone[name] = true
+	}
+	for _, name := range names {
+		d.gone[name] = true
+		if n := len(d.queue[name]); n > 0 {
+			d.log.Info("dropping queued fires: target is gone", logging.KeyTarget, name, "fires", n)
+		}
+		for _, f := range d.queue[name] {
+			if err := d.unstoreLocked(f); err != nil {
+				d.log.Error("cannot remove queued fire from the store",
+					logging.KeyTaskID, f.task.ID, logging.KeyTarget, name, "err", err)
+			}
+		}
+		delete(d.queue, name)
+	}
+	for id, f := range d.pending {
+		if gone[f.task.Target] {
+			d.log.Info("dropping pending fire: target is gone",
+				logging.KeyTaskID, id, logging.KeyTarget, f.task.Target)
+			if err := d.unstoreLocked(f); err != nil {
+				d.log.Error("cannot remove queued fire from the store",
+					logging.KeyTaskID, id, logging.KeyTarget, f.task.Target, "err", err)
+			}
+			delete(d.pending, id)
+		}
+	}
+}
+
+// Drain starts the waiting fires of every target that has capacity. Like
+// Submit, it may start runs: do not call it with a lock the runner's
+// callbacks take.
+func (d *Dispatcher) Drain(ctx context.Context) {
+	d.mu.Lock()
+	targets := make([]string, 0, len(d.queue))
+	for name := range d.queue {
+		targets = append(targets, name)
+	}
+	d.mu.Unlock()
+	for _, name := range targets {
+		d.drain(ctx, name)
 	}
 }
 
@@ -231,7 +303,20 @@ func (d *Dispatcher) releasePendingLocked(taskID string) {
 // drops, so the pending fire is released here, after the decrement, and
 // only when the task is idle.
 func (d *Dispatcher) launch(ctx context.Context, f fire) (store.Run, error) {
-	run, err := d.runs.Start(ctx, f.task, f.trigger, f.scheduledAt)
+	d.mu.Lock()
+	gone := d.gone[f.task.Target]
+	d.mu.Unlock()
+	var run store.Run
+	var err error
+	if gone {
+		// Reload removed the target after this fire was counted. Starting
+		// it would record a failed run on a machine that is no longer
+		// configured.
+		d.log.Info("dropping fire: target is gone",
+			logging.KeyTaskID, f.task.ID, logging.KeyTarget, f.task.Target, "trigger", f.trigger)
+	} else {
+		run, err = d.runs.Start(ctx, f.task, f.trigger, f.scheduledAt)
+	}
 	d.mu.Lock()
 	d.gen++
 	d.launching[f.task.Target]--
@@ -263,6 +348,17 @@ func (d *Dispatcher) drain(ctx context.Context, target string) {
 		d.drainAgain[target] = false
 		d.mu.Unlock()
 		active := d.lockWithActive()
+		if d.gone[target] {
+			delete(d.queue, target)
+			if d.drainAgain[target] {
+				d.mu.Unlock()
+				continue
+			}
+			delete(d.draining, target)
+			delete(d.drainAgain, target)
+			d.mu.Unlock()
+			return
+		}
 		if len(d.queue[target]) == 0 || !d.hasCapacityLocked(target, active) {
 			if d.drainAgain[target] {
 				d.mu.Unlock()

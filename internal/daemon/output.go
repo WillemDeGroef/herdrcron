@@ -82,11 +82,12 @@ func (d *daemon) runsAttachCmd(ctx context.Context, params json.RawMessage) (any
 	case err != nil:
 		return nil, fmt.Errorf("attach to run %s: %w", p.RunID, err)
 	}
-	res := api.AttachCmdResult{Mode: d.cfg.AttachMode}
+	cfg := d.config()
+	res := api.AttachCmdResult{Mode: cfg.AttachMode}
 	if res.Mode == api.AttachPane && !hasAgent {
 		res.Mode, res.Note = api.AttachFull, "the agent has exited; opening the full herdr UI"
 	}
-	res.Argv, err = d.attachArgv(run.Target, run.HerdrPane, res.Mode)
+	res.Argv, err = d.attachArgv(cfg, run.Target, run.HerdrPane, res.Mode)
 	if err != nil {
 		return nil, api.InvalidParams(fmt.Errorf("run %s: %w", p.RunID, err))
 	}
@@ -101,8 +102,8 @@ func (d *daemon) runsAttachCmd(ctx context.Context, params json.RawMessage) (any
 //     herdr --remote <host> with the local herdr.
 //
 // herdr is the target's herdr_path when set.
-func (d *daemon) attachArgv(name, pane, mode string) ([]string, error) {
-	t, ok := d.cfg.Targets[name]
+func (d *daemon) attachArgv(cfg config.Config, name, pane, mode string) ([]string, error) {
+	t, ok := cfg.Targets[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown target %q", name)
 	}
@@ -114,7 +115,7 @@ func (d *daemon) attachArgv(name, pane, mode string) ([]string, error) {
 		return []string{bin, "agent", "attach", pane}, nil
 	}
 	if mode == api.AttachFull {
-		return []string{herdrBin(d.cfg.Targets[config.LocalTarget]), "--remote", t.Host}, nil
+		return []string{herdrBin(cfg.Targets[config.LocalTarget]), "--remote", t.Host}, nil
 	}
 	ssh := sshTarget(name, t, d.sshControlDir)
 	return ssh.InteractiveArgv([]string{herdrBin(t), "agent", "attach", pane}), nil

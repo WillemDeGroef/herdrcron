@@ -70,11 +70,13 @@ type Scheduler struct {
 	store  *store.Store
 	runs   Starter
 	adopt  Adopter
-	cfg    config.Config
 	log    *slog.Logger
 	reload chan struct{}
 
 	onPauseExpired func(ctx context.Context, taskID string) error
+
+	cfgMu sync.RWMutex
+	cfg   config.Config // read with config()
 
 	mu        sync.Mutex
 	tasks     map[string]*entry // enabled tasks, and any task waiting to clear a timed pause
@@ -110,6 +112,24 @@ func New(o Options) *Scheduler {
 		pausedOn:       map[string]struct{}{},
 		onPauseExpired: o.OnPauseExpired,
 	}
+}
+
+// SetConfig replaces the config: the timezone fallback, history_days and
+// catch_up_window. Tasks already scheduled keep their entries; call
+// SetTasks afterwards so a new timezone reaches them.
+func (s *Scheduler) SetConfig(cfg config.Config) {
+	if cfg.CatchUpWindow.Duration <= 0 {
+		cfg.CatchUpWindow.Duration = config.DefaultCatchUpWindow
+	}
+	s.cfgMu.Lock()
+	s.cfg = cfg
+	s.cfgMu.Unlock()
+}
+
+func (s *Scheduler) config() config.Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg
 }
 
 // SetTasks replaces the task list. Valid, enabled tasks get a next_fire_at
@@ -242,7 +262,7 @@ func (s *Scheduler) wake() {
 // newEntry schedules t. It keeps the next fire time of old, the task's
 // current entry, if the schedule and time zone did not change.
 func (s *Scheduler) newEntry(t config.Task, now time.Time, old *entry) (*entry, error) {
-	loc, err := s.cfg.Location(t)
+	loc, err := s.config().Location(t)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +361,7 @@ func (s *Scheduler) Tick(ctx context.Context) time.Time {
 // without walking them; if none is left, it returns e.next.
 func (s *Scheduler) latestFire(e *entry, now time.Time) time.Time {
 	latest := e.next
-	if floor := now.Add(-s.cfg.CatchUpWindow.Duration); latest.Before(floor) {
+	if floor := now.Add(-s.config().CatchUpWindow.Duration); latest.Before(floor) {
 		// Next is strictly after its argument; a fire at floor is still
 		// inside the window.
 		f := e.sched.Next(floor.Add(-time.Nanosecond))
@@ -397,9 +417,9 @@ func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now t
 		s.maybeStartScheduled(ctx, wctx, log, t, scheduledAt)
 	case t.Missed == "skip":
 		log.Info("missed fire skipped", "scheduled_at", scheduledAt, "late_by", now.Sub(scheduledAt).String())
-	case now.Sub(scheduledAt) > s.cfg.CatchUpWindow.Duration:
+	case now.Sub(scheduledAt) > s.config().CatchUpWindow.Duration:
 		log.Info("missed fire older than catch_up_window ignored", "scheduled_at", scheduledAt,
-			"late_by", now.Sub(scheduledAt).String(), "catch_up_window", s.cfg.CatchUpWindow.String())
+			"late_by", now.Sub(scheduledAt).String(), "catch_up_window", s.config().CatchUpWindow.String())
 	default:
 		adopted, err := s.adoptLost(ctx, log, t)
 		if err != nil {
@@ -469,9 +489,9 @@ func (s *Scheduler) CatchUpTarget(ctx context.Context, target string) {
 		if !t.Enabled || t.Missed != "run_once" {
 			continue
 		}
-		if now.Sub(last.ScheduledAt) > s.cfg.CatchUpWindow.Duration {
+		if now.Sub(last.ScheduledAt) > s.config().CatchUpWindow.Duration {
 			log.Info("unreachable fire older than catch_up_window ignored", "scheduled_at", last.ScheduledAt,
-				"catch_up_window", s.cfg.CatchUpWindow.String())
+				"catch_up_window", s.config().CatchUpWindow.String())
 			continue
 		}
 		if t.PausedAt(now) {
@@ -637,7 +657,7 @@ func (s *Scheduler) prune(ctx context.Context, now time.Time) {
 	s.nextPrune = now.Add(pruneEvery)
 	s.mu.Unlock()
 
-	cutoff := now.AddDate(0, 0, -s.cfg.HistoryDays)
+	cutoff := now.AddDate(0, 0, -s.config().HistoryDays)
 	n, err := s.store.DeleteRunsBefore(ctx, cutoff)
 	if err != nil {
 		s.log.Error("cannot prune run history", "err", err)

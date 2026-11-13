@@ -780,3 +780,22 @@ func (s *skipRuns) Start(context.Context, config.Task, string, time.Time) (store
 	s.n++
 	return store.Run{}, nil
 }
+
+// SetConfig changes catch_up_window on a running scheduler: a missed fire
+// 5h old is ignored with a 4h window and caught up once it is 6h.
+func TestSetConfigAppliesCatchUpWindow(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 12, 10, 0, 0, time.UTC))
+	daily := task("daily", "0 7 * * *")
+	daily.Timezone = "UTC"
+	e.config.CatchUpWindow = config.Duration{Duration: 4 * time.Hour}
+	e.restart()
+	e.setTasks(valid(daily))
+
+	e.clock.Set(time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC))
+	e.config.CatchUpWindow = config.Duration{Duration: 6 * time.Hour}
+	e.sched.SetConfig(e.config)
+	e.sched.Tick(e.ctx)
+	if runs := e.runs("daily"); len(runs) != 1 || runs[0].Trigger != store.TriggerCatchUp {
+		t.Errorf("runs = %+v, want one catch_up with the 6h window", runs)
+	}
+}

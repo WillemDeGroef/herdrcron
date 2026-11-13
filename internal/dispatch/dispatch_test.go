@@ -696,6 +696,57 @@ func TestQueueFireDuringAFailedLaunchStartsOnceTheTaskIsIdle(t *testing.T) {
 	}
 }
 
+// Fires waiting on a target reload removed are discarded. Ending the runs
+// that were already active must not start them, on the max_parallel queue
+// or as a pending overlap fire.
+func TestDropTargetsDiscardsWaitingFires(t *testing.T) {
+	cfg := config.Config{Targets: map[string]config.Target{
+		"vps":   {MaxParallel: 1},
+		"local": {MaxParallel: 4},
+	}}
+	h := newHarness(t, cfg, nil)
+	first := submit(t, h, task("a", "vps", "skip"), store.TriggerSchedule, t0, false)
+	if first.Run.ID == "" {
+		t.Fatal("first vps fire did not start")
+	}
+	if out := submit(t, h, task("b", "vps", "parallel"), store.TriggerSchedule, t0, false); !out.Queued {
+		t.Fatalf("vps fire above max_parallel = %+v, want Queued", out)
+	}
+	overlap := submit(t, h, task("c", "local", "queue"), store.TriggerSchedule, t0, false)
+	if overlap.Run.ID == "" {
+		t.Fatal("local fire did not start")
+	}
+	if out := submit(t, h, task("c", "local", "queue"), store.TriggerSchedule, t0.Add(time.Hour), false); !out.Queued {
+		t.Fatalf("overlap fire = %+v, want Queued", out)
+	}
+
+	h.d.DropTargets([]string{"vps", "local"})
+	h.runs.end(t, first.Run.ID)
+	h.runs.end(t, overlap.Run.ID)
+
+	if n := len(h.runs.startCalls()); n != 2 {
+		t.Fatalf("Start called %d times, want 2: the waiting fires were dropped", n)
+	}
+}
+
+// Queued fires dropped by DropTargets are removed from queued_fires too.
+func TestDropTargetsDeletesStoredQueuedFires(t *testing.T) {
+	st := openStore(t)
+	h := newHarness(t, oneSlot(), st)
+	first := submit(t, h, task("a", "local", "parallel"), store.TriggerSchedule, t0, false)
+	if first.Run.ID == "" {
+		t.Fatal("first fire did not start")
+	}
+	if !submit(t, h, task("b", "local", "parallel"), store.TriggerSchedule, t0, false).Queued {
+		t.Fatal("want b queued")
+	}
+	h.d.DropTargets([]string{"local"})
+	fires, err := st.ListQueuedFires(context.Background())
+	if err != nil || len(fires) != 0 {
+		t.Fatalf("stored fires = %+v err=%v, want none after DropTargets", fires, err)
+	}
+}
+
 // restart returns a new dispatcher and runner on the same store, as a
 // daemon restart gives. recovered are the runs the new runner still tracks.
 func restart(t *testing.T, cfg config.Config, st *store.Store, recovered ...store.Run) harness {

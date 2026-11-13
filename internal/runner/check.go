@@ -76,11 +76,11 @@ cd "$d" 2>/dev/null || exit 4`
 // does not start the herdr server and neither reads nor fills the
 // preflight cache. The error is only for an unknown target.
 func (r *Runner) CheckTarget(ctx context.Context, name string, tasks []config.Task) (Check, error) {
-	ts := r.targets[name]
+	ts := r.target(name)
 	if ts == nil {
 		return Check{}, fmt.Errorf("unknown target %q", name)
 	}
-	want := r.cfg.HerdrVersion
+	want := r.config().HerdrVersion
 	if want == "" {
 		want = config.DefaultHerdrVersion
 	}
@@ -90,7 +90,7 @@ func (r *Runner) CheckTarget(ctx context.Context, name string, tasks []config.Ta
 	_, err := ts.herdr.PaneList(ctx)
 	// A check discovers an outage, but it must not stretch a backoff the
 	// poll worker is already counting down.
-	r.observe(name, err, false)
+	r.observe(ts, name, err, false)
 	if errors.Is(err, target.ErrUnreachable) {
 		c.Items = append(c.Items, CheckItem{Kind: CheckKindReachable, Name: "reachable", Result: CheckFail, Detail: err.Error()})
 		for _, item := range []struct {

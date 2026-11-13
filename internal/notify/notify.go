@@ -26,6 +26,7 @@ const maxOutput = 500
 // Notifier runs the notify command. Its methods are safe for concurrent
 // use. A nil *Notifier notifies nothing.
 type Notifier struct {
+	mu      sync.Mutex // guards command and on
 	command []string
 	on      []string
 	log     *slog.Logger
@@ -44,19 +45,33 @@ func New(cfg config.Notify, log *slog.Logger) *Notifier {
 	return &Notifier{command: slices.Clone(cfg.Command), on: slices.Clone(cfg.On), log: log, Timeout: DefaultTimeout}
 }
 
+// SetConfig replaces the notify command and events. Commands already
+// started are not affected.
+func (n *Notifier) SetConfig(cfg config.Notify) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.command, n.on = slices.Clone(cfg.Command), slices.Clone(cfg.On)
+}
+
 // Notify runs the command with message appended as its last argument, if
 // event is listed in notify.on. It does not wait for the command: a slow
 // or failing command never holds up a run. A failure is logged on log
 // (the run's logger, so the line carries the run's ids), or on the
 // notifier's logger when log is nil.
 func (n *Notifier) Notify(event, message string, log *slog.Logger) {
-	if n == nil || len(n.command) == 0 || !slices.Contains(n.on, event) {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	command, listed := n.command, slices.Contains(n.on, event)
+	n.mu.Unlock()
+	if len(command) == 0 || !listed {
 		return
 	}
 	if log == nil {
 		log = n.log
 	}
-	argv := append(slices.Clone(n.command), message)
+	argv := append(slices.Clone(command), message)
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()

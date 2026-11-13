@@ -71,7 +71,7 @@ func (r *Runner) AdoptLost(ctx context.Context, t config.Task) (run store.Run, a
 		return store.Run{}, false, err
 	}
 	panes, err := ts.herdr.PaneList(ctx)
-	r.observe(t.Target, err, true)
+	r.observe(ts, t.Target, err, true)
 	if err != nil && !herdr.IsCode(err, herdr.CodeServerNotRunning) {
 		return store.Run{}, false, fmt.Errorf("adopt lost run of %s: %w", t.ID, err)
 	}
@@ -83,7 +83,7 @@ func (r *Runner) AdoptLost(ctx context.Context, t config.Task) (run store.Run, a
 		launched, err := r.launchArrived(ctx, ts, c, panes, log)
 		if err != nil {
 			if errors.Is(err, target.ErrUnreachable) {
-				r.observe(t.Target, err, true)
+				r.observe(ts, t.Target, err, true)
 			}
 			return run, adopted, fmt.Errorf("adopt lost run %s: %w", c.ID, err)
 		}

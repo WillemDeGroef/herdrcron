@@ -563,8 +563,8 @@ func TestReloadRereadsTaskFiles(t *testing.T) {
 		t.Errorf("reload = %+v", res)
 	}
 	write(t, p.ConfigFile(), "timezone: UTC\ntargets:\n  vps:\n    host: vps2\n")
-	if res := call[api.ReloadResult](t, c, api.MethodReload, nil); !res.RestartRequired {
-		t.Errorf("reload after a config change = %+v, want restart_required", res)
+	if res := call[api.ReloadResult](t, c, api.MethodReload, nil); res.RestartRequired {
+		t.Errorf("reload after a config change = %+v, want it applied without a restart", res)
 	}
 }
 
