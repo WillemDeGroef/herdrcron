@@ -31,15 +31,37 @@ type env struct {
 	runner    *runner.Runner
 	configDir string
 	dbPath    string
-	log       *bytes.Buffer
+	log       *lockedBuffer
+	logger    *slog.Logger // one handler: runners before and after a restart share log
 
 	mu      sync.Mutex
 	ended   []store.Run          // runs passed to OnEnd
 	notes   []notification       // Notify calls
 	targets []runner.TargetState // OnTargetChange calls
+
+	onAmend func(store.Run) // the next newRunner's OnAmend
 }
 
 type notification struct{ event, message string }
+
+// lockedBuffer is the test log sink. Cleanup runs in its own goroutine, so
+// a test that reads the log while that goroutine writes needs the lock.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) Bytes() []byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return bytes.Clone(l.b.Bytes())
+}
 
 // recordNotify is like daemon.runChanged notifications: blocked and end
 // statuses that notify.on would fire for.
@@ -90,8 +112,9 @@ func newEnv(t *testing.T) *env {
 	e := &env{
 		t: t, ctx: context.Background(), store: st, herdr: newFakeHerdr(), configDir: dir, dbPath: dbPath,
 		clock: clock.NewFake(time.Date(2026, 11, 6, 7, 0, 0, 0, time.UTC)),
-		log:   &bytes.Buffer{},
+		log:   &lockedBuffer{},
 	}
+	e.logger = slog.New(slog.NewJSONHandler(e.log, nil))
 	e.runner = e.newRunner()
 	return e
 }
@@ -105,10 +128,11 @@ func (e *env) newRunner() *runner.Runner {
 		Targets:   map[string]target.Target{"local": e.herdr},
 		Config:    config.Config{Timezone: "Europe/Brussels", Targets: map[string]config.Target{"local": {}}},
 		ConfigDir: e.configDir,
-		Log:       slog.New(slog.NewJSONHandler(e.log, nil)),
+		Log:       e.logger,
 		// The fake server answers at once or never.
 		ServerStartWait: 50 * time.Millisecond,
 		OnChange:        e.recordNotify,
+		OnAmend:         e.onAmend,
 		OnTargetChange: func(st runner.TargetState) {
 			e.mu.Lock()
 			defer e.mu.Unlock()
