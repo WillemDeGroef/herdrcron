@@ -229,3 +229,88 @@ func TestCatchUpTargetWaitsWhenAdoptionCannotBeChecked(t *testing.T) {
 		t.Errorf("Start calls once the target answers = %+v, want one catch_up", calls)
 	}
 }
+
+// The 13:00 fire is on time, and it is the first thing to run after the
+// outage. It asks about the lost launch before Start, so the dispatcher
+// can apply overlap to the adopted run.
+func TestOnTimeFireChecksForALostLaunchBeforeStarting(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 11, 59, 0, 0, time.UTC))
+	e.setTasks(valid(onVPS(task("hourly", "@hourly"))))
+	e.starter.setUnreachable(true)
+	e.runUntil(time.Date(2026, 11, 6, 12, 1, 0, 0, time.UTC))
+	if n := len(e.runs("hourly")); n != 1 {
+		t.Fatalf("%d runs, want the one host_unreachable fire", n)
+	}
+
+	e.starter.setUnreachable(false)
+	askedFirst := false
+	e.starter.setAdopt(func(config.Task) (store.Run, bool, error) {
+		askedFirst = len(e.starter.Calls()) == 1
+		return store.Run{}, false, nil
+	})
+	// 13:00 UTC is 14:00 in Brussels, twenty seconds late: still on time.
+	e.clock.Set(time.Date(2026, 11, 6, 13, 0, 20, 0, time.UTC))
+	e.sched.Tick(e.ctx)
+	if !askedFirst {
+		t.Fatal("AdoptLost did not run before Start")
+	}
+	calls := e.starter.Calls()
+	if len(calls) != 2 || calls[1].trigger != store.TriggerSchedule {
+		t.Fatalf("Start calls = %+v, want the unreachable fire and one on-time schedule", calls)
+	}
+}
+
+// The check failing must not swallow the on-time fire. Start still runs,
+// and a down target records host_unreachable instead of launching.
+func TestOnTimeFireStillStartsWhenTheLostLaunchCannotBeChecked(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 11, 59, 0, 0, time.UTC))
+	e.setTasks(valid(onVPS(task("hourly", "@hourly"))))
+	e.starter.setUnreachable(true)
+	e.runUntil(time.Date(2026, 11, 6, 12, 1, 0, 0, time.UTC))
+	e.starter.setUnreachable(false)
+	e.starter.setAdopt(func(config.Task) (store.Run, bool, error) {
+		return store.Run{}, false, fmt.Errorf("pane list: target vps unreachable")
+	})
+	e.clock.Set(time.Date(2026, 11, 6, 13, 0, 20, 0, time.UTC))
+	e.sched.Tick(e.ctx)
+	calls := e.starter.Calls()
+	if len(calls) != 2 || calls[1].trigger != store.TriggerSchedule {
+		t.Fatalf("Start calls = %+v, want the on-time fire to start anyway", calls)
+	}
+}
+
+// The daemon was down across 12:00. The late tick is a catch-up, and the
+// adopted run takes its place: Start is not called.
+func TestMissedFireAdoptsALostLaunchInsteadOfCatchingUp(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 11, 59, 0, 0, time.UTC))
+	tasks := valid(onVPS(task("hourly", "@hourly")))
+	e.setTasks(tasks)
+	e.clock.Set(time.Date(2026, 11, 6, 12, 30, 0, 0, time.UTC))
+	e.restart()
+	e.setTasks(tasks)
+	e.starter.setAdopt(func(config.Task) (store.Run, bool, error) {
+		return store.Run{ID: "lost", TaskID: "hourly", Status: store.StatusRunning}, true, nil
+	})
+	e.sched.Tick(e.ctx)
+	if n := len(e.starter.Calls()); n != 0 {
+		t.Fatalf("%d Start calls, want none: the adopted run takes the catch-up", n)
+	}
+}
+
+// A late tick that cannot tell whether the lost launch is running starts
+// no catch-up yet.
+func TestMissedFireWaitsWhenALostLaunchCannotBeChecked(t *testing.T) {
+	e := newEnv(t, time.Date(2026, 11, 6, 11, 59, 0, 0, time.UTC))
+	tasks := valid(onVPS(task("hourly", "@hourly")))
+	e.setTasks(tasks)
+	e.clock.Set(time.Date(2026, 11, 6, 12, 30, 0, 0, time.UTC))
+	e.restart()
+	e.setTasks(tasks)
+	e.starter.setAdopt(func(config.Task) (store.Run, bool, error) {
+		return store.Run{}, false, fmt.Errorf("pane list: target vps unreachable")
+	})
+	e.sched.Tick(e.ctx)
+	if n := len(e.starter.Calls()); n != 0 {
+		t.Fatalf("%d Start calls while the lost launch cannot be checked, want none", n)
+	}
+}

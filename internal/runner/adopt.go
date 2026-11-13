@@ -26,6 +26,14 @@ const reasonLaunchUnconfirmed = "launch not confirmed"
 // and showed that the launch did not leave a running pane behind.
 const reasonNoAgent = "launch reply lost, no agent found"
 
+// lostLaunchReason reports whether reason is the marker AdoptLost looks
+// up. The stored text is the marker, then ": ", then the wrapped error
+// (see launch). A different reason that merely shares the prefix is not
+// one, so a later wording cannot be adopted by accident.
+func lostLaunchReason(reason string) bool {
+	return reason == reasonLaunchUnconfirmed || strings.HasPrefix(reason, reasonLaunchUnconfirmed+": ")
+}
+
 // AdoptLost looks for runs of task t that ended host_unreachable because
 // the reply to their launch was lost, and whose launch did reach the
 // target: the run's pane still exists in its hc- tab, and the pane shows
@@ -54,7 +62,7 @@ func (r *Runner) AdoptLost(ctx context.Context, t config.Task) (run store.Run, a
 	}
 	runs = slices.DeleteFunc(runs, func(run store.Run) bool {
 		return run.Status != store.StatusHostUnreachable || run.Target != t.Target || run.HerdrPane == "" ||
-			!strings.HasPrefix(run.ExitReason, reasonLaunchUnconfirmed)
+			!lostLaunchReason(run.ExitReason)
 	})
 	if len(runs) == 0 {
 		return store.Run{}, false, nil
@@ -142,6 +150,14 @@ func (r *Runner) launchArrived(ctx context.Context, ts *targetState, run store.R
 	if err != nil {
 		return false, err
 	}
+	// The launch line in the scrollback means this is still the terminal we
+	// typed into. A herdr server restart restores the pane id as a new
+	// shell with another terminal id and an empty scrollback (issue #34):
+	// that pane fails this check, so it is not adopted and catch-up still
+	// runs. Adopting it would take the fire, and the next poll would then
+	// mark the run lost because the terminal id changed. If a restored
+	// pane ever keeps the old scrollback, reject it here when the run's
+	// stored terminal id differs, and do not close its tab.
 	if strings.Contains(out, run.ID+".md") {
 		return true, nil
 	}

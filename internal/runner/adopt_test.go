@@ -2,10 +2,15 @@ package runner_test
 
 import (
 	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/WillemDeGroef/herdrcron/internal/config"
+	"github.com/WillemDeGroef/herdrcron/internal/dispatch"
+	"github.com/WillemDeGroef/herdrcron/internal/scheduler"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
 	"github.com/WillemDeGroef/herdrcron/internal/target"
 )
@@ -235,5 +240,43 @@ func TestAdoptLostAdoptsBehindALaterRun(t *testing.T) {
 	got, adopted, err := e.adopt()
 	if err != nil || !adopted || got.ID != lost.ID {
 		t.Fatalf("AdoptLost = %+v, %v, %v, want run %s adopted", got, adopted, err, lost.ID)
+	}
+}
+
+// The first thing after the outage is an on-time fire, not catch-up.
+// Overlap skip must not start a second agent beside the one whose launch
+// reply was lost.
+func TestOnTimeFireAdoptsLostLaunchAndDoesNotStartAnother(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.script(working)
+	lost := e.startLost()
+	e.reconnect()
+
+	cfg := config.Config{
+		Timezone: "Europe/Brussels", HistoryDays: config.DefaultHistoryDays,
+		Targets: map[string]config.Target{"local": {}},
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	disp := dispatch.New(dispatch.Options{Runs: e.runner, Store: e.store, Config: cfg, Log: log})
+	sched := scheduler.New(scheduler.Options{
+		Clock: e.clock, Store: e.store, Runs: disp, Adopt: e.runner, Config: cfg, Log: log,
+	})
+	tk := deps()
+	if err := sched.SetTasks(e.ctx, []config.TaskEntry{{ID: tk.ID, Task: tk}}); err != nil {
+		t.Fatal(err)
+	}
+	// reconnect left the clock at 08:05 Brussels. The next */2 fire is
+	// 08:06, and ten seconds later it is still on time.
+	e.clock.Advance(70 * time.Second)
+	launches := e.herdr.count("herdr", "pane", "run")
+	sched.Tick(e.ctx)
+	if n := e.herdr.count("herdr", "pane", "run"); n != launches {
+		t.Fatalf("%d launches after the on-time fire, want %d", n, launches)
+	}
+	if got := e.get(lost.ID); got.Status != store.StatusRunning || !got.EndedAt.IsZero() || !got.StartedAt.Equal(lost.StartedAt) {
+		t.Errorf("lost run = %+v, want %s still running from %v", got, lost.ID, lost.StartedAt)
+	}
+	if !e.runner.Active(lost.ID) {
+		t.Error("the adopted run is not tracked")
 	}
 }
