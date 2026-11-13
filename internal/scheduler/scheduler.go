@@ -40,11 +40,20 @@ type Starter interface {
 	Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error)
 }
 
+// Adopter finds runs of a task whose launch reached the target while its
+// reply was lost; runner.Runner implements it. AdoptLost tracks such a
+// run as running again and returns the newest one. An error means it could
+// not ask the target, so the scheduler starts no catch_up run for now.
+type Adopter interface {
+	AdoptLost(ctx context.Context, t config.Task) (run store.Run, adopted bool, err error)
+}
+
 // Options configures New.
 type Options struct {
 	Clock  clock.Clock
 	Store  *store.Store
 	Runs   Starter
+	Adopt  Adopter       // asked before a catch-up after a target outage; may be nil
 	Config config.Config // as loaded: timezone fallback, history_days, catch_up_window
 	Log    *slog.Logger
 	// OnPauseExpired is called from Tick when a task's timed paused_until
@@ -60,6 +69,7 @@ type Scheduler struct {
 	clock  clock.Clock
 	store  *store.Store
 	runs   Starter
+	adopt  Adopter
 	cfg    config.Config
 	log    *slog.Logger
 	reload chan struct{}
@@ -94,7 +104,7 @@ func New(o Options) *Scheduler {
 		o.Config.CatchUpWindow.Duration = config.DefaultCatchUpWindow
 	}
 	return &Scheduler{
-		clock: o.Clock, store: o.Store, runs: o.Runs, cfg: o.Config, log: o.Log,
+		clock: o.Clock, store: o.Store, runs: o.Runs, adopt: o.Adopt, cfg: o.Config, log: o.Log,
 		reload:         make(chan struct{}, 1),
 		tasks:          map[string]*entry{},
 		pausedOn:       map[string]struct{}{},
@@ -398,12 +408,16 @@ func (s *Scheduler) fire(ctx context.Context, e *entry, scheduledAt, next, now t
 // run for that fire, however many fires were missed: each one after the
 // first left a newer host_unreachable run, so that run names the latest.
 // The usual suppression applies (disabled, paused, global pause).
+//
+// First, for every task on the target, the Adopter looks for a run whose
+// launch did reach the target. An adopted run is that one run: it serves
+// the task's missed fire, and no catch_up run starts.
 func (s *Scheduler) CatchUpTarget(ctx context.Context, target string) {
 	now := s.clock.Now()
 	s.mu.Lock()
 	var tasks []config.Task
 	for _, e := range s.tasks {
-		if e.task.Target == target && e.task.Enabled && e.task.Missed == "run_once" {
+		if e.task.Target == target {
 			tasks = append(tasks, e.task)
 		}
 	}
@@ -412,12 +426,24 @@ func (s *Scheduler) CatchUpTarget(ctx context.Context, target string) {
 	wctx := context.WithoutCancel(ctx)
 	for _, t := range tasks {
 		log := s.log.With(logging.KeyTaskID, t.ID, logging.KeyTarget, t.Target)
+		adopted, adoptErr := s.adoptLost(ctx, log, t)
 		last, ok, err := s.store.LastNonManualRun(ctx, t.ID)
 		if err != nil {
 			log.Error("cannot read last run for catch-up", "err", err)
 			continue
 		}
 		if !ok || last.Status != store.StatusHostUnreachable {
+			continue
+		}
+		if adopted.ID != "" {
+			// Like a catch_up run, the adopted run takes the fire, so the
+			// next CatchUpTarget (or a restart) does not start one for it.
+			if err := s.store.RecordFire(wctx, t.ID, adopted.ID, last.ScheduledAt); err != nil {
+				log.Error("cannot write task state", "err", err)
+			}
+			continue
+		}
+		if !t.Enabled || t.Missed != "run_once" {
 			continue
 		}
 		if now.Sub(last.ScheduledAt) > s.cfg.CatchUpWindow.Duration {
@@ -429,9 +455,47 @@ func (s *Scheduler) CatchUpTarget(ctx context.Context, target string) {
 			log.Info("unreachable fire not caught up: task paused", "scheduled_at", last.ScheduledAt)
 			continue
 		}
+		if adoptErr != nil {
+			log.Warn("unreachable fire not caught up: cannot check for a run whose launch reply was lost",
+				"scheduled_at", last.ScheduledAt, "err", adoptErr)
+			continue
+		}
+		if s.fireServed(ctx, log, t.ID, last) {
+			continue
+		}
 		log.Info("catching up fire the target missed", "scheduled_at", last.ScheduledAt)
 		s.maybeStartCatchUp(ctx, wctx, log, t, last.ScheduledAt)
 	}
+}
+
+// adoptLost asks the Adopter for a run of t whose launch reply was lost.
+// The run is zero when nothing was adopted.
+func (s *Scheduler) adoptLost(ctx context.Context, log *slog.Logger, t config.Task) (store.Run, error) {
+	if s.adopt == nil {
+		return store.Run{}, nil
+	}
+	run, adopted, err := s.adopt.AdoptLost(ctx, t)
+	if !adopted {
+		return store.Run{}, err
+	}
+	log.Info("run with a lost launch reply adopted: no catch-up", logging.KeyRunID, run.ID, "started_at", run.StartedAt)
+	return run, err
+}
+
+// fireServed reports whether the host_unreachable fire of last was taken
+// by an adopted run before: task_state then names another run, one that is
+// not host_unreachable, for a fire at or after it.
+func (s *Scheduler) fireServed(ctx context.Context, log *slog.Logger, taskID string, last store.Run) bool {
+	st, ok, err := s.store.GetTaskState(ctx, taskID)
+	if err != nil {
+		log.Error("cannot read task state for catch-up", "err", err)
+		return false
+	}
+	if !ok || st.LastRunID == "" || st.LastRunID == last.ID || st.LastFireAt.Before(last.ScheduledAt) {
+		return false
+	}
+	run, err := s.store.GetRun(ctx, st.LastRunID)
+	return err == nil && run.Status != store.StatusHostUnreachable
 }
 
 // maybeStartScheduled starts an on-time scheduled run after re-checking

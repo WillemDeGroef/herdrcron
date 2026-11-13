@@ -178,6 +178,7 @@ A `herdr` package on top of `Target` wraps the herdr CLI commands and parses JSO
 - Daemon start: for every run with `ended_at` empty, look up its pane on the target. Pane exists → continue tracking from step 7. Pane gone → `lost`. Target unreachable → keep the run open and retry.
 - Target unreachable during a run: the agent keeps running on the target. Mark the target `unreachable`, back off (30 s, doubling, max 5 min), and resume tracking when it answers. Do not count unreachable time towards a `failed` status; the timeout still counts.
 - Target unreachable at fire time: record a run with status `host_unreachable`; apply `missed` when the target answers.
+- Launch reply lost (the target dropped after it accepted `pane run`): the run is recorded `host_unreachable` with the reason `launch not confirmed`. When the target answers, and before any catch-up, look for the run's pane in its `hc-` tab. If it is there, the agent did start: adopt the run as `running` and track it from step 7; it takes the place of the catch-up run. If the target cannot be asked, start nothing yet.
 - Concurrency: one worker per target; at most `max_parallel` active runs per target (default 4). Fires above the limit wait in a per-target queue.
 - Every herdr call has a 30 s context timeout.
 

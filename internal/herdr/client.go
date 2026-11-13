@@ -80,6 +80,12 @@ func (c *Client) TabCreate(ctx context.Context, workspaceID, cwd, label string, 
 	return call[TabCreatedResult](ctx, c, "tab_created", "tab", "create", args...)
 }
 
+// TabList runs `herdr tab list --workspace <id>`.
+func (c *Client) TabList(ctx context.Context, workspaceID string) ([]TabInfo, error) {
+	r, err := call[TabListResult](ctx, c, "tab_list", "tab", "list", "--workspace", workspaceID)
+	return r.Tabs, err
+}
+
 // TabRename runs `herdr tab rename`.
 func (c *Client) TabRename(ctx context.Context, tabID, label string) error {
 	_, err := call[TabInfoResult](ctx, c, "tab_info", "tab", "rename", tabID, label)
