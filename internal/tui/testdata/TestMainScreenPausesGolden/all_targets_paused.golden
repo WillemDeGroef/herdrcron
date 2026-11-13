@@ -1,0 +1,16 @@
+ herdrcron · daemon up 3d · targets: local ●  vps ●  buildbox ○ unreachable
+ ⏸ ALL TARGETS PAUSED — no task fires until resumed (P)
+  TARGET    TASK                 SCHEDULE      STATE      LAST       NEXT
+› buildbox  release-notes        Fri 16:00     ! blocked  …          paused
+  vps       factory-coordinator  */30 * * * *  ◐ running  …          paused
+  local     e2e-timeout          @hourly       ⏸ paused   ✗ 40m ago  paused
+  vps       nightly-e2e          02:00 daily   ⏸ paused   ✗ 1d ago   paused
+  local     peppol-sh-deps       Mon 07:00     ⏸ paused   ✓ 3d ago   paused
+  vps       peppolnews-ingest    @every 2h     ○ off      ✓ 5d ago   —
+
+
+
+
+
+
+ space on/off  p pause  r run now  n new  e edit  d delete  enter details  a attach  / filter  ? help  q quit

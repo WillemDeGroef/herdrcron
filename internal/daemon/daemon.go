@@ -155,11 +155,12 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		Clock: clk, Store: st, Targets: targets, Config: cfg, ConfigDir: p.ConfigDir, Log: log,
 		OnEnd:          func(ctx context.Context, run store.Run) { d.disp.RunEnded(ctx, run) },
 		OnChange:       d.runChanged,
+		OnAmend:        d.runAmended,
 		OnTargetChange: d.targetChanged,
 	})
 	d.disp = dispatch.New(dispatch.Options{Runs: latestDef{d}, Store: st, Config: cfg, Log: log})
 	d.sched = scheduler.New(scheduler.Options{
-		Clock: clk, Store: st, Runs: d.disp, Config: cfg, Log: log,
+		Clock: clk, Store: st, Runs: d.disp, Adopt: d.runner, Config: cfg, Log: log,
 		OnPauseExpired: d.pauseExpired,
 	})
 	if err := d.loadGlobalPause(ctx); err != nil {

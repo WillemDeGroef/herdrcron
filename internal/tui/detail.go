@@ -327,16 +327,32 @@ func (m Model) detailBody() ([]string, int) {
 	return lines, first + 1 + cur
 }
 
-// fireLines preview the next five fire times of the task's schedule.
+// fireLines preview the next five fire times of the task's schedule. A
+// pause without an end shows that instead; a timed pause shows the fires
+// after it.
 func (m Model) fireLines() []string {
 	def, sum := m.detail.d.Task, m.detail.d.Summary
-	fires, err := nextFires(def.Schedule, def.Timezone, m.status.Timezone, m.loc, m.now(), 5)
+	h := hold{}
+	if sum.State != api.StateOff && sum.State != api.StateInvalid {
+		h = m.holdOn(sum.Target, sum.PausedUntil)
+	}
+	after := h.from(def.Schedule, m.now())
+	if phase, ok := everyPhaseAfter(def.Schedule, sum.NextFireAt, h); ok {
+		after = phase
+	}
+	fires, err := nextFires(def.Schedule, def.Timezone, m.status.Timezone, m.loc, after, 5)
 	if err != nil {
 		return []string{m.st.critical.Render("  " + err.Error())}
 	}
 	var out []string
-	switch sum.State {
-	case api.StateOff, api.StatePaused, api.StateInvalid:
+	switch {
+	case h.endless():
+		return []string{m.st.dim.Render("  " + h.text(m.loc))}
+	case !h.none():
+		out = append(out, m.st.dim.Render("  "+h.text(m.loc)))
+	case sum.State == api.StatePaused && !pauseEnded(sum.PausedUntil, m.now()):
+		return []string{m.st.dim.Render("  paused: no fires until resumed")}
+	case sum.State == api.StateOff, sum.State == api.StateInvalid:
 		out = append(out, m.st.dim.Render("  (task is "+sum.State+": the schedule would fire at)"))
 	}
 	if len(fires) == 0 {
