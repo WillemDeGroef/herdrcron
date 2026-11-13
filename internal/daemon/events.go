@@ -86,11 +86,9 @@ func (d *daemon) subscribe(ctx context.Context, _ json.RawMessage) (any, <-chan 
 	return api.SubscribeResult{Subscribed: true}, d.bus.subscribe(ctx), nil
 }
 
-// runChanged is the runner's OnChange: it is the one place a stored run
-// change becomes a "run.changed" event and optional notify.command calls
-// (blocked, failed, timeout, lost). It also queues the task's display
-// state to be republished; that needs the runner's lock, which OnChange
-// may not take.
+// runChanged is the runner's OnChange: optional notify.command calls
+// (blocked, failed, timeout, lost) and a run.changed publish (via
+// runAmended). OnChange may not take the runner's lock.
 func (d *daemon) runChanged(run store.Run) {
 	runLog := logging.ForRun(d.log, run.ID, run.TaskID, run.Target)
 	switch run.Status {

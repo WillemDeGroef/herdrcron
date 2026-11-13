@@ -167,11 +167,11 @@ A `herdr` package on top of `Target` wraps the herdr CLI commands and parses JSO
    - `working` → `running`.
    - `blocked` → `blocked`; on the first change, notify (see Configuration). With `on_blocked: stop`, stop the run.
    - `done` or `idle` for 2 polls in a row (debounce) → `done`.
-   - Pane gone → `lost`.
+   - Pane gone → `lost`. (For herdr 0.9.1, `docs/herdr-findings.md` also ends a run `lost` when a restarted herdr server restored its pane id as a new shell.)
    - Unknown or no status (no herdr agent integration) → stay `running`; the timeout still applies. (For herdr 0.9.1, `docs/herdr-findings.md` ends a run whose `agent` is absent when a later `pane process-info` sample shows the shell back in the foreground.)
 8. Timeout: when `started_at + timeout` passes, stop the run (step 10) with status `timeout`.
 9. Finish: read the last 200 lines (`herdr pane read <pane> --source recent --lines 200`) into `output_tail`. Set `ended_at`. With `on_done: close_tab`, close the tab; else keep it for the user to read. Delete the remote prompt file. (For herdr 0.9.1, `docs/herdr-findings.md` uses `--source recent-unwrapped` so soft wraps are joined. `--source recent --lines N` does work and keeps the wraps.)
-10. Stop (timeout, user stop, or `on_blocked: stop`): send Ctrl-C to the pane twice, 2 s apart; wait 10 s; then close the tab. Status `stopped` or `timeout`. (For herdr 0.9.1, `docs/herdr-findings.md` replaces this with `esc`, then `ctrl+c ctrl+c` in one call: two calls 2 s apart do not exit Claude Code.)
+10. Stop (timeout, user stop, or `on_blocked: stop`): send Ctrl-C to the pane twice, 2 s apart; wait 10 s; then close the tab. Status `stopped` or `timeout`. (For herdr 0.9.1, `docs/herdr-findings.md` replaces this with `esc`, then `ctrl+c ctrl+c` in one call: two calls 2 s apart do not exit Claude Code. If that pane id was restored as a new shell, the run ends `lost` and no keys are sent.)
 
 ### Recovery and failures
 
@@ -179,7 +179,7 @@ A `herdr` package on top of `Target` wraps the herdr CLI commands and parses JSO
 - Target unreachable during a run: the agent keeps running on the target. Mark the target `unreachable`, back off (30 s, doubling, max 5 min), and resume tracking when it answers. Do not count unreachable time towards a `failed` status; the timeout still counts.
 - Target unreachable during a stop (step 10): end the run at once with its status (`stopped` or `timeout`) and add `; target unreachable, tab may still be open` to `exit_reason`. Remember the run (table `pending_cleanups`, kept across a daemon restart) and run step 10 on the target when it answers again; `exit_reason` then ends in `; tab closed after the target came back` (or `tab was gone` / `tab could not be closed`). This does not notify a second time.
 - Target unreachable at fire time: record a run with status `host_unreachable`; apply `missed` when the target answers.
-- Concurrency: one worker per target; at most `max_parallel` active runs per target (default 4). Fires above the limit wait in a per-target queue.
+- Concurrency: one worker per target; at most `max_parallel` active runs per target (default 4). Fires above the limit wait in a per-target queue. Waiting fires (this queue and the one pending fire of `overlap: queue`) are stored in table `queued_fires` and wait again after a daemon restart; a fire whose task is gone or invalid by then, or a schedule or catch-up fire older than `catch_up_window`, is dropped with a log line.
 - Every herdr call has a 30 s context timeout.
 
 ## Daemon API
