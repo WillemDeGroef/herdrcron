@@ -134,7 +134,10 @@ type Runner struct {
 	// cleanups holds the ended runs whose stop is finished when their
 	// target answers again, by run id.
 	cleanups map[string]*pendingCleanup
-	closed   bool // Run has returned; no new stops
+	// lostCreates holds the tab creates that got no answer, by run id:
+	// their tab is looked for when the target answers again.
+	lostCreates map[string]*lostCreate
+	closed      bool // Run has returned; no new stops
 }
 
 // targetState is a target with its herdr client and preflight cache.
@@ -149,7 +152,9 @@ type targetState struct {
 	checks      map[string]checkedAt // agent command and cwd, by key
 
 	// openMu serialises workspace lookup and creation, so two runs that
-	// start at once for the same repo share one hc- workspace.
+	// start at once for the same repo share one hc- workspace. It is also
+	// held while the tab of a lost create is looked for: no tab of another
+	// run can appear in between.
 	openMu sync.Mutex
 
 	// gen identifies this targetState. It changes when Reconfigure
@@ -204,6 +209,7 @@ func New(o Options) *Runner {
 		active:         map[string]*activeRun{},
 		starting:       map[string]*activeRun{},
 		cleanups:       map[string]*pendingCleanup{},
+		lostCreates:    map[string]*lostCreate{},
 	}
 	r.stopCtx, r.cancelStop = context.WithCancel(context.Background())
 	if r.waitStart <= 0 {
@@ -260,8 +266,11 @@ func (r *Runner) Reconfigure(cfg config.Config, newTarget func(name string, tc c
 	// active runs and its replacement: Start registers the run before it
 	// looks its target up.
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.reconfigureLocked(cfg, newTarget)
+	deferred = r.reconfigureLocked(cfg, newTarget)
+	stale := r.staleLostCreatesLocked()
+	r.mu.Unlock()
+	r.dropLostCreates(stale)
+	return deferred
 }
 
 // ReconfigureAfter is Reconfigure, but prepare runs once the deferred set
@@ -273,9 +282,7 @@ func (r *Runner) Reconfigure(cfg config.Config, newTarget func(name string, tc c
 // make prepare repeat without end. Passing a nil prepare is Reconfigure.
 func (r *Runner) ReconfigureAfter(cfg config.Config, newTarget func(name string, tc config.Target) target.Target, prepare func(deferred []string) error) (deferred []string, err error) {
 	if prepare == nil {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		return r.reconfigureLocked(cfg, newTarget), nil
+		return r.Reconfigure(cfg, newTarget), nil
 	}
 	for {
 		r.mu.Lock()
@@ -292,7 +299,9 @@ func (r *Runner) ReconfigureAfter(cfg config.Config, newTarget func(name string,
 			continue
 		}
 		deferred = r.reconfigureLocked(cfg, newTarget)
+		stale := r.staleLostCreatesLocked()
 		r.mu.Unlock()
+		r.dropLostCreates(stale)
 		return deferred, nil
 	}
 }
@@ -547,18 +556,33 @@ func (r *Runner) cleanupFailedLaunch(ctx context.Context, ts *targetState, a *ac
 // hc-<repo-basename> or creates it, and opens the run's tab there. A new
 // workspace comes with a first tab, which the run uses. The workspace is
 // looked up on every run: closing its last tab closes it.
+//
+// A create that gets no answer may still have made the tab. It is recorded
+// (see createLost), and every launch first closes the tabs of the creates
+// recorded before it.
 func (r *Runner) openTab(ctx context.Context, ts *targetState, a *activeRun, cwd, label string, env []string) error {
 	wsLabel := "hc-" + path.Base(cwd)
 	ts.openMu.Lock()
 	defer ts.openMu.Unlock()
+	if err := r.closeOrphanTabs(ctx, ts, a.run.Target); err != nil {
+		return fmt.Errorf("close the tab of an earlier launch: %w", err)
+	}
 	workspaces, err := ts.herdr.WorkspaceList(ctx)
 	if err != nil {
 		return fmt.Errorf("list workspaces: %w", err)
 	}
 	i := slices.IndexFunc(workspaces, func(w herdr.WorkspaceInfo) bool { return w.Label == wsLabel })
 	if i >= 0 {
-		res, err := ts.herdr.TabCreate(ctx, workspaces[i].WorkspaceID, cwd, label, env)
+		// The tabs that are there now: if the reply to the create is lost,
+		// the new tab is the one with the label that is not among them.
+		wsID := workspaces[i].WorkspaceID
+		tabs, err := ts.herdr.TabList(ctx, wsID)
 		if err != nil {
+			return fmt.Errorf("list tabs: %w", err)
+		}
+		res, err := ts.herdr.TabCreate(ctx, wsID, cwd, label, env)
+		if err != nil {
+			r.createLost(ctx, ts, a, err, store.LostCreate{Workspace: wsID, Label: label, Known: tabIDs(tabs)})
 			return fmt.Errorf("create tab: %w", err)
 		}
 		r.setHerdrIDs(a, res.Tab.WorkspaceID, res.Tab.TabID, res.RootPane)
@@ -566,6 +590,7 @@ func (r *Runner) openTab(ctx context.Context, ts *targetState, a *activeRun, cwd
 	}
 	res, err := ts.herdr.WorkspaceCreate(ctx, cwd, wsLabel, env)
 	if err != nil {
+		r.createLost(ctx, ts, a, err, store.LostCreate{Label: wsLabel, Known: workspaceIDs(workspaces)})
 		return fmt.Errorf("create workspace: %w", err)
 	}
 	r.setHerdrIDs(a, res.Workspace.WorkspaceID, res.Tab.TabID, res.RootPane)
@@ -760,7 +785,11 @@ func (r *Runner) Recover(ctx context.Context, tasks []config.Task) error {
 	if err != nil {
 		return fmt.Errorf("recover: %w", err)
 	}
-	for _, name := range pending {
+	lost, err := r.recoverLostCreates(ctx)
+	if err != nil {
+		return fmt.Errorf("recover: %w", err)
+	}
+	for _, name := range slices.Concat(pending, lost) {
 		if !slices.Contains(targets, name) {
 			targets = append(targets, name)
 		}
@@ -854,10 +883,12 @@ func (r *Runner) livePane(runID string) (store.Run, *targetState, error) {
 // `herdr pane list` covers them all. Panes without an agent get one
 // `pane process-info` each, to see whether the command has ended. Runs
 // being stopped are skipped: the stop decides their end. A target that
-// answers gets the stops finished that could not reach it before.
+// answers gets the stops finished that could not reach it before, and the
+// tabs of lost creates closed.
 func (r *Runner) PollTarget(ctx context.Context, name string) {
 	r.pollTarget(ctx, name)
 	r.resumeCleanups(name)
+	r.resumeLostCreates(ctx, name)
 }
 
 func (r *Runner) pollTarget(ctx context.Context, name string) {

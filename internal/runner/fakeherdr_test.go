@@ -95,8 +95,12 @@ type fakeHerdr struct {
 	// dropBeforeRun: the target drops before pane run reaches it and stays
 	// unreachable; nothing is typed into the pane.
 	dropBeforeRun bool
-	failPut       bool   // PutFile fails
-	version       string // `herdr --version` prints "herdr <version>"; "" = 0.9.1
+	// loseCreateReply names a create command ("tab create" or "workspace
+	// create"): herdr runs it, then the target drops before the reply
+	// arrives and stays unreachable.
+	loseCreateReply string
+	failPut         bool   // PutFile fails
+	version         string // `herdr --version` prints "herdr <version>"; "" = 0.9.1
 	// hostEnv, when set, makes the shell-script calls (preflight and
 	// target check) run for real in a local sh with this environment
 	// (a temp HOME and PATH), instead of the canned answers above.
@@ -175,6 +179,21 @@ func (f *fakeHerdr) tabOpen(id string) bool {
 	return ok
 }
 
+// openTabs returns the ids of the open tabs, sorted.
+func (f *fakeHerdr) openTabs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Sorted(maps.Keys(f.tabs))
+}
+
+// addTab opens a tab as a user would, outside herdrcron.
+func (f *fakeHerdr) addTab(ws, label string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tab, _ := f.newTab(ws, label)
+	return tab
+}
+
 func herdrErr(code string) error {
 	b, _ := json.Marshal(herdr.ErrorResponse{Error: herdr.ErrorBody{Code: code, Message: code}, ID: "cli"})
 	return &target.ExitError{Code: 1, Stderr: b}
@@ -236,6 +255,10 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		ws := fmt.Sprintf("w%d", f.nextID)
 		f.workspaces[label] = ws
 		tab, pane := f.newTab(ws, "1")
+		if f.loseCreateReply == cmd {
+			f.loseCreateReply, f.unreachable = "", true
+			return nil, &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connection reset\n")}
+		}
 		return ok(herdr.WorkspaceCreatedResult{
 			Type: "workspace_created", Workspace: herdr.WorkspaceInfo{WorkspaceID: ws, Label: label},
 			Tab: herdr.TabInfo{TabID: tab, WorkspaceID: ws, Label: "1"}, RootPane: pane,
@@ -247,6 +270,10 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		}
 		label := flag(argv, "--label")
 		tab, pane := f.newTab(ws, label)
+		if f.loseCreateReply == cmd {
+			f.loseCreateReply, f.unreachable = "", true
+			return nil, &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connection reset\n")}
+		}
 		return ok(herdr.TabCreatedResult{
 			Type: "tab_created", Tab: herdr.TabInfo{TabID: tab, WorkspaceID: ws, Label: label}, RootPane: pane,
 		})
