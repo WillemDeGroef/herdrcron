@@ -39,7 +39,7 @@ func (d *daemon) reloadLocked(ctx context.Context) (any, error) {
 	var entries []config.TaskEntry
 	var err error
 	if cfgErr == nil && !reflect.DeepEqual(fileCfg, cur) {
-		entries, _, deferred, err = d.applyNewConfig(cur, fileCfg)
+		entries, _, deferred, err = d.applyNewConfig(ctx, cur, fileCfg)
 	} else {
 		entries, err = config.LoadTasks(d.configDir, cur)
 	}
@@ -91,7 +91,7 @@ func (d *daemon) reloadLocked(ctx context.Context) (any, error) {
 // settings (only max_parallel follows next) and is named in deferred. The
 // caller holds d.mu and reschedules the tasks afterwards, so a new timezone
 // reaches their next fire.
-func (d *daemon) applyNewConfig(cur, next config.Config) (entries []config.TaskEntry, running config.Config, deferred []string, err error) {
+func (d *daemon) applyNewConfig(ctx context.Context, cur, next config.Config) (entries []config.TaskEntry, running config.Config, deferred []string, err error) {
 	deferred, err = d.runner.ReconfigureAfter(next, d.newTarget, func(def []string) error {
 		var loadErr error
 		entries, loadErr = config.LoadTasks(d.configDir, overlayConfig(cur, next, def))
@@ -101,7 +101,7 @@ func (d *daemon) applyNewConfig(cur, next config.Config) (entries []config.TaskE
 		return nil, cur, nil, err
 	}
 	running = overlayConfig(cur, next, deferred)
-	d.installConfig(cur, running)
+	d.installConfig(ctx, cur, running)
 	return entries, running, deferred, nil
 }
 
@@ -125,7 +125,7 @@ func overlayConfig(cur, next config.Config, deferred []string) config.Config {
 
 // installConfig publishes running to the daemon's collaborators. The runner
 // already has it (ReconfigureAfter). The caller holds d.mu.
-func (d *daemon) installConfig(cur, running config.Config) {
+func (d *daemon) installConfig(ctx context.Context, cur, running config.Config) {
 	d.cfgMu.Lock()
 	d.cfg = running
 	d.cfgMu.Unlock()
@@ -133,7 +133,7 @@ func (d *daemon) installConfig(cur, running config.Config) {
 	d.sched.SetConfig(running)
 	d.disp.SetConfig(running)
 	removed := removedTargets(cur, running)
-	d.disp.DropTargets(removed)
+	d.disp.DropTargets(ctx, removed)
 
 	// A removed or replaced target loses its last check: the report was
 	// about another machine or another herdr. Bump the epoch too, so a

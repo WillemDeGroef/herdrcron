@@ -246,6 +246,10 @@ func runRun(ctx context.Context, p paths.Paths, args []string, stdout, stderr io
 		fmt.Fprintf(stdout, "run of %s queued: it starts when the active run ends or a slot on the target is free\n", r.TaskID)
 		return 0
 	}
+	if r.Status == "dropped" {
+		fmt.Fprintf(stdout, "run %s of %s dropped: %s\n", r.ID, r.TaskID, r.ExitReason)
+		return 0
+	}
 	line := fmt.Sprintf("run %s started for %s: %s", r.ID, r.TaskID, r.Status)
 	if r.HerdrTab != "" {
 		line += fmt.Sprintf(", herdr tab %s pane %s", r.HerdrTab, r.HerdrPane)

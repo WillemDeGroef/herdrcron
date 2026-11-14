@@ -173,7 +173,12 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		OnAmend:        d.runAmended,
 		OnTargetChange: d.targetChanged,
 	})
-	d.disp = dispatch.New(dispatch.Options{Runs: latestDef{d}, Store: st, Config: cfg, Log: log})
+	d.disp = dispatch.New(dispatch.Options{
+		Runs: latestDef{d}, Store: st, Config: cfg, Log: log, Now: clk.Now,
+		// A dropped fire is a new row in the task's history, not a run
+		// that changed state: publish it without a notification.
+		OnDropped: d.runAmended,
+	})
 	d.sched = scheduler.New(scheduler.Options{
 		Clock: clk, Store: st, Runs: d.disp, Adopt: d.runner, Config: cfg, Log: log,
 		OnPauseExpired: d.pauseExpired,
@@ -271,6 +276,8 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	}()
 	err = srv.Serve(ctx, ln)
 	cancel()
+	// Fires that still wait stay in queued_fires for the next daemon.
+	d.disp.Stop()
 	<-schedDone
 	<-runnerDone
 	<-watchDone
@@ -465,8 +472,13 @@ func (d *daemon) tasksRunNow(ctx context.Context, params json.RawMessage) (any, 
 		// overlap queue with a fire already pending: this one is dropped.
 		return nil, &api.Error{Code: api.CodeRunActive,
 			Message: fmt.Sprintf("task %s has an active run and a queued fire (overlap: queue)", e.ID)}
+	case out.Queued:
+		return api.RunNowResult{RunSummary: api.RunSummary{TaskID: e.ID, Target: e.Task.Target, Trigger: store.TriggerManual}, Queued: true}, nil
+	default:
+		// The fire was dropped (its target is gone) and the history row
+		// could not be stored. It is not waiting in the queue.
+		return nil, fmt.Errorf("start run of %s: dropped", e.ID)
 	}
-	return api.RunNowResult{RunSummary: api.RunSummary{TaskID: e.ID, Target: e.Task.Target, Trigger: store.TriggerManual}, Queued: true}, nil
 }
 
 // runsStop stops an active run and returns it once the stop sequence is

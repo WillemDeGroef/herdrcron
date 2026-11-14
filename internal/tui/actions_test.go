@@ -190,6 +190,18 @@ func TestRunNow(t *testing.T) {
 	finalView(t, tm)
 }
 
+func TestRunNowDroppedShowsTheReason(t *testing.T) {
+	f := fixture()
+	f.set(api.MethodTasksRunNow, api.RunNowResult{RunSummary: api.RunSummary{
+		ID: "r9", TaskID: "e2e-timeout", Status: "dropped", ExitReason: "target old removed from config",
+	}})
+	tm := start(t, newTestModel(f, plain()))
+	selectTask(t, tm, order, "e2e-timeout")
+	tm.Send(key("r"))
+	waitText(t, tm, "dropped run of e2e-timeout: target old removed from config")
+	finalView(t, tm)
+}
+
 func TestRunNowAsksBeforeParallel(t *testing.T) {
 	f := fixture()
 	f.fail(api.MethodTasksRunNow, &api.Error{Code: api.CodeRunActive, Message: "task has an active run"})

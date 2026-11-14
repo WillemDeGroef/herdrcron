@@ -452,6 +452,7 @@ const (
 	runDone     = "done"
 	runFailed   = "failed"
 	runTimeout  = "timeout"
+	runDropped  = "dropped"
 )
 
 // activeStatus reports whether a run in status s is still going.
