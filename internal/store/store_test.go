@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -1161,5 +1162,63 @@ func TestOpenAtSchemaVersion3IsIdempotent(t *testing.T) {
 	}
 	if version != 3 {
 		t.Errorf("user_version = %d, want 3", version)
+	}
+}
+
+// A rollback lowers user_version by hand so an older binary opens the
+// database (README, "Upgrade and rollback"). The columns of the newer schema
+// are still there, so the upgrade that follows must skip them and keep the
+// data.
+func TestOpenAfterLoweredUserVersionKeepsColumnsAndData(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("user_version=%d", version), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			s, err := store.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			run := newRun("a", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+			run.EndedAt = run.StartedAt.Add(time.Minute)
+			run.Status = store.StatusStopped
+			run.HerdrTerminal = "term-1"
+			if err := s.InsertRun(ctx, run); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SetPendingCleanup(ctx, run.ID, true); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.MarkCleanupClosing(ctx, run.ID, true, "kept tail"); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			db, err := sql.Open("sqlite", "file:"+path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			s, err = store.Open(path)
+			if err != nil {
+				t.Fatalf("Open after PRAGMA user_version = %d: %v", version, err)
+			}
+			t.Cleanup(func() { _ = s.Close() })
+			list, err := s.ListPendingCleanups(ctx)
+			if err != nil || len(list) != 1 || !list[0].Closing || !list[0].PaneReplaced || list[0].Tail != "kept tail" {
+				t.Fatalf("ListPendingCleanups = %+v, %v; want the stored progress", list, err)
+			}
+			got, err := s.GetRun(ctx, run.ID)
+			if err != nil || got.HerdrTerminal != "term-1" {
+				t.Fatalf("GetRun = %+v, %v; want herdr_terminal kept", got, err)
+			}
+		})
 	}
 }

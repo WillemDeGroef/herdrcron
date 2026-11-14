@@ -39,3 +39,7 @@ changelog:
     exclude:
       - "^docs:"
       - "^test:"
+
+release:
+  footer: |
+    Rolling back to an older herdrcron after this one has run can need one manual step on the state database (`PRAGMA user_version`). See [Upgrade and rollback](https://github.com/WillemDeGroef/herdrcron#upgrade-and-rollback) in the README.
