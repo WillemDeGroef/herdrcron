@@ -67,7 +67,9 @@ fi
 if [ -n "$FAKE_SSH_STDIN_STALL" ]; then
 	mkfifo "$dir/in"
 	exec 5<&0
-	{ head -c "$FAKE_SSH_STDIN_STALL" <&5; cat <&5 >/dev/null; } > "$dir/in" &
+	# The ":" keeps sh from exec'ing cat in place of this subshell, which
+	# would close the FIFO's only writer and end the stall with an EOF.
+	{ head -c "$FAKE_SSH_STDIN_STALL" <&5; cat <&5 >/dev/null; :; } > "$dir/in" &
 	exec < "$dir/in" 5<&-
 fi
 env=$(command -v env)
