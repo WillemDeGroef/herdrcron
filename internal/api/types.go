@@ -391,7 +391,8 @@ type TaskChangedEvent struct {
 }
 
 // RunChangedEvent is the params of "run.changed": a run was stored with a
-// new status (started, status change, ended).
+// new status (started, status change, ended), or an ended run's exit
+// reason was amended (its stop was finished or dropped later).
 type RunChangedEvent struct {
 	Run RunSummary `json:"run"`
 }

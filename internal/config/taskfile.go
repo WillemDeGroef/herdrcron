@@ -111,6 +111,12 @@ func Version(taskFile, promptFile string) (string, error) {
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return "", fmt.Errorf("read prompt file: %w", err)
 	}
+	return hashVersion(task, prompt), nil
+}
+
+// hashVersion is Version for bytes already read. A missing prompt is an
+// empty slice, the same as a prompt file that is not there.
+func hashVersion(task, prompt []byte) string {
 	h := sha256.New()
 	for _, part := range [][]byte{task, prompt} {
 		var n [8]byte
@@ -118,7 +124,7 @@ func Version(taskFile, promptFile string) (string, error) {
 		h.Write(n[:])
 		h.Write(part)
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // field is one key to write into a YAML mapping. A nil value and nil sub

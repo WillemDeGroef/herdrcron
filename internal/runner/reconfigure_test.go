@@ -3,6 +3,7 @@ package runner_test
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,5 +117,52 @@ func TestReconfigureDefersATargetWithAnActiveRun(t *testing.T) {
 	})
 	if !viaNewPath {
 		t.Errorf("replacement target calls = %q, want a pane list through the new herdr_path", other.Calls())
+	}
+}
+
+// Reload can remove a target after a waiting fire has left the queue and
+// before the dispatcher marks the target gone. Start then finds no target.
+// The fire is dropped, not failed, and nothing is launched or notified.
+func TestStartAfterTargetRemovedIsDroppedNotFailed(t *testing.T) {
+	e := newEnv(t)
+	before := len(e.herdr.Calls())
+	removed := envConfig(map[string]config.Target{})
+	newTarget := func(string, config.Target) target.Target { return e.herdr }
+	if deferred := e.runner.Reconfigure(removed, newTarget); len(deferred) != 0 {
+		t.Fatalf("deferred = %q, want none: local has no active run", deferred)
+	}
+	task := deps()
+	scheduled := e.clock.Now()
+	run, err := e.runner.Start(e.ctx, task, store.TriggerSchedule, scheduled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != store.StatusDropped {
+		t.Fatalf("status = %s, want dropped", run.Status)
+	}
+	if !strings.Contains(run.ExitReason, "target local removed from config") {
+		t.Fatalf("reason = %q, want the removal", run.ExitReason)
+	}
+	if !run.StartedAt.Equal(run.EndedAt) || !run.EndedAt.Equal(e.clock.Now()) {
+		t.Fatalf("start %v end %v, want both at the drop", run.StartedAt, run.EndedAt)
+	}
+	if run.HerdrWorkspace != "" || run.HerdrTab != "" || run.HerdrPane != "" {
+		t.Fatalf("herdr ids set on a dropped run: %+v", run)
+	}
+	stored := e.get(run.ID)
+	if stored.Status != store.StatusDropped || !stored.StartedAt.Equal(stored.EndedAt) || stored.ExitReason != run.ExitReason {
+		t.Fatalf("stored = %+v, want the dropped row", stored)
+	}
+	if notes := e.notifications(); len(notes) != 0 {
+		t.Fatalf("notifications = %+v, want none", notes)
+	}
+	if n := len(e.herdr.Calls()); n != before {
+		t.Fatalf("herdr calls = %d, was %d: a dropped fire launches nothing", n, before)
+	}
+	if n := len(e.runner.ActiveRuns()); n != 0 {
+		t.Fatalf("%d active runs, want none", n)
+	}
+	if ended := e.endedRuns(); len(ended) != 1 || ended[0].ID != run.ID || ended[0].Status != store.StatusDropped {
+		t.Fatalf("OnEnd = %+v, want the dropped run", ended)
 	}
 }

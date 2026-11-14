@@ -119,7 +119,7 @@ func (d *daemon) editLocked(ctx context.Context, i int, action string, edit func
 	if err := d.sched.SetTask(ctx, e); err != nil {
 		d.log.Error("cannot reschedule task", logging.KeyTaskID, e.ID, "err", err)
 	}
-	d.versions[e.ID] = d.fileVersion(e)
+	d.setVersionLocked(e.ID, d.fileVersion(e))
 	d.publishTaskLocked(ctx, i)
 	return d.summary(ctx, e)
 }

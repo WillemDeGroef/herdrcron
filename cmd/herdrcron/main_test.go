@@ -747,6 +747,20 @@ func TestRunThatFailsToStartExitsNonZero(t *testing.T) {
 	}
 }
 
+func TestRunDroppedPrintsTheReason(t *testing.T) {
+	p := xdg(t)
+	var gotID string
+	stubDaemon(t, p, runNowStub(t, api.RunSummary{ID: "01JRUN", TaskID: "nightly", Target: "old",
+		Trigger: "manual", Status: "dropped", ExitReason: "target old removed from config"}, &gotID))
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"run", "nightly"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d, want 0: a drop is not a failed run", code)
+	}
+	if got, want := out.String(), "run 01JRUN of nightly dropped: target old removed from config\n"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}
+
 func TestRunUnknownTaskFails(t *testing.T) {
 	p := xdg(t)
 	var gotID string

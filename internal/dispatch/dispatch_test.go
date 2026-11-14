@@ -33,6 +33,15 @@ type fakeRunner struct {
 	// failLaunch makes Start return an ended, failed run, after calling
 	// RunEnded from inside Start.
 	failLaunch bool
+	// dropLaunch makes Start return an ended dropped run, as the runner
+	// does when the target was removed before launch. It calls RunEnded
+	// from inside Start.
+	dropLaunch bool
+	// refuse makes Start of these task ids return the error and no run,
+	// like the daemon does for a task that was deleted.
+	refuse map[string]error
+	// decline makes Start of these task ids return no run and no error.
+	decline map[string]bool
 	// duringStart, when set, runs inside the next Start before it returns
 	// (and before a failed launch calls RunEnded).
 	duringStart func()
@@ -45,6 +54,14 @@ func newFakeRunner() *fakeRunner { return &fakeRunner{active: map[string]store.R
 
 func (f *fakeRunner) Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
 	f.mu.Lock()
+	if err := f.refuse[t.ID]; err != nil {
+		f.mu.Unlock()
+		return store.Run{}, err
+	}
+	if f.decline[t.ID] {
+		f.mu.Unlock()
+		return store.Run{}, nil
+	}
 	f.n++
 	r := store.Run{
 		ID: fmt.Sprintf("r%d", f.n), TaskID: t.ID, Target: t.Target, Trigger: trigger,
@@ -52,7 +69,7 @@ func (f *fakeRunner) Start(ctx context.Context, t config.Task, trigger string, s
 	}
 	f.starts = append(f.starts, r)
 	f.startErrs = append(f.startErrs, ctx.Err())
-	fail, hook := f.failLaunch, f.duringStart
+	fail, drop, hook := f.failLaunch, f.dropLaunch, f.duringStart
 	f.duringStart = nil
 	if hook != nil {
 		f.mu.Unlock()
@@ -61,6 +78,13 @@ func (f *fakeRunner) Start(ctx context.Context, t config.Task, trigger string, s
 	}
 	if fail {
 		r.Status, r.EndedAt = store.StatusFailed, time.Now()
+		f.mu.Unlock()
+		f.d.RunEnded(ctx, r)
+		return r, nil
+	}
+	if drop {
+		r.Status, r.EndedAt = store.StatusDropped, r.StartedAt
+		r.ExitReason = "target " + t.Target + " removed from config"
 		f.mu.Unlock()
 		f.d.RunEnded(ctx, r)
 		return r, nil
@@ -720,7 +744,7 @@ func TestDropTargetsDiscardsWaitingFires(t *testing.T) {
 		t.Fatalf("overlap fire = %+v, want Queued", out)
 	}
 
-	h.d.DropTargets([]string{"vps", "local"})
+	h.d.DropTargets(context.Background(), []string{"vps", "local"})
 	h.runs.end(t, first.Run.ID)
 	h.runs.end(t, overlap.Run.ID)
 
@@ -740,7 +764,7 @@ func TestDropTargetsDeletesStoredQueuedFires(t *testing.T) {
 	if !submit(t, h, task("b", "local", "parallel"), store.TriggerSchedule, t0, false).Queued {
 		t.Fatal("want b queued")
 	}
-	h.d.DropTargets([]string{"local"})
+	h.d.DropTargets(context.Background(), []string{"local"})
 	fires, err := st.ListQueuedFires(context.Background())
 	if err != nil || len(fires) != 0 {
 		t.Fatalf("stored fires = %+v err=%v, want none after DropTargets", fires, err)

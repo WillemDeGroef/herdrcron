@@ -38,6 +38,9 @@ type Options struct {
 	// Targets, if set, replaces the real targets by name; tests use it to
 	// run without herdr.
 	Targets map[string]target.Target
+	// LoadTasks, if set, reads the task files in place of config.LoadTasks;
+	// tests use it to stand in for a filesystem that stopped answering.
+	LoadTasks func(configDir string, cfg config.Config) ([]config.TaskEntry, error)
 }
 
 type daemon struct {
@@ -63,6 +66,10 @@ type daemon struct {
 	// newTarget builds the target of a config.yaml entry; nil leaves the
 	// target out.
 	newTarget func(name string, tc config.Target) target.Target
+	// loadTasks, when set, is Options.LoadTasks: a test stand-in for the
+	// task-file read. nil reads with config.SnapshotTasks, which versions
+	// the bytes it parsed.
+	loadTasks func(configDir string, cfg config.Config) ([]config.TaskEntry, error)
 
 	// mu guards tasks, versions, deleting and globalPause, and serialises
 	// task file writes. Lock order: mu, then the scheduler's lock. Never
@@ -74,6 +81,12 @@ type daemon struct {
 	// watcher event whose files still have it (the daemon's own write)
 	// changes nothing.
 	versions map[string]string
+	// tasksGen counts the changes to tasks and versions: every task
+	// written, reloaded or removed, and every "reload" applied. A reload
+	// reads the files without mu and applies its read only if tasksGen is
+	// still what it was when the read began (reload.go). versions cannot
+	// tell: a task changed and changed back has the version it had.
+	tasksGen uint64
 	// deleting holds tasks being deleted; the watcher leaves them alone.
 	deleting map[string]bool
 
@@ -122,7 +135,13 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		log.Error("config invalid", "err", err)
 		return err
 	}
-	tasks, err := config.LoadTasks(p.ConfigDir, cfg)
+	var tasks []config.TaskEntry
+	var pinned []string
+	if opts.LoadTasks != nil {
+		tasks, err = opts.LoadTasks(p.ConfigDir, cfg)
+	} else {
+		tasks, pinned, err = config.SnapshotTasks(p.ConfigDir, cfg)
+	}
 	if err != nil {
 		log.Error("cannot load tasks", "err", err)
 		return err
@@ -139,14 +158,20 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	}
 	d := &daemon{
 		version: opts.Version, started: time.Now(), configDir: p.ConfigDir,
-		cfg: cfg, tasks: tasks, store: st, clk: clk, log: log,
+		cfg: cfg, tasks: tasks, store: st, clk: clk, log: log, loadTasks: opts.LoadTasks,
 		configFile: p.ConfigFile(), bus: newBus(log), sshControlDir: p.SSHControlDir(),
 		versions: map[string]string{}, deleting: map[string]bool{},
 		dirty: map[string]struct{}{}, dirtyWake: make(chan struct{}, 1),
 		lastChecks: map[string]api.TargetCheck{}, checkEpoch: map[string]uint64{},
 	}
-	for _, e := range tasks {
-		d.versions[e.ID] = d.fileVersion(e)
+	if opts.LoadTasks != nil {
+		for _, e := range tasks {
+			d.versions[e.ID] = d.fileVersion(e)
+		}
+	} else {
+		for i, e := range tasks {
+			d.versions[e.ID] = pinned[i]
+		}
 	}
 	log.Info("config loaded", "targets", d.targetNames(), "tasks", len(tasks))
 	for _, e := range tasks {
@@ -173,7 +198,12 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		OnAmend:        d.runAmended,
 		OnTargetChange: d.targetChanged,
 	})
-	d.disp = dispatch.New(dispatch.Options{Runs: latestDef{d}, Store: st, Config: cfg, Log: log})
+	d.disp = dispatch.New(dispatch.Options{
+		Runs: latestDef{d}, Store: st, Config: cfg, Log: log, Now: clk.Now,
+		// A dropped fire is a new row in the task's history, not a run
+		// that changed state: publish it without a notification.
+		OnDropped: d.runAmended,
+	})
 	d.sched = scheduler.New(scheduler.Options{
 		Clock: clk, Store: st, Runs: d.disp, Adopt: d.runner, Config: cfg, Log: log,
 		OnPauseExpired: d.pauseExpired,
@@ -271,6 +301,8 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	}()
 	err = srv.Serve(ctx, ln)
 	cancel()
+	// Fires that still wait stay in queued_fires for the next daemon.
+	d.disp.Stop()
 	<-schedDone
 	<-runnerDone
 	<-watchDone
@@ -465,8 +497,13 @@ func (d *daemon) tasksRunNow(ctx context.Context, params json.RawMessage) (any, 
 		// overlap queue with a fire already pending: this one is dropped.
 		return nil, &api.Error{Code: api.CodeRunActive,
 			Message: fmt.Sprintf("task %s has an active run and a queued fire (overlap: queue)", e.ID)}
+	case out.Queued:
+		return api.RunNowResult{RunSummary: api.RunSummary{TaskID: e.ID, Target: e.Task.Target, Trigger: store.TriggerManual}, Queued: true}, nil
+	default:
+		// The fire was dropped (its target is gone) and the history row
+		// could not be stored. It is not waiting in the queue.
+		return nil, fmt.Errorf("start run of %s: dropped", e.ID)
 	}
-	return api.RunNowResult{RunSummary: api.RunSummary{TaskID: e.ID, Target: e.Task.Target, Trigger: store.TriggerManual}, Queued: true}, nil
 }
 
 // runsStop stops an active run and returns it once the stop sequence is
@@ -542,8 +579,9 @@ func apiTime(t time.Time) string {
 
 // latestDef sits between the dispatcher and the runner. A fire carries the
 // task as it was when it was scheduled or queued; latestDef starts the
-// definition as it is now, so an edit applies to the next run. A task
-// deleted or made invalid meanwhile does not start.
+// definition as it is now, with the prompt as it is now, so an edit applies
+// to the next run and a later edit cannot change this one. A task deleted
+// or made invalid meanwhile does not start.
 type latestDef struct{ d *daemon }
 
 func (l latestDef) Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
@@ -553,11 +591,16 @@ func (l latestDef) Start(ctx context.Context, t config.Task, trigger string, sch
 	if gen, ok := catchGenFrom(ctx); ok && !l.d.runner.HasGen(t.Target, gen) {
 		return store.Run{}, nil
 	}
-	cur, err := l.d.currentTask(t)
+	cur, prompt, promptErr, err := l.d.currentTask(t)
 	if err != nil {
 		return store.Run{}, err
 	}
-	return l.d.runner.Start(ctx, cur, trigger, scheduledAt)
+	if promptErr != nil {
+		// The runner reads the file once more and stores the run as failed
+		// with the reason if it still cannot.
+		return l.d.runner.Start(ctx, cur, trigger, scheduledAt)
+	}
+	return l.d.runner.StartWithPrompt(ctx, cur, prompt, trigger, scheduledAt)
 }
 
 func (l latestDef) ActiveRuns() []store.Run { return l.d.runner.ActiveRuns() }
