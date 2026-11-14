@@ -453,6 +453,37 @@ func TestPromptFileIsWrittenAndCommandReadsIt(t *testing.T) {
 	}
 }
 
+// StartWithPrompt launches with the text it was given and never reads the
+// prompt file: the file may be gone by the time the run starts.
+func TestStartWithPromptDoesNotNeedThePromptFile(t *testing.T) {
+	e := newEnv(t)
+	if err := os.Remove(filepath.Join(e.configDir, "prompts", "deps.md")); err != nil {
+		t.Fatal(err)
+	}
+	run, err := e.runner.StartWithPrompt(e.ctx, deps(), []byte("as decided"), store.TriggerManual, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != store.StatusRunning {
+		t.Fatalf("run = %+v, want running", run)
+	}
+	path := "~/.cache/herdrcron/runs/" + run.ID + ".md"
+	if got := string(e.herdr.Files()[path]); got != "as decided" {
+		t.Errorf("prompt file %s = %q, want the given prompt", path, got)
+	}
+}
+
+func TestMissingPromptFileFailsTheRun(t *testing.T) {
+	e := newEnv(t)
+	if err := os.Remove(filepath.Join(e.configDir, "prompts", "deps.md")); err != nil {
+		t.Fatal(err)
+	}
+	run := e.start(deps())
+	if run.Status != store.StatusFailed || !strings.Contains(run.ExitReason, "read prompt file prompts/deps.md") {
+		t.Errorf("run = %+v, want failed with the prompt file as the reason", run)
+	}
+}
+
 func TestPreflightFailureFailsTheRun(t *testing.T) {
 	e := newEnv(t)
 	e.herdr.preflight = "agent command claude not found on PATH"

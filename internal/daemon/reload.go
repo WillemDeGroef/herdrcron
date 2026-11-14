@@ -152,7 +152,7 @@ func (d *daemon) applyReadLocked(ctx context.Context, r reloadRead) (res any, ap
 		if _, ok := d.runner.ReconfigureIf(r.next, d.newTarget, r.deferred); !ok {
 			return nil, false, nil
 		}
-		d.installConfig(r.cur, r.resulting)
+		d.installConfig(ctx, r.cur, r.resulting)
 	}
 	old := d.versions
 	d.tasks = r.entries
@@ -215,7 +215,7 @@ func overlayConfig(cur, next config.Config, deferred []string) config.Config {
 
 // installConfig publishes running to the daemon's collaborators. The runner
 // already has it (ReconfigureIf). The caller holds d.mu.
-func (d *daemon) installConfig(cur, running config.Config) {
+func (d *daemon) installConfig(ctx context.Context, cur, running config.Config) {
 	d.cfgMu.Lock()
 	d.cfg = running
 	d.cfgMu.Unlock()
@@ -223,7 +223,7 @@ func (d *daemon) installConfig(cur, running config.Config) {
 	d.sched.SetConfig(running)
 	d.disp.SetConfig(running)
 	removed := removedTargets(cur, running)
-	d.disp.DropTargets(removed)
+	d.disp.DropTargets(ctx, removed)
 
 	// A removed or replaced target loses its last check: the report was
 	// about another machine or another herdr. Bump the epoch too, so a

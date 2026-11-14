@@ -198,7 +198,12 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		OnAmend:        d.runAmended,
 		OnTargetChange: d.targetChanged,
 	})
-	d.disp = dispatch.New(dispatch.Options{Runs: latestDef{d}, Store: st, Config: cfg, Log: log})
+	d.disp = dispatch.New(dispatch.Options{
+		Runs: latestDef{d}, Store: st, Config: cfg, Log: log, Now: clk.Now,
+		// A dropped fire is a new row in the task's history, not a run
+		// that changed state: publish it without a notification.
+		OnDropped: d.runAmended,
+	})
 	d.sched = scheduler.New(scheduler.Options{
 		Clock: clk, Store: st, Runs: d.disp, Adopt: d.runner, Config: cfg, Log: log,
 		OnPauseExpired: d.pauseExpired,
@@ -296,6 +301,8 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	}()
 	err = srv.Serve(ctx, ln)
 	cancel()
+	// Fires that still wait stay in queued_fires for the next daemon.
+	d.disp.Stop()
 	<-schedDone
 	<-runnerDone
 	<-watchDone
@@ -490,8 +497,13 @@ func (d *daemon) tasksRunNow(ctx context.Context, params json.RawMessage) (any, 
 		// overlap queue with a fire already pending: this one is dropped.
 		return nil, &api.Error{Code: api.CodeRunActive,
 			Message: fmt.Sprintf("task %s has an active run and a queued fire (overlap: queue)", e.ID)}
+	case out.Queued:
+		return api.RunNowResult{RunSummary: api.RunSummary{TaskID: e.ID, Target: e.Task.Target, Trigger: store.TriggerManual}, Queued: true}, nil
+	default:
+		// The fire was dropped (its target is gone) and the history row
+		// could not be stored. It is not waiting in the queue.
+		return nil, fmt.Errorf("start run of %s: dropped", e.ID)
 	}
-	return api.RunNowResult{RunSummary: api.RunSummary{TaskID: e.ID, Target: e.Task.Target, Trigger: store.TriggerManual}, Queued: true}, nil
 }
 
 // runsStop stops an active run and returns it once the stop sequence is
@@ -567,8 +579,9 @@ func apiTime(t time.Time) string {
 
 // latestDef sits between the dispatcher and the runner. A fire carries the
 // task as it was when it was scheduled or queued; latestDef starts the
-// definition as it is now, so an edit applies to the next run. A task
-// deleted or made invalid meanwhile does not start.
+// definition as it is now, with the prompt as it is now, so an edit applies
+// to the next run and a later edit cannot change this one. A task deleted
+// or made invalid meanwhile does not start.
 type latestDef struct{ d *daemon }
 
 func (l latestDef) Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
@@ -578,11 +591,16 @@ func (l latestDef) Start(ctx context.Context, t config.Task, trigger string, sch
 	if gen, ok := catchGenFrom(ctx); ok && !l.d.runner.HasGen(t.Target, gen) {
 		return store.Run{}, nil
 	}
-	cur, err := l.d.currentTask(t)
+	cur, prompt, promptErr, err := l.d.currentTask(t)
 	if err != nil {
 		return store.Run{}, err
 	}
-	return l.d.runner.Start(ctx, cur, trigger, scheduledAt)
+	if promptErr != nil {
+		// The runner reads the file once more and stores the run as failed
+		// with the reason if it still cannot.
+		return l.d.runner.Start(ctx, cur, trigger, scheduledAt)
+	}
+	return l.d.runner.StartWithPrompt(ctx, cur, prompt, trigger, scheduledAt)
 }
 
 func (l latestDef) ActiveRuns() []store.Run { return l.d.runner.ActiveRuns() }

@@ -1,8 +1,9 @@
 // Package store keeps the herdrcron daemon state in SQLite: one row per run
 // in table runs, per task scheduling state in table task_state, the global
 // pauses in table global_pause, the fires that wait for a run to end or for a
-// free slot in table queued_fires, and the ended runs whose tab may still be
-// open on their target in table pending_cleanups.
+// free slot in table queued_fires, the ended runs whose tab may still be
+// open on their target in table pending_cleanups, and the tab creates that
+// got no answer in table lost_creates.
 package store
 
 import (
@@ -35,6 +36,10 @@ const (
 	StatusStopped         = "stopped"
 	StatusLost            = "lost" // The pane no longer exists.
 	StatusHostUnreachable = "host_unreachable"
+	// StatusDropped: a fire that waited in queued_fires and was discarded
+	// before it started. The row never was a run: it has no herdr ids, it
+	// starts and ends at the time of the drop, and its exit reason says why.
+	StatusDropped = "dropped"
 )
 
 // ErrNotFound is returned, wrapped, when a requested row does not exist.
@@ -42,7 +47,7 @@ var ErrNotFound = errors.New("not found")
 
 // schemaVersion is stored in PRAGMA user_version so later versions can
 // migrate the schema.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // schema creates the tables if they are missing.
 const schema = `
@@ -84,7 +89,11 @@ CREATE TABLE IF NOT EXISTS queued_fires (
 	pending      INTEGER NOT NULL -- 1: waits for the task's active run.
 );
 CREATE TABLE IF NOT EXISTS pending_cleanups (
-	run_id TEXT PRIMARY KEY -- An ended run whose tab may still be open.
+	run_id        TEXT PRIMARY KEY, -- An ended run whose tab may still be open.
+	-- How far the cleanup got (since schema version 3), see PendingCleanup.
+	closing       INTEGER NOT NULL DEFAULT 0,
+	pane_replaced INTEGER NOT NULL DEFAULT 0,
+	output_tail   TEXT
 );
 `
 
@@ -144,7 +153,7 @@ func migrate(db *sql.DB) error {
 	if version > schemaVersion {
 		return fmt.Errorf("database schema version %d is newer than this herdrcron (%d)", version, schemaVersion)
 	}
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(schema + lostCreatesSchema); err != nil {
 		return err
 	}
 	// Version 2 added runs.herdr_terminal. CREATE TABLE IF NOT EXISTS
@@ -155,18 +164,35 @@ func migrate(db *sql.DB) error {
 	// The column is looked up, not assumed missing: a daemon that died
 	// between the ALTER and the version write must still open.
 	if version < 2 {
-		var n int
-		err := db.QueryRow("SELECT count(*) FROM pragma_table_info('runs') WHERE name = 'herdr_terminal'").Scan(&n)
-		if err != nil {
+		if err := addColumn(db, "runs", "herdr_terminal", "TEXT"); err != nil {
 			return err
 		}
-		if n == 0 {
-			if _, err := db.Exec("ALTER TABLE runs ADD COLUMN herdr_terminal TEXT"); err != nil {
+	}
+	// Version 3 added the progress columns of pending_cleanups, in the same
+	// way.
+	if version < 3 {
+		for _, c := range [][2]string{
+			{"closing", "INTEGER NOT NULL DEFAULT 0"},
+			{"pane_replaced", "INTEGER NOT NULL DEFAULT 0"},
+			{"output_tail", "TEXT"},
+		} {
+			if err := addColumn(db, "pending_cleanups", c[0], c[1]); err != nil {
 				return err
 			}
 		}
 	}
 	_, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion))
+	return err
+}
+
+// addColumn adds the column to the table unless it is already there.
+func addColumn(db *sql.DB, table, column, decl string) error {
+	var n int
+	err := db.QueryRow("SELECT count(*) FROM pragma_table_info(?) WHERE name = ?", table, column).Scan(&n)
+	if err != nil || n > 0 {
+		return err
+	}
+	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + decl)
 	return err
 }
 
@@ -184,12 +210,21 @@ const runColumns = `id, task_id, target, trigger, scheduled_at, started_at,
 	ended_at, status, herdr_workspace, herdr_tab, herdr_pane, herdr_terminal,
 	exit_reason, output_tail`
 
+// execer is the part of *sql.DB and *sql.Tx that writes need.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // InsertRun adds a new run. r.ID must be set.
 func (s *Store) InsertRun(ctx context.Context, r Run) error {
+	return insertRun(ctx, s.db, r)
+}
+
+func insertRun(ctx context.Context, db execer, r Run) error {
 	if r.ID == "" {
 		return errors.New("insert run: empty id")
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := db.ExecContext(ctx,
 		`INSERT INTO runs (`+runColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.TaskID, r.Target, r.Trigger, timeValue(r.ScheduledAt),
 		timeValue(r.StartedAt), timeValue(r.EndedAt), r.Status,
@@ -349,15 +384,81 @@ func (s *Store) SetPendingCleanup(ctx context.Context, runID string, pending boo
 	return nil
 }
 
-// ListPendingCleanups returns the runs with a pending cleanup, oldest
-// first.
-func (s *Store) ListPendingCleanups(ctx context.Context) ([]Run, error) {
-	runs, err := s.queryRuns(ctx, `SELECT `+runColumns+` FROM runs
-		WHERE id IN (SELECT run_id FROM pending_cleanups) ORDER BY started_at, id`)
+// PendingCleanup is an ended run whose stop could not reach its target, and
+// how far a later try to finish that stop got.
+type PendingCleanup struct {
+	Run
+	// Closing is set just before the cleanup closes the run's tab. If the
+	// daemon dies before it stores the outcome, the next daemon knows that
+	// the stop keys were sent and that a missing tab was closed by it.
+	Closing bool
+	// PaneReplaced: the cleanup found a new shell under the run's pane id
+	// and sent it no keys. Only meaningful with Closing.
+	PaneReplaced bool
+	// Tail is the pane output the cleanup read before closing the tab.
+	// Only meaningful with Closing.
+	Tail string
+}
+
+// MarkCleanupClosing records that the pending cleanup of the run is about
+// to close the run's tab (see PendingCleanup). It does nothing for a run
+// without a pending cleanup.
+func (s *Store) MarkCleanupClosing(ctx context.Context, runID string, paneReplaced bool, tail string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE pending_cleanups
+		SET closing = 1, pane_replaced = ?, output_tail = ? WHERE run_id = ?`, paneReplaced, tail, runID)
+	if err != nil {
+		return fmt.Errorf("mark cleanup of run %s closing: %w", runID, err)
+	}
+	return nil
+}
+
+// ListPendingCleanups returns the pending cleanups, oldest run first.
+func (s *Store) ListPendingCleanups(ctx context.Context) ([]PendingCleanup, error) {
+	cleanups, err := s.listPendingCleanups(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list pending cleanups: %w", err)
 	}
-	return runs, nil
+	return cleanups, nil
+}
+
+func (s *Store) listPendingCleanups(ctx context.Context) ([]PendingCleanup, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, closing, pane_replaced, output_tail FROM pending_cleanups`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	progress := map[string]PendingCleanup{}
+	for rows.Next() {
+		var (
+			id   string
+			c    PendingCleanup
+			tail sql.NullString
+		)
+		if err := rows.Scan(&id, &c.Closing, &c.PaneReplaced, &tail); err != nil {
+			return nil, err
+		}
+		c.Tail = tail.String
+		progress[id] = c
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Closed before the next query: the store has one connection.
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	runs, err := s.queryRuns(ctx, `SELECT `+runColumns+` FROM runs
+		WHERE id IN (SELECT run_id FROM pending_cleanups) ORDER BY started_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	cleanups := make([]PendingCleanup, 0, len(runs))
+	for _, run := range runs {
+		c := progress[run.ID] // zero for a cleanup recorded in between
+		c.Run = run
+		cleanups = append(cleanups, c)
+	}
+	return cleanups, nil
 }
 
 // queryRuns runs a query that selects runColumns.
@@ -397,7 +498,8 @@ func (s *Store) LastRun(ctx context.Context, taskID string) (r Run, ok bool, err
 // LastNonManualRun returns the newest run whose trigger is not manual, by
 // start time. ok is false if every run is manual or there are none.
 // Catch-up after a target outage uses this so a newer "run now" does not
-// hide a host_unreachable scheduled fire.
+// hide a host_unreachable scheduled fire. A dropped queued fire is skipped
+// for the same reason: it never ran.
 func (s *Store) LastNonManualRun(ctx context.Context, taskID string) (r Run, ok bool, err error) {
 	if taskID == "" {
 		return Run{}, false, errors.New("last non-manual run: empty task id")
@@ -407,7 +509,7 @@ func (s *Store) LastNonManualRun(ctx context.Context, taskID string) (r Run, ok 
 		return Run{}, false, fmt.Errorf("last non-manual run of %s: %w", taskID, err)
 	}
 	for _, run := range runs {
-		if run.Trigger != TriggerManual {
+		if run.Trigger != TriggerManual && run.Status != StatusDropped {
 			return run, true, nil
 		}
 	}
@@ -639,11 +741,36 @@ func (s *Store) ReleaseQueuedFire(ctx context.Context, id int64) (int64, error) 
 	return newID, nil
 }
 
-// DeleteQueuedFire removes a queued fire: it is starting, or it was
-// dropped. A fire that does not exist is not an error.
+// DeleteQueuedFire removes a queued fire that is starting. A fire that does
+// not exist is not an error.
 func (s *Store) DeleteQueuedFire(ctx context.Context, id int64) error {
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM queued_fires WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("delete queued fire %d: %w", id, err)
+	}
+	return nil
+}
+
+// DropQueuedFire removes the queued fire id, which will not run, and adds
+// r, the ended row that shows the drop in the task's history. Both happen
+// in one transaction, so a fire is never gone without its row and a row is
+// never written for a fire that still waits. id 0 is a fire that was not
+// stored: only r is added. A fire that no longer exists is not an error.
+func (s *Store) DropQueuedFire(ctx context.Context, id int64, r Run) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("drop queued fire %d: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if id != 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM queued_fires WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("drop queued fire %d: %w", id, err)
+		}
+	}
+	if err := insertRun(ctx, tx, r); err != nil {
+		return fmt.Errorf("drop queued fire %d: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("drop queued fire %d: %w", id, err)
 	}
 	return nil
 }

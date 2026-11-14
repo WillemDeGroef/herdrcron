@@ -144,3 +144,30 @@ func TestReconfigureIfRefusesAStaleDeferredSetAndChangesNothing(t *testing.T) {
 			known, built, gen, e.targetState().Gen == gen)
 	}
 }
+
+// ReconfigureIf is the daemon's reload path. Like Reconfigure, it drops the
+// lost create of a target it replaces and closes no tab there.
+func TestReconfigureIfDropsTheLostCreateOfAReplacedTarget(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.script(working, idle, idle)
+	first := e.start(deps())
+	e.statuses(first.ID, 3)
+	e.startLostCreate("tab create")
+	tabs := e.herdr.openTabs()
+
+	e.reconnect()
+	other := e.herdr
+	moved := envConfig(map[string]config.Target{"local": {Host: "box"}})
+	deferred, ok := e.runner.ReconfigureIf(moved,
+		func(string, config.Target) target.Target { return other }, e.runner.WouldDefer(moved))
+	if !ok || len(deferred) != 0 {
+		t.Fatalf("ReconfigureIf = %q, %v, want none, applied", deferred, ok)
+	}
+	e.runner.PollTarget(e.ctx, "local")
+	if got := e.herdr.openTabs(); !slices.Equal(got, tabs) {
+		t.Errorf("open tabs = %q, want %q: nothing closed on the new target", got, tabs)
+	}
+	if got := e.lostCreates(); len(got) != 0 {
+		t.Errorf("stored lost creates = %+v, want none", got)
+	}
+}

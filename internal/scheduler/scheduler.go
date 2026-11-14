@@ -594,8 +594,9 @@ func (s *Scheduler) start(ctx, wctx context.Context, log *slog.Logger, t config.
 		log.Error("cannot start run", "trigger", trigger, "scheduled_at", scheduledAt, "err", err)
 	}
 	// Record the fire even when the finishing write failed: the row
-	// exists, and last_run_id should point at it.
-	if run.ID != "" {
+	// exists, and last_run_id should point at it. A dropped fire did not
+	// run. Pointing last_run_id at it would hide an older missed fire.
+	if run.ID != "" && run.Status != store.StatusDropped {
 		if err := s.store.RecordFire(wctx, t.ID, run.ID, scheduledAt); err != nil {
 			log.Error("cannot write task state", "err", err)
 		}
