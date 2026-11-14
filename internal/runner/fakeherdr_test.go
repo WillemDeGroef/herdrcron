@@ -351,7 +351,7 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		}
 		return nil, nil
 	case "pane read":
-		if _, found := f.panes[argv[3]]; !found {
+		if p, found := f.panes[argv[3]]; !found || p.closed {
 			return nil, herdrErr(herdr.CodePaneNotFound)
 		}
 		return []byte(f.output), nil
