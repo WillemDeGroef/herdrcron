@@ -325,6 +325,8 @@ func (m Model) runNow(id string, parallel bool) tea.Cmd {
 			return doneMsg{text: "queued a run of " + id}
 		case res.Status == runFailed:
 			return doneMsg{err: fmt.Errorf("run %s failed to start: %s", id, res.ExitReason)}
+		case res.Status == runDropped:
+			return doneMsg{text: "dropped run of " + id + ": " + res.ExitReason}
 		}
 		return doneMsg{text: "started run " + res.ID + " of " + id}
 	}

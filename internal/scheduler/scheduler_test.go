@@ -29,6 +29,9 @@ type fakeRuns struct {
 	// unreachable stores each run as host_unreachable, as the runner does
 	// for a fire at a target that does not answer.
 	unreachable bool
+	// dropped stores each run as dropped, as the runner does when the
+	// target was removed before the fire could start.
+	dropped bool
 	// beforeInsert runs synchronously at the start of Start, before the run
 	// row is inserted (used to simulate pause/disable mid-tick).
 	beforeInsert func(t config.Task)
@@ -70,6 +73,9 @@ func (f *fakeRuns) Start(ctx context.Context, t config.Task, trigger string, sch
 	err, status := f.err, store.StatusDone
 	if f.unreachable {
 		status = store.StatusHostUnreachable
+	}
+	if f.dropped {
+		status = store.StatusDropped
 	}
 	f.mu.Unlock()
 	if err != nil {
@@ -797,5 +803,27 @@ func TestSetConfigAppliesCatchUpWindow(t *testing.T) {
 	e.sched.Tick(e.ctx)
 	if runs := e.runs("daily"); len(runs) != 1 || runs[0].Trigger != store.TriggerCatchUp {
 		t.Errorf("runs = %+v, want one catch_up with the 6h window", runs)
+	}
+}
+
+// A fire the runner drops (its target was removed) is a history row and
+// not a fire that happened: task_state does not point at it.
+func TestDroppedFireIsNotRecordedAsRun(t *testing.T) {
+	loc := brussels(t)
+	start := time.Date(2026, 11, 6, 12, 10, 0, 0, loc)
+	e := newEnv(t, start)
+	e.starter.dropped = true
+	e.setTasks(valid(task("hourly", "@hourly")))
+	e.sched.Tick(e.ctx)
+	fireAt := time.Date(2026, 11, 6, 13, 0, 0, 0, loc)
+	e.clock.Set(fireAt.Add(2 * time.Second))
+	e.sched.Tick(e.ctx)
+	runs := e.runs("hourly")
+	if len(runs) != 1 || runs[0].Status != store.StatusDropped {
+		t.Fatalf("runs = %+v, want one dropped row", runs)
+	}
+	st := e.state("hourly")
+	if st.LastRunID != "" || !st.LastFireAt.IsZero() {
+		t.Errorf("task_state = %+v, want no last run: the fire was dropped", st)
 	}
 }

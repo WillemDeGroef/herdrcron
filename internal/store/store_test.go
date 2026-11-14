@@ -883,6 +883,121 @@ INSERT INTO queued_fires (task_id, target, trigger, pending) VALUES ('backup', '
 	}
 }
 
+func TestDropQueuedFireRecordsHistoryAndRemovesTheFire(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	now := at.Add(10 * time.Minute)
+	id, err := s.AddQueuedFire(ctx, store.QueuedFire{TaskID: "a", Target: "mini", Trigger: store.TriggerSchedule, ScheduledAt: at})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keptID, err := s.AddQueuedFire(ctx, store.QueuedFire{TaskID: "b", Target: "local", Trigger: store.TriggerManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dropped := store.Run{
+		ID: store.NewRunID(now), TaskID: "a", Target: "mini", Trigger: store.TriggerSchedule,
+		ScheduledAt: at, StartedAt: now, EndedAt: now,
+		Status: store.StatusDropped, ExitReason: "target mini removed from config",
+	}
+	if err := s.DropQueuedFire(ctx, id, dropped); err != nil {
+		t.Fatal(err)
+	}
+	fires, err := s.ListQueuedFires(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fires) != 1 || fires[0].ID != keptID {
+		t.Fatalf("queued fires after drop = %+v, want only fire %d", fires, keptID)
+	}
+	runs, err := s.ListRuns(ctx, "a", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("history of a = %+v, want the one dropped row", runs)
+	}
+	assertRunEqual(t, runs[0], dropped)
+	// The row is ended: recovery must not take it for an open run.
+	open, err := s.ListOpenRuns(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("open runs = %+v, want none", open)
+	}
+}
+
+// A fire that was never stored (ID 0) still gets its history row.
+func TestDropQueuedFireWithoutStoredFire(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	dropped := store.Run{
+		ID: store.NewRunID(now), TaskID: "a", Target: "mini", Trigger: store.TriggerManual,
+		StartedAt: now, EndedAt: now, Status: store.StatusDropped, ExitReason: "target mini removed from config",
+	}
+	if err := s.DropQueuedFire(ctx, 0, dropped); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetRun(ctx, dropped.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRunEqual(t, got, dropped)
+}
+
+// The delete and the history row are one transaction: when the row cannot
+// be written, the fire stays queued, so a later drop can record it.
+func TestDropQueuedFireKeepsTheFireWhenHistoryFails(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	id, err := s.AddQueuedFire(ctx, store.QueuedFire{TaskID: "a", Target: "mini", Trigger: store.TriggerManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dup := newRun("a", now)
+	if err := s.InsertRun(ctx, dup); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DropQueuedFire(ctx, id, dup); err == nil {
+		t.Fatal("DropQueuedFire with a run id that exists: want an error")
+	}
+	fires, err := s.ListQueuedFires(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fires) != 1 || fires[0].ID != id {
+		t.Fatalf("queued fires = %+v, want fire %d still queued", fires, id)
+	}
+}
+
+// A dropped queued fire never ran, so it must not hide the host_unreachable
+// fire that catch-up after a target outage looks for.
+func TestLastNonManualRunSkipsDroppedFires(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	missed := newRun("a", base)
+	missed.Trigger = store.TriggerSchedule
+	missed.Status = store.StatusHostUnreachable
+	dropped := newRun("a", base.Add(time.Minute))
+	dropped.Trigger = store.TriggerSchedule
+	dropped.Status = store.StatusDropped
+	for _, r := range []store.Run{missed, dropped} {
+		if err := s.InsertRun(ctx, r); err != nil {
+			t.Fatalf("InsertRun: %v", err)
+		}
+	}
+	got, ok, err := s.LastNonManualRun(ctx, "a")
+	if err != nil || !ok {
+		t.Fatalf("LastNonManualRun = ok %v, err %v; want true, nil", ok, err)
+	}
+	assertRunEqual(t, got, missed)
+}
+
 // A cleanup's progress is stored before its tab is closed, so a daemon
 // that dies before amending the run still knows what it had done.
 func TestPendingCleanupClosing(t *testing.T) {

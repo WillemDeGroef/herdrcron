@@ -36,6 +36,10 @@ const (
 	StatusStopped         = "stopped"
 	StatusLost            = "lost" // The pane no longer exists.
 	StatusHostUnreachable = "host_unreachable"
+	// StatusDropped: a fire that waited in queued_fires and was discarded
+	// before it started. The row never was a run: it has no herdr ids, it
+	// starts and ends at the time of the drop, and its exit reason says why.
+	StatusDropped = "dropped"
 )
 
 // ErrNotFound is returned, wrapped, when a requested row does not exist.
@@ -206,12 +210,21 @@ const runColumns = `id, task_id, target, trigger, scheduled_at, started_at,
 	ended_at, status, herdr_workspace, herdr_tab, herdr_pane, herdr_terminal,
 	exit_reason, output_tail`
 
+// execer is the part of *sql.DB and *sql.Tx that writes need.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // InsertRun adds a new run. r.ID must be set.
 func (s *Store) InsertRun(ctx context.Context, r Run) error {
+	return insertRun(ctx, s.db, r)
+}
+
+func insertRun(ctx context.Context, db execer, r Run) error {
 	if r.ID == "" {
 		return errors.New("insert run: empty id")
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := db.ExecContext(ctx,
 		`INSERT INTO runs (`+runColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.TaskID, r.Target, r.Trigger, timeValue(r.ScheduledAt),
 		timeValue(r.StartedAt), timeValue(r.EndedAt), r.Status,
@@ -485,7 +498,8 @@ func (s *Store) LastRun(ctx context.Context, taskID string) (r Run, ok bool, err
 // LastNonManualRun returns the newest run whose trigger is not manual, by
 // start time. ok is false if every run is manual or there are none.
 // Catch-up after a target outage uses this so a newer "run now" does not
-// hide a host_unreachable scheduled fire.
+// hide a host_unreachable scheduled fire. A dropped queued fire is skipped
+// for the same reason: it never ran.
 func (s *Store) LastNonManualRun(ctx context.Context, taskID string) (r Run, ok bool, err error) {
 	if taskID == "" {
 		return Run{}, false, errors.New("last non-manual run: empty task id")
@@ -495,7 +509,7 @@ func (s *Store) LastNonManualRun(ctx context.Context, taskID string) (r Run, ok 
 		return Run{}, false, fmt.Errorf("last non-manual run of %s: %w", taskID, err)
 	}
 	for _, run := range runs {
-		if run.Trigger != TriggerManual {
+		if run.Trigger != TriggerManual && run.Status != StatusDropped {
 			return run, true, nil
 		}
 	}
@@ -727,11 +741,36 @@ func (s *Store) ReleaseQueuedFire(ctx context.Context, id int64) (int64, error) 
 	return newID, nil
 }
 
-// DeleteQueuedFire removes a queued fire: it is starting, or it was
-// dropped. A fire that does not exist is not an error.
+// DeleteQueuedFire removes a queued fire that is starting. A fire that does
+// not exist is not an error.
 func (s *Store) DeleteQueuedFire(ctx context.Context, id int64) error {
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM queued_fires WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("delete queued fire %d: %w", id, err)
+	}
+	return nil
+}
+
+// DropQueuedFire removes the queued fire id, which will not run, and adds
+// r, the ended row that shows the drop in the task's history. Both happen
+// in one transaction, so a fire is never gone without its row and a row is
+// never written for a fire that still waits. id 0 is a fire that was not
+// stored: only r is added. A fire that no longer exists is not an error.
+func (s *Store) DropQueuedFire(ctx context.Context, id int64, r Run) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("drop queued fire %d: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if id != 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM queued_fires WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("drop queued fire %d: %w", id, err)
+		}
+	}
+	if err := insertRun(ctx, tx, r); err != nil {
+		return fmt.Errorf("drop queued fire %d: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("drop queued fire %d: %w", id, err)
 	}
 	return nil
 }
