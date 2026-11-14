@@ -98,7 +98,7 @@ Each run opens a tab labelled `hc-<task>-<HHMM>` in a workspace labelled `hc-<re
 
 ### Pane shell
 
-The launch line is typed into the pane's interactive shell, on the local machine and on a remote one alike. herdr picks that shell, not herdrcron: `default_shell` under `[terminal]` in herdr's `config.toml`, else `$SHELL`, else `/bin/sh`. A target's `shell` setting (`bash -lc`) does not change it: that one only runs herdrcron's own commands on a remote machine.
+The launch line is typed into the pane's interactive shell, on the local machine and on a remote one alike. herdr picks that shell, not herdrcron: `default_shell` under `[terminal]` in herdr's `config.toml`, else `$SHELL`, else `/bin/sh`. A target's `shell` setting (`bash -lc`) does not change it. That setting runs herdrcron's own checks on every target, and over SSH the remote herdr calls. An upload stays in `/bin/sh` and does not use it.
 
 The pane shell must be POSIX-like (bash, zsh, ksh, dash). The line relies on POSIX single quoting for the command and its args (`'it'\''s'`), and on `"$(cat "$HOME"/.cache/herdrcron/runs/<run id>.md)"` to pass the prompt as one argument. csh, tcsh, nushell and PowerShell do not read that line as written, and fish treats a backslash inside single quotes differently, so an arg can reach the agent changed. herdrcron is tested with a POSIX shell only. If your login shell is another one, set `default_shell = "/bin/bash"` in herdr's config on that machine; you can still start your own shell from there in panes you open yourself.
 
@@ -116,9 +116,9 @@ A target other than `local` is reached with `ssh` from the always-on host (conne
 - the repos cloned at the tasks' `cwd`;
 - SSH key access from the always-on host without a password prompt (an alias in `~/.ssh/config` works as `host`);
 - a POSIX-like shell in herdr panes (see "Pane shell" above);
-- `/bin/sh` with `printf` and `mktemp`, and one of `setsid`, `/proc`, or a `ps` that can list pid, ppid and pgid (`ps -A -o pid= -o ppid= -o pgid=`; a BusyBox `ps` has `-o` and not `-p`, which is enough). If none of those is there, the command still runs and herdrcron says so on stderr: a cancel then stops only that command, not processes it started.
+- `/bin/sh` with `printf` and `mktemp`, and one of `setsid`, `/proc`, or a `ps` that can list pid, ppid and pgid (`ps -A -o pid= -o ppid= -o pgid=`; a BusyBox `ps` has `-o` and not `-p`, which is enough). If none of those is there, the command still runs. The remote script writes a warning on its stderr, which a successful command does not show. A cancel then stops only that command, not processes it started.
 
-For herdrcron's own SSH commands, the remote user's login shell can be anything (bash, zsh, fish, tcsh): it only starts `/bin/sh`, which runs the command through the target's `shell`. The shell in the herdr pane is a separate matter and does have to be POSIX-like. When herdrcron gives up on a remote command (a timeout, a shutdown), the command is stopped on the remote machine too: SIGTERM first, SIGKILL five seconds later for what is still running.
+For herdrcron's own SSH commands, the remote user's login shell can be anything (bash, zsh, fish, tcsh): it only starts `/bin/sh`. From there, a command or a file removal runs through the target's `shell`; an upload stays in `/bin/sh`. The shell in the herdr pane is a separate matter and does have to be POSIX-like. When herdrcron gives up on a remote command (a timeout, a shutdown), the command is stopped on the remote machine too: SIGTERM first, SIGKILL five seconds later for what is still running.
 
 ### No terminal on SSH calls
 
@@ -157,10 +157,12 @@ To roll back:
 
 1. Stop the daemon: `systemctl --user stop herdrcron.service`, on macOS `launchctl bootout gui/$(id -u)/io.github.willemdegroef.herdrcron`, or end a foreground `herdrcron daemon`. Do not edit the database while a daemon has it open.
 2. Copy `herdrcron.db` in the state dir, with `herdrcron.db-wal` and `herdrcron.db-shm` when they exist. Do not delete the `-wal` file: it can hold committed data.
-3. Set the version the old binary wants (2 here), with the `sqlite3` command-line tool. herdrcron has no command for this:
+3. Set the version the old binary wants (2 here), with the `sqlite3` command-line tool. herdrcron has no command for this. The file is `herdrcron.db` in the state dir (`$XDG_STATE_HOME/herdrcron` when that value is an absolute path, otherwise `~/.local/state/herdrcron`):
 
    ```sh
-   sqlite3 ~/.local/state/herdrcron/herdrcron.db 'PRAGMA user_version = 2;'
+   state=${XDG_STATE_HOME:-$HOME/.local/state}
+   case $state in /*) ;; *) state=$HOME/.local/state ;; esac
+   sqlite3 "$state/herdrcron/herdrcron.db" 'PRAGMA user_version = 2;'
    ```
 
 4. Install the old binary and start the daemon (`herdrcron install-service` from the old binary, or `herdrcron daemon`).
