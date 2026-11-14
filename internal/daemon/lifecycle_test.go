@@ -338,6 +338,43 @@ func TestRunNowOverlapQueueStartsTheQueuedRunWhenTheActiveOneEnds(t *testing.T) 
 	}
 }
 
+// A fire queued before an update still carries the task from then, including
+// the old prompt file. The update points the task at a new file and deletes
+// the old one before that fire starts. The run uses the prompt as it is when
+// it starts, and does not fail with "read prompt file".
+func TestQueuedFireStartsWithThePromptAsItIsWhenItStarts(t *testing.T) {
+	l := newLifecycle(t, noon, "timeout: 1h\noverlap: queue\n")
+	l.start()
+	first := l.mustRunNow()
+
+	queued, err := l.runNow(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queued.Queued || queued.ID != "" {
+		t.Fatalf("second run_now = %+v, want queued", queued)
+	}
+
+	movePrompt(t, l.c, "job", "prompts/moved.md", "second prompt")
+	if _, err := os.Stat(filepath.Join(l.p.ConfigDir, "prompts", "job.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old prompt file still exists (%v): the queued fire's file was not removed", err)
+	}
+
+	l.herdr.set(first.HerdrPane, paneIdle)
+	l.advanceUntil("the first run ends", pollStep, l.ended(first.ID))
+	eventually(t, "the queued run to start", func() bool {
+		runs := l.runs()
+		return len(runs) == 2 && runs[0].Status != store.StatusStarting
+	})
+	second := l.runs()[0]
+	if second.ID == first.ID || second.Status != store.StatusRunning {
+		t.Fatalf("queued run = %+v, want running", second)
+	}
+	if got := l.herdr.putContents(); !slices.Equal(got, []string{"do the job", "second prompt"}) {
+		t.Errorf("prompt files written = %q, want the prompt current when the queued fire started", got)
+	}
+}
+
 func TestRunsStopStopsTheRunAndClosesItsTab(t *testing.T) {
 	l := newLifecycle(t, time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC), "timeout: 1h\n")
 	l.herdr.setOutput("last words of the agent\n")
