@@ -33,6 +33,10 @@ type fakeRunner struct {
 	// failLaunch makes Start return an ended, failed run, after calling
 	// RunEnded from inside Start.
 	failLaunch bool
+	// dropLaunch makes Start return an ended dropped run, as the runner
+	// does when the target was removed before launch. It calls RunEnded
+	// from inside Start.
+	dropLaunch bool
 	// refuse makes Start of these task ids return the error and no run,
 	// like the daemon does for a task that was deleted.
 	refuse map[string]error
@@ -65,7 +69,7 @@ func (f *fakeRunner) Start(ctx context.Context, t config.Task, trigger string, s
 	}
 	f.starts = append(f.starts, r)
 	f.startErrs = append(f.startErrs, ctx.Err())
-	fail, hook := f.failLaunch, f.duringStart
+	fail, drop, hook := f.failLaunch, f.dropLaunch, f.duringStart
 	f.duringStart = nil
 	if hook != nil {
 		f.mu.Unlock()
@@ -74,6 +78,13 @@ func (f *fakeRunner) Start(ctx context.Context, t config.Task, trigger string, s
 	}
 	if fail {
 		r.Status, r.EndedAt = store.StatusFailed, time.Now()
+		f.mu.Unlock()
+		f.d.RunEnded(ctx, r)
+		return r, nil
+	}
+	if drop {
+		r.Status, r.EndedAt = store.StatusDropped, r.StartedAt
+		r.ExitReason = "target " + t.Target + " removed from config"
 		f.mu.Unlock()
 		f.d.RunEnded(ctx, r)
 		return r, nil

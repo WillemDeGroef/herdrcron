@@ -472,8 +472,13 @@ func (d *daemon) tasksRunNow(ctx context.Context, params json.RawMessage) (any, 
 		// overlap queue with a fire already pending: this one is dropped.
 		return nil, &api.Error{Code: api.CodeRunActive,
 			Message: fmt.Sprintf("task %s has an active run and a queued fire (overlap: queue)", e.ID)}
+	case out.Queued:
+		return api.RunNowResult{RunSummary: api.RunSummary{TaskID: e.ID, Target: e.Task.Target, Trigger: store.TriggerManual}, Queued: true}, nil
+	default:
+		// The fire was dropped (its target is gone) and the history row
+		// could not be stored. It is not waiting in the queue.
+		return nil, fmt.Errorf("start run of %s: dropped", e.ID)
 	}
-	return api.RunNowResult{RunSummary: api.RunSummary{TaskID: e.ID, Target: e.Task.Target, Trigger: store.TriggerManual}, Queued: true}, nil
 }
 
 // runsStop stops an active run and returns it once the stop sequence is

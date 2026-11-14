@@ -134,8 +134,8 @@ func TestFireDroppedAtLaunchBecauseItsTargetIsGoneIsRecorded(t *testing.T) {
 	h := newDropHarness(t, oneSlot(), st)
 	h.runs.duringSnapshot = func() { h.d.DropTargets(context.Background(), []string{"local"}) }
 	out := submit(t, h.harness, task("a", "local", "parallel"), store.TriggerSchedule, t0, false)
-	if out.Run.ID != "" || out.Queued || out.Skipped {
-		t.Fatalf("Submit = %+v, want the fire dropped", out)
+	if out.Queued || out.Skipped || out.Run.Status != store.StatusDropped || out.Run.ID == "" {
+		t.Fatalf("Submit = %+v, want the dropped history row", out)
 	}
 	if n := len(h.runs.startCalls()); n != 0 {
 		t.Fatalf("Start called %d times, want 0", n)
@@ -337,5 +337,25 @@ func TestStopKeepsWaitingFiresInTheStoreForTheNextDaemon(t *testing.T) {
 	starts := next.runs.startCalls()
 	if len(starts) != 1 || starts[0].TaskID != "b" || !starts[0].ScheduledAt.Equal(t0.Add(time.Minute)) {
 		t.Fatalf("next daemon started %+v, want b's kept fire", starts)
+	}
+}
+
+// The runner records a dropped row itself when the target is already gone
+// by the time a queued fire starts. That fire did not run, so task_state
+// stays unchanged and OnDropped is not called a second time.
+func TestQueuedFireDroppedByTheRunnerIsNotRecordedAsFired(t *testing.T) {
+	st := openStore(t)
+	h := newDropHarness(t, oneSlot(), st)
+	first := submit(t, h.harness, task("a", "local", "parallel"), store.TriggerSchedule, t0, false)
+	if !submit(t, h.harness, task("b", "local", "parallel"), store.TriggerSchedule, t0.Add(time.Minute), false).Queued {
+		t.Fatal("want b queued behind a")
+	}
+	h.runs.dropLaunch = true
+	h.runs.end(t, first.Run.ID)
+	if _, ok, err := st.GetTaskState(context.Background(), "b"); err != nil || ok {
+		t.Fatalf("task state of b: ok=%v err=%v, want none (a dropped fire did not run)", ok, err)
+	}
+	if got := h.onDropped(); len(got) != 0 {
+		t.Fatalf("OnDropped = %+v, want none: the runner stored the row", got)
 	}
 }

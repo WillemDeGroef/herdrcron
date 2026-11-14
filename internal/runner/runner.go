@@ -131,6 +131,11 @@ type Runner struct {
 	// starting holds the runs between their insert and the end of their
 	// launch, by run id; they are not in active yet.
 	starting map[string]*activeRun
+	// removed names targets Reconfigure has dropped. A later start for one
+	// of them is a dropped run, not a failed one: the target used to be
+	// configured. A name the runner never had is absent, and stays a
+	// failed run. Guarded by mu, which reconfigureLocked already holds.
+	removed map[string]bool
 	// cleanups holds the ended runs whose stop is finished when their
 	// target answers again, by run id.
 	cleanups map[string]*pendingCleanup
@@ -203,6 +208,7 @@ func New(o Options) *Runner {
 		workers:        map[string]context.CancelFunc{},
 		active:         map[string]*activeRun{},
 		starting:       map[string]*activeRun{},
+		removed:        map[string]bool{},
 		cleanups:       map[string]*pendingCleanup{},
 	}
 	r.stopCtx, r.cancelStop = context.WithCancel(context.Background())
@@ -381,6 +387,7 @@ func (r *Runner) reconfigureLocked(cfg config.Config, newTarget func(name string
 			delete(r.workers, rt.name)
 		}
 		if !rt.wanted {
+			r.removed[rt.name] = true
 			r.log.Info("target removed", "target", rt.name)
 		}
 	}
@@ -393,6 +400,7 @@ func (r *Runner) reconfigureLocked(cfg config.Config, newTarget func(name string
 			continue
 		}
 		r.targets[name] = r.stamp(newTargetState(t, tc))
+		delete(r.removed, name)
 		r.startWorkerLocked(name)
 		r.log.Info("target configured", "target", name)
 	}
@@ -413,11 +421,37 @@ func sameTarget(a, b config.Target) bool {
 	return a == b
 }
 
+// errTargetGone is launch's error when the task's target is no longer
+// configured. Reload can remove the target after a waiting fire has left
+// the dispatcher's queue and before the target is marked gone. That fire
+// is dropped, not failed: a failed row would notify.
+var errTargetGone = errors.New("target removed")
+
+// unknownTargetError is a missing target. Its text is the failed-run
+// reason a target the runner never had still gets. Unwrap lets Start
+// tell that case from any other launch error.
+type unknownTargetError struct{ name string }
+
+func (e unknownTargetError) Error() string {
+	return fmt.Sprintf("unknown target %q", e.name)
+}
+
+func (e unknownTargetError) Unwrap() error { return errTargetGone }
+
+func targetRemovedReason(name string) string {
+	return "target " + name + " removed from config"
+}
+
 // Start runs steps 1 to 6 for task t: it reserves the run row, launches
 // the agent in a new hc- tab, and returns the run as running. A run that
 // cannot start is stored as failed with the reason, and returned without
-// an error; the error is for a run that could not be stored at all.
+// an error; the error is for a run that could not be stored at all. A
+// target Reconfigure has removed is stored as dropped, and nothing is
+// launched. A target the runner never had stays a failed run.
 func (r *Runner) Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
+	if r.target(t.Target) == nil && r.targetWasRemoved(t.Target) {
+		return r.recordTargetRemoved(ctx, t, trigger, scheduledAt)
+	}
 	now := r.clock.Now()
 	run := store.Run{
 		ID: store.NewRunID(now), TaskID: t.ID, Target: t.Target, Trigger: trigger,
@@ -453,8 +487,47 @@ func (r *Runner) Start(ctx context.Context, t config.Task, trigger string, sched
 		a.log.Warn("target unreachable at fire time", "err", err)
 		return r.end(context.WithoutCancel(ctx), a, store.StatusHostUnreachable, err.Error())
 	}
+	if errors.Is(err, errTargetGone) && r.targetWasRemoved(t.Target) {
+		// The target went away after the check at the top of Start: reload
+		// has dropped it and the dispatcher has not marked it gone yet.
+		a.log.Info("dropping run: target is gone", "err", err)
+		return r.end(context.WithoutCancel(ctx), a, store.StatusDropped, targetRemovedReason(t.Target))
+	}
 	a.log.Warn("run failed to start", "err", err)
 	return r.end(context.WithoutCancel(ctx), a, store.StatusFailed, err.Error())
+}
+
+// recordTargetRemoved stores a dropped run for a fire whose target is
+// already gone. started_at and ended_at are both the time of the drop, and
+// the row has no herdr ids. The write ignores ctx's cancellation: the fire
+// is not coming back, and its history row is how that is seen. OnEnd runs,
+// as it does for any run end.
+func (r *Runner) recordTargetRemoved(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
+	ctx = context.WithoutCancel(ctx)
+	now := r.clock.Now()
+	run := store.Run{
+		ID: store.NewRunID(now), TaskID: t.ID, Target: t.Target, Trigger: trigger,
+		ScheduledAt: scheduledAt, StartedAt: now, EndedAt: now,
+		Status: store.StatusDropped, ExitReason: targetRemovedReason(t.Target),
+	}
+	if err := r.store.InsertRun(ctx, run); err != nil {
+		return store.Run{}, err
+	}
+	r.log.Info("dropping run: target is gone",
+		logging.KeyTaskID, t.ID, logging.KeyTarget, t.Target, "trigger", trigger, "reason", run.ExitReason)
+	r.changed(run)
+	if r.onEnd != nil {
+		r.onEnd(ctx, run)
+	}
+	return run, nil
+}
+
+// targetWasRemoved reports whether Reconfigure has dropped name. The
+// caller must not hold r.mu.
+func (r *Runner) targetWasRemoved(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.removed[name]
 }
 
 // launch runs steps 2 to 6. On error, a.run holds whatever herdr ids were
@@ -464,7 +537,7 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 	ts := r.target(t.Target)
 	ok := ts != nil
 	if !ok {
-		return fmt.Errorf("unknown target %q", t.Target)
+		return unknownTargetError{t.Target}
 	}
 	if err := r.knownUnreachable(ts, t.Target); err != nil {
 		return err
@@ -1066,7 +1139,12 @@ func (r *Runner) endRun(ctx context.Context, a *activeRun, status, reason string
 	r.mu.Unlock()
 	// Out of the active map, a.run is no longer read by ActiveRuns.
 	failedToStart := a.run.Status == store.StatusStarting
-	a.run.Status, a.run.ExitReason, a.run.EndedAt = status, reason, r.clock.Now()
+	endedAt := r.clock.Now()
+	a.run.Status, a.run.ExitReason, a.run.EndedAt = status, reason, endedAt
+	if status == store.StatusDropped {
+		// The run never started. Both times are the moment it was dropped.
+		a.run.StartedAt = endedAt
+	}
 	err := r.store.UpdateRun(ctx, a.run)
 	if err == nil {
 		r.changed(a.run)

@@ -54,8 +54,8 @@ const DefaultMaxParallel = 4
 
 // Outcome is what Submit did with a fire. At most one of its parts is set.
 type Outcome struct {
-	// Run is the run that started now. It may come back ended (a failed
-	// launch).
+	// Run is the run that started now, or the history row of a fire that
+	// was dropped (status dropped). It may come back ended (a failed launch).
 	Run store.Run
 	// Queued: the fire waits, as the task's one pending overlap fire or in
 	// its target's max_parallel queue.
@@ -63,8 +63,8 @@ type Outcome struct {
 	// Skipped: overlap skip, or a queue fire dropped because one is already
 	// pending. Nothing was recorded.
 	Skipped bool
-	// Neither set and no error: the fire was dropped because reload removed
-	// its target. The dispatcher recorded the drop in the task's history.
+	// Neither set and no error: the fire was dropped and its history row
+	// could not be stored. It is not queued.
 }
 
 // fire is one request to start a run of a task.
@@ -340,11 +340,10 @@ func (d *Dispatcher) launch(ctx context.Context, f fire) (run store.Run, dropped
 	d.mu.Unlock()
 	if gone {
 		// Reload removed the target after this fire was counted. Starting
-		// it would record a failed run on a machine that is no longer
-		// configured.
+		// it would launch on a machine that is no longer configured.
 		d.log.Info("dropping fire: target is gone",
 			logging.KeyTaskID, f.task.ID, logging.KeyTarget, f.task.Target, "trigger", f.trigger)
-		d.recordDrop(ctx, f, reasonTargetGone(f.task.Target))
+		run = d.recordDrop(ctx, f, reasonTargetGone(f.task.Target))
 	} else {
 		run, err = d.runs.Start(ctx, f.task, f.trigger, f.scheduledAt)
 	}
@@ -466,7 +465,9 @@ func (d *Dispatcher) startDeferred(ctx context.Context, f fire) {
 		}
 		d.recordDrop(ctx, f, reason)
 	}
-	if run.ID == "" || f.trigger == store.TriggerManual || d.store == nil {
+	// A dropped fire did not run. Leaving task_state alone keeps it
+	// from counting as the last fire, which would hide an older missed one.
+	if dropped || run.Status == store.StatusDropped || run.ID == "" || f.trigger == store.TriggerManual || d.store == nil {
 		return
 	}
 	if err := d.store.RecordFire(ctx, f.task.ID, run.ID, f.scheduledAt); err != nil {
@@ -517,13 +518,14 @@ func reasonTargetGone(target string) string {
 // row that shows the drop, and reason, in its task's history. The two are
 // one transaction. A failure is logged: the fire is dropped all the same.
 // Without a store nothing is recorded. It may be called with d.mu held.
+// The stored row is returned. A zero run means nothing was stored.
 //
 // This write must complete, so it does not follow ctx's cancellation. The
 // fire is already gone from memory. If its row stayed in queued_fires, the
 // next daemon would restore it and run a fire that was dropped.
-func (d *Dispatcher) recordDrop(ctx context.Context, f fire, reason string) {
+func (d *Dispatcher) recordDrop(ctx context.Context, f fire, reason string) store.Run {
 	if d.store == nil {
-		return
+		return store.Run{}
 	}
 	now := d.now()
 	run := store.Run{
@@ -534,11 +536,12 @@ func (d *Dispatcher) recordDrop(ctx context.Context, f fire, reason string) {
 	if err := d.store.DropQueuedFire(context.WithoutCancel(ctx), f.id, run); err != nil {
 		d.log.Error("cannot record dropped fire",
 			logging.KeyTaskID, f.task.ID, logging.KeyTarget, f.task.Target, "reason", reason, "err", err)
-		return
+		return store.Run{}
 	}
 	if d.onDropped != nil {
 		d.onDropped(run)
 	}
+	return run
 }
 
 // Restore loads the fires a previous daemon left waiting, in their queue
