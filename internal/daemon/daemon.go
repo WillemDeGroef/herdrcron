@@ -66,8 +66,9 @@ type daemon struct {
 	// newTarget builds the target of a config.yaml entry; nil leaves the
 	// target out.
 	newTarget func(name string, tc config.Target) target.Target
-	// loadTasks reads every task file: config.LoadTasks, or the stand-in
-	// of Options.LoadTasks.
+	// loadTasks, when set, is Options.LoadTasks: a test stand-in for the
+	// task-file read. nil reads with config.SnapshotTasks, which versions
+	// the bytes it parsed.
 	loadTasks func(configDir string, cfg config.Config) ([]config.TaskEntry, error)
 
 	// mu guards tasks, versions, deleting and globalPause, and serialises
@@ -134,11 +135,13 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		log.Error("config invalid", "err", err)
 		return err
 	}
-	loadTasks := opts.LoadTasks
-	if loadTasks == nil {
-		loadTasks = config.LoadTasks
+	var tasks []config.TaskEntry
+	var pinned []string
+	if opts.LoadTasks != nil {
+		tasks, err = opts.LoadTasks(p.ConfigDir, cfg)
+	} else {
+		tasks, pinned, err = config.SnapshotTasks(p.ConfigDir, cfg)
 	}
-	tasks, err := loadTasks(p.ConfigDir, cfg)
 	if err != nil {
 		log.Error("cannot load tasks", "err", err)
 		return err
@@ -155,14 +158,20 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	}
 	d := &daemon{
 		version: opts.Version, started: time.Now(), configDir: p.ConfigDir,
-		cfg: cfg, tasks: tasks, store: st, clk: clk, log: log, loadTasks: loadTasks,
+		cfg: cfg, tasks: tasks, store: st, clk: clk, log: log, loadTasks: opts.LoadTasks,
 		configFile: p.ConfigFile(), bus: newBus(log), sshControlDir: p.SSHControlDir(),
 		versions: map[string]string{}, deleting: map[string]bool{},
 		dirty: map[string]struct{}{}, dirtyWake: make(chan struct{}, 1),
 		lastChecks: map[string]api.TargetCheck{}, checkEpoch: map[string]uint64{},
 	}
-	for _, e := range tasks {
-		d.versions[e.ID] = d.fileVersion(e)
+	if opts.LoadTasks != nil {
+		for _, e := range tasks {
+			d.versions[e.ID] = d.fileVersion(e)
+		}
+	} else {
+		for i, e := range tasks {
+			d.versions[e.ID] = pinned[i]
+		}
 	}
 	log.Info("config loaded", "targets", d.targetNames(), "tasks", len(tasks))
 	for _, e := range tasks {

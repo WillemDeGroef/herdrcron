@@ -89,7 +89,8 @@ type reloadRead struct {
 	resulting config.Config
 
 	entries []config.TaskEntry
-	// entryVersions[i] is the file version of entries[i].
+	// entryVersions[i] is the version of the bytes entries[i] was parsed
+	// from, not a later read of the file.
 	entryVersions []string
 }
 
@@ -109,12 +110,22 @@ func (d *daemon) readForReload() (reloadRead, error) {
 		r.resulting = overlayConfig(r.cur, r.next, r.deferred)
 	}
 	var err error
-	if r.entries, err = d.loadTasks(d.configDir, r.resulting); err != nil {
-		return reloadRead{}, err
+	if d.loadTasks != nil {
+		// Test stand-in. It returns the entries; the version is whatever
+		// the files hold once it returns. Production hashes the bytes it
+		// parsed (SnapshotTasks) so a write during the read cannot be
+		// stored under the new hash: the watcher would then skip it.
+		if r.entries, err = d.loadTasks(d.configDir, r.resulting); err != nil {
+			return reloadRead{}, err
+		}
+		r.entryVersions = make([]string, len(r.entries))
+		for i, e := range r.entries {
+			r.entryVersions[i] = d.fileVersion(e)
+		}
+		return r, nil
 	}
-	r.entryVersions = make([]string, len(r.entries))
-	for i, e := range r.entries {
-		r.entryVersions[i] = d.fileVersion(e)
+	if r.entries, r.entryVersions, err = config.SnapshotTasks(d.configDir, r.resulting); err != nil {
+		return reloadRead{}, err
 	}
 	return r, nil
 }
@@ -152,7 +163,9 @@ func (d *daemon) applyReadLocked(ctx context.Context, r reloadRead) (res any, ap
 		Tasks:           make([]api.TaskSummary, 0, len(r.entries)),
 		RestartRequired: len(r.deferred) > 0, DeferredTargets: r.deferred,
 	}
-	// Every version first: publishTaskLocked sends the task's.
+	// Versions go in before the events. Publish every change before building
+	// the response: a summary error must not skip one, because the versions
+	// are already the new ones and the next reload would not send it either.
 	for i, e := range r.entries {
 		d.versions[e.ID] = r.entryVersions[i]
 	}
@@ -161,16 +174,18 @@ func (d *daemon) applyReadLocked(ctx context.Context, r reloadRead) (res any, ap
 			logTask(d.log, e)
 			d.publishTaskLocked(ctx, i)
 		}
-		s, err := d.summary(ctx, e)
-		if err != nil {
-			return nil, true, err
-		}
-		out.Tasks = append(out.Tasks, s)
 	}
 	for id := range old {
 		if _, ok := d.versions[id]; !ok {
 			d.publishDeleted(id)
 		}
+	}
+	for _, e := range r.entries {
+		s, err := d.summary(ctx, e)
+		if err != nil {
+			return nil, true, err
+		}
+		out.Tasks = append(out.Tasks, s)
 	}
 	d.log.Info("reloaded", "tasks", len(r.entries), "restart_required", out.RestartRequired, "deferred_targets", r.deferred)
 	if r.cfgErr != nil {
