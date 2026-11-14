@@ -42,7 +42,7 @@ var ErrNotFound = errors.New("not found")
 
 // schemaVersion is stored in PRAGMA user_version so later versions can
 // migrate the schema.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // schema creates the tables if they are missing.
 const schema = `
@@ -84,7 +84,11 @@ CREATE TABLE IF NOT EXISTS queued_fires (
 	pending      INTEGER NOT NULL -- 1: waits for the task's active run.
 );
 CREATE TABLE IF NOT EXISTS pending_cleanups (
-	run_id TEXT PRIMARY KEY -- An ended run whose tab may still be open.
+	run_id        TEXT PRIMARY KEY, -- An ended run whose tab may still be open.
+	-- How far the cleanup got (since schema version 3), see PendingCleanup.
+	closing       INTEGER NOT NULL DEFAULT 0,
+	pane_replaced INTEGER NOT NULL DEFAULT 0,
+	output_tail   TEXT
 );
 `
 
@@ -155,18 +159,35 @@ func migrate(db *sql.DB) error {
 	// The column is looked up, not assumed missing: a daemon that died
 	// between the ALTER and the version write must still open.
 	if version < 2 {
-		var n int
-		err := db.QueryRow("SELECT count(*) FROM pragma_table_info('runs') WHERE name = 'herdr_terminal'").Scan(&n)
-		if err != nil {
+		if err := addColumn(db, "runs", "herdr_terminal", "TEXT"); err != nil {
 			return err
 		}
-		if n == 0 {
-			if _, err := db.Exec("ALTER TABLE runs ADD COLUMN herdr_terminal TEXT"); err != nil {
+	}
+	// Version 3 added the progress columns of pending_cleanups, in the same
+	// way.
+	if version < 3 {
+		for _, c := range [][2]string{
+			{"closing", "INTEGER NOT NULL DEFAULT 0"},
+			{"pane_replaced", "INTEGER NOT NULL DEFAULT 0"},
+			{"output_tail", "TEXT"},
+		} {
+			if err := addColumn(db, "pending_cleanups", c[0], c[1]); err != nil {
 				return err
 			}
 		}
 	}
 	_, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion))
+	return err
+}
+
+// addColumn adds the column to the table unless it is already there.
+func addColumn(db *sql.DB, table, column, decl string) error {
+	var n int
+	err := db.QueryRow("SELECT count(*) FROM pragma_table_info(?) WHERE name = ?", table, column).Scan(&n)
+	if err != nil || n > 0 {
+		return err
+	}
+	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + decl)
 	return err
 }
 
@@ -349,15 +370,81 @@ func (s *Store) SetPendingCleanup(ctx context.Context, runID string, pending boo
 	return nil
 }
 
-// ListPendingCleanups returns the runs with a pending cleanup, oldest
-// first.
-func (s *Store) ListPendingCleanups(ctx context.Context) ([]Run, error) {
-	runs, err := s.queryRuns(ctx, `SELECT `+runColumns+` FROM runs
-		WHERE id IN (SELECT run_id FROM pending_cleanups) ORDER BY started_at, id`)
+// PendingCleanup is an ended run whose stop could not reach its target, and
+// how far a later try to finish that stop got.
+type PendingCleanup struct {
+	Run
+	// Closing is set just before the cleanup closes the run's tab. If the
+	// daemon dies before it stores the outcome, the next daemon knows that
+	// the stop keys were sent and that a missing tab was closed by it.
+	Closing bool
+	// PaneReplaced: the cleanup found a new shell under the run's pane id
+	// and sent it no keys. Only meaningful with Closing.
+	PaneReplaced bool
+	// Tail is the pane output the cleanup read before closing the tab.
+	// Only meaningful with Closing.
+	Tail string
+}
+
+// MarkCleanupClosing records that the pending cleanup of the run is about
+// to close the run's tab (see PendingCleanup). It does nothing for a run
+// without a pending cleanup.
+func (s *Store) MarkCleanupClosing(ctx context.Context, runID string, paneReplaced bool, tail string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE pending_cleanups
+		SET closing = 1, pane_replaced = ?, output_tail = ? WHERE run_id = ?`, paneReplaced, tail, runID)
+	if err != nil {
+		return fmt.Errorf("mark cleanup of run %s closing: %w", runID, err)
+	}
+	return nil
+}
+
+// ListPendingCleanups returns the pending cleanups, oldest run first.
+func (s *Store) ListPendingCleanups(ctx context.Context) ([]PendingCleanup, error) {
+	cleanups, err := s.listPendingCleanups(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list pending cleanups: %w", err)
 	}
-	return runs, nil
+	return cleanups, nil
+}
+
+func (s *Store) listPendingCleanups(ctx context.Context) ([]PendingCleanup, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, closing, pane_replaced, output_tail FROM pending_cleanups`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	progress := map[string]PendingCleanup{}
+	for rows.Next() {
+		var (
+			id   string
+			c    PendingCleanup
+			tail sql.NullString
+		)
+		if err := rows.Scan(&id, &c.Closing, &c.PaneReplaced, &tail); err != nil {
+			return nil, err
+		}
+		c.Tail = tail.String
+		progress[id] = c
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Closed before the next query: the store has one connection.
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	runs, err := s.queryRuns(ctx, `SELECT `+runColumns+` FROM runs
+		WHERE id IN (SELECT run_id FROM pending_cleanups) ORDER BY started_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	cleanups := make([]PendingCleanup, 0, len(runs))
+	for _, run := range runs {
+		c := progress[run.ID] // zero for a cleanup recorded in between
+		c.Run = run
+		cleanups = append(cleanups, c)
+	}
+	return cleanups, nil
 }
 
 // queryRuns runs a query that selects runColumns.
