@@ -99,7 +99,7 @@ Validation on load and on every write: `id` matches `^[a-z0-9][a-z0-9-]{0,62}$`;
 | `exit_reason` | TEXT | Short human text, for example `timeout after 2h` |
 | `output_tail` | TEXT | Last 200 lines of pane output at the end of the run |
 
-Run states: `starting`, `running`, `blocked`, `done`, `failed`, `timeout`, `stopped`, `lost` (pane no longer exists), `host_unreachable`.
+Run states: `starting`, `running`, `blocked`, `done`, `failed`, `timeout`, `stopped`, `lost` (pane no longer exists), `host_unreachable`, `dropped` (a queued fire that was discarded before it started, for example because its target or task was removed; `exit_reason` says why. The row has no herdr ids, and `started_at` and `ended_at` are both the time of the drop).
 
 Table `task_state` holds per task: `last_run_id`, `next_fire_at`, `last_fire_at`. Keep runs for 90 days by default (`history_days` in config.yaml).
 
@@ -180,7 +180,7 @@ A `herdr` package on top of `Target` wraps the herdr CLI commands and parses JSO
 - Target unreachable during a stop (step 10): end the run at once with its status (`stopped` or `timeout`) and add `; target unreachable, tab may still be open` to `exit_reason`. Remember the run (table `pending_cleanups`, kept across a daemon restart) and run step 10 on the target when it answers again; `exit_reason` then ends in `; tab closed after the target came back` (or `tab was gone` / `tab could not be closed`). This does not notify a second time.
 - Target unreachable at fire time: record a run with status `host_unreachable`; apply `missed` when the target answers.
 - Launch reply lost (the target dropped after it accepted `pane run`): the run is recorded `host_unreachable` with the reason `launch not confirmed`. When the target answers, and before any catch-up, look for the run's pane in its `hc-` tab. If it is there, the agent did start: adopt the run as `running` and track it from step 7; it takes the place of the catch-up run. If the target cannot be asked, start nothing yet. An on-time fire makes the same check first, so the task's overlap applies to the adopted run.
-- Concurrency: one worker per target; at most `max_parallel` active runs per target (default 4). Fires above the limit wait in a per-target queue. Waiting fires (this queue and the one pending fire of `overlap: queue`) are stored in table `queued_fires` and wait again after a daemon restart; a fire whose task is gone or invalid by then, or a schedule or catch-up fire older than `catch_up_window`, is dropped with a log line.
+- Concurrency: one worker per target; at most `max_parallel` active runs per target (default 4). Fires above the limit wait in a per-target queue. Waiting fires (this queue and the one pending fire of `overlap: queue`) are stored in table `queued_fires` and wait again after a daemon restart; a fire whose task is gone or invalid by then, or a schedule or catch-up fire older than `catch_up_window`, is dropped. So is a waiting fire whose target a reload removed, and one whose task was deleted or made invalid before it could start. Every dropped fire gets a row in the run history with state `dropped` and the reason in `exit_reason`, so the task's history shows it; no notification is sent. At shutdown the daemon starts no more waiting fires: they stay in `queued_fires` for the next start.
 - Every herdr call has a 30 s context timeout.
 
 ## Daemon API

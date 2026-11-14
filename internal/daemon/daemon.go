@@ -173,7 +173,12 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		OnAmend:        d.runAmended,
 		OnTargetChange: d.targetChanged,
 	})
-	d.disp = dispatch.New(dispatch.Options{Runs: latestDef{d}, Store: st, Config: cfg, Log: log})
+	d.disp = dispatch.New(dispatch.Options{
+		Runs: latestDef{d}, Store: st, Config: cfg, Log: log, Now: clk.Now,
+		// A dropped fire is a new row in the task's history, not a run
+		// that changed state: publish it without a notification.
+		OnDropped: d.runAmended,
+	})
 	d.sched = scheduler.New(scheduler.Options{
 		Clock: clk, Store: st, Runs: d.disp, Adopt: d.runner, Config: cfg, Log: log,
 		OnPauseExpired: d.pauseExpired,
@@ -271,6 +276,8 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	}()
 	err = srv.Serve(ctx, ln)
 	cancel()
+	// Fires that still wait stay in queued_fires for the next daemon.
+	d.disp.Stop()
 	<-schedDone
 	<-runnerDone
 	<-watchDone
