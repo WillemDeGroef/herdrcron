@@ -48,6 +48,20 @@ func (d *daemon) fileVersion(e config.TaskEntry) string {
 	return v
 }
 
+// setVersionLocked records v as the version of task id's files as loaded.
+// The caller holds d.mu.
+func (d *daemon) setVersionLocked(id, v string) {
+	d.versions[id] = v
+	d.tasksGen++
+}
+
+// dropVersionLocked forgets the version of a task that is gone. The caller
+// holds d.mu.
+func (d *daemon) dropVersionLocked(id string) {
+	delete(d.versions, id)
+	d.tasksGen++
+}
+
 // liveState is the display state from the task's active runs: blocked,
 // running, or "" with none.
 func (d *daemon) liveState(id string) string {
@@ -258,7 +272,7 @@ func (d *daemon) tasksUpdate(ctx context.Context, params json.RawMessage) (any, 
 // started with.
 func (d *daemon) storedLocked(ctx context.Context, e config.TaskEntry) (api.TaskDetail, error) {
 	logTask(d.log, e)
-	d.versions[e.ID] = d.fileVersion(e)
+	d.setVersionLocked(e.ID, d.fileVersion(e))
 	d.rescheduleLocked(ctx)
 	d.publishTaskLocked(ctx, d.find(e.ID))
 	return d.detailLocked(ctx, e)
@@ -319,7 +333,7 @@ func (d *daemon) tasksDelete(ctx context.Context, params json.RawMessage) (any, 
 		return nil, fmt.Errorf("remove task file: %w", err)
 	}
 	d.tasks = slices.Delete(d.tasks, i, i+1)
-	delete(d.versions, p.ID)
+	d.dropVersionLocked(p.ID)
 	if promptKnown {
 		d.removeUnusedPromptLocked(p.ID, promptPath)
 	}
@@ -580,7 +594,7 @@ func (d *daemon) reloadOneLocked(ctx context.Context, id string) {
 			return
 		}
 		d.tasks = slices.Delete(d.tasks, i, i+1)
-		delete(d.versions, id)
+		d.dropVersionLocked(id)
 		d.rescheduleLocked(ctx)
 		d.log.Info("task file removed", logging.KeyTaskID, id)
 		d.publishDeleted(id)
@@ -596,7 +610,7 @@ func (d *daemon) reloadOneLocked(ctx context.Context, id string) {
 	} else {
 		d.insertLocked(e)
 	}
-	d.versions[id] = v
+	d.setVersionLocked(id, v)
 	d.log.Info("task file changed on disk", logging.KeyTaskID, id)
 	logTask(d.log, e)
 	d.rescheduleLocked(ctx)

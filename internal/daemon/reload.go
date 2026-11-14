@@ -13,96 +13,171 @@ import (
 
 // reload serves "reload": it re-reads config.yaml and every task file.
 //
-// A changed config.yaml is applied to the running daemon (applyNewConfig)
-// only after the task files have been read against the config that would
-// result. A failure to read them leaves the running config as it is. The
-// one part that can wait is a target with active runs: see
-// api.ReloadResult. A config.yaml that does not parse changes nothing in
-// the running config; the task files still reload, and the call then fails
-// with that error.
+// A changed config.yaml is applied to the running daemon only after the
+// task files have been read against the config that would result. A
+// failure to read them leaves the running config as it is. The one part
+// that can wait is a target with active runs: see api.ReloadResult. A
+// config.yaml that does not parse changes nothing in the running config;
+// the task files still reload, and the call then fails with that error.
+//
+// The files are read without d.mu (readForReload) and the result is
+// applied with it (applyReadLocked). A config directory on a filesystem
+// that stopped answering, a network mount for one, would otherwise hold
+// d.mu for as long as the read hangs, and with it every API call that
+// lists or changes tasks, the start of every run (currentTask) and the
+// task.changed events: the daemon would look dead to the CLI and the TUI
+// and miss its fires. A read that hangs holds up only its own reload.
+//
+// What happened during the read can make it out of date: a task written
+// through the API, a hand edit the watcher reloaded, another reload, a run
+// that started or ended on a target config.yaml changes. applyReadLocked
+// then applies nothing and the files are read again.
 func (d *daemon) reload(ctx context.Context, _ json.RawMessage) (any, error) {
-	d.mu.Lock()
-	res, err := d.reloadLocked(ctx)
-	d.mu.Unlock()
+	res, err := d.reloadFiles(ctx)
 	// A higher max_parallel leaves room for fires that waited. Not under
 	// d.mu: a run that starts calls back into the daemon.
 	d.disp.Drain(ctx)
 	return res, err
 }
 
-// reloadLocked is reload with d.mu held, without the drain. The result is
-// nil when err is not.
-func (d *daemon) reloadLocked(ctx context.Context) (any, error) {
-	cur := d.config()
-	var deferred []string
-	fileCfg, cfgErr := config.Load(d.configFile)
-	var entries []config.TaskEntry
-	var err error
-	if cfgErr == nil && !reflect.DeepEqual(fileCfg, cur) {
-		entries, _, deferred, err = d.applyNewConfig(cur, fileCfg)
-	} else {
-		entries, err = config.LoadTasks(d.configDir, cur)
-	}
-	if err != nil {
-		return nil, err
-	}
-	old := map[string]string{}
-	for _, e := range d.tasks {
-		old[e.ID] = d.versions[e.ID]
-	}
-	d.tasks = entries
-	d.rescheduleLocked(ctx)
-	res := api.ReloadResult{
-		Tasks:           make([]api.TaskSummary, 0, len(entries)),
-		RestartRequired: len(deferred) > 0, DeferredTargets: deferred,
-	}
-	for i, e := range entries {
-		v := d.fileVersion(e)
-		d.versions[e.ID] = v
-		if prev, ok := old[e.ID]; !ok || prev != v {
-			logTask(d.log, e)
-			d.publishTaskLocked(ctx, i)
-		}
-		delete(old, e.ID)
-		s, err := d.summary(ctx, e)
+// reloadAttempts is how often one "reload" reads the files before it
+// gives up. Each further attempt needs another change to land during the
+// read before it, so this is not reached in practice; the bound keeps a
+// reload from spinning if it ever is.
+const reloadAttempts = 5
+
+// reloadFiles is reload without the drain. The result is nil when err is
+// not.
+func (d *daemon) reloadFiles(ctx context.Context) (any, error) {
+	for range reloadAttempts {
+		read, err := d.readForReload()
 		if err != nil {
 			return nil, err
 		}
-		res.Tasks = append(res.Tasks, s)
+		d.mu.Lock()
+		res, applied, err := d.applyReadLocked(ctx, read)
+		d.mu.Unlock()
+		if applied {
+			return res, err
+		}
+		d.log.Info("reload read out of date, reading again")
 	}
-	for id := range old {
-		delete(d.versions, id)
-		d.publishDeleted(id)
-	}
-	d.log.Info("reloaded", "tasks", len(entries), "restart_required", res.RestartRequired, "deferred_targets", deferred)
-	if cfgErr != nil {
-		d.log.Error("config.yaml not applied", "err", cfgErr)
-		return nil, &api.Error{Code: api.CodeInternalError, Message: "config.yaml: " + cfgErr.Error()}
-	}
-	return res, nil
+	return nil, &api.Error{Code: api.CodeInternalError,
+		Message: "reload: tasks and runs kept changing while the files were read; try again"}
 }
 
-// applyNewConfig makes next, config.yaml as just loaded, the running
-// config in place of cur. Task files are loaded against the config that
-// would result, including targets whose change waits because they have
-// active runs, and next is published only when that load succeeds. Every
-// setting applies at once, except a target with active runs whose host,
-// shell or herdr_path changed, or that is gone from next: it keeps its old
-// settings (only max_parallel follows next) and is named in deferred. The
-// caller holds d.mu and reschedules the tasks afterwards, so a new timezone
-// reaches their next fire.
-func (d *daemon) applyNewConfig(cur, next config.Config) (entries []config.TaskEntry, running config.Config, deferred []string, err error) {
-	deferred, err = d.runner.ReconfigureAfter(next, d.newTarget, func(def []string) error {
-		var loadErr error
-		entries, loadErr = config.LoadTasks(d.configDir, overlayConfig(cur, next, def))
-		return loadErr
-	})
-	if err != nil {
-		return nil, cur, nil, err
+// reloadRead is config.yaml and the task files as one "reload" read them,
+// with what the daemon looked like when the read began.
+type reloadRead struct {
+	// cur is the running config and gen is d.tasksGen when the read began.
+	// The read is applied only if gen still holds: no task and no config
+	// has changed in the daemon since.
+	cur config.Config
+	gen uint64
+
+	// next is config.yaml as read and cfgErr why it could not be. replace
+	// is set when next is to take the place of cur.
+	next    config.Config
+	cfgErr  error
+	replace bool
+	// deferred are the targets that would keep their old settings, as the
+	// runner said during the read. resulting is the config the daemon runs
+	// with once the read is applied: next with those targets as cur has
+	// them, or cur itself when replace is not set. The entries were
+	// validated against it.
+	deferred  []string
+	resulting config.Config
+
+	entries []config.TaskEntry
+	// entryVersions[i] is the file version of entries[i].
+	entryVersions []string
+}
+
+// readForReload reads config.yaml and the task files. It changes nothing
+// in the daemon and must be called without d.mu: this is the part of a
+// reload that can hang on a slow filesystem.
+func (d *daemon) readForReload() (reloadRead, error) {
+	d.mu.Lock()
+	r := reloadRead{cur: d.config(), gen: d.tasksGen}
+	d.mu.Unlock()
+
+	r.resulting = r.cur
+	r.next, r.cfgErr = config.Load(d.configFile)
+	if r.cfgErr == nil && !reflect.DeepEqual(r.next, r.cur) {
+		r.replace = true
+		r.deferred = d.runner.WouldDefer(r.next)
+		r.resulting = overlayConfig(r.cur, r.next, r.deferred)
 	}
-	running = overlayConfig(cur, next, deferred)
-	d.installConfig(cur, running)
-	return entries, running, deferred, nil
+	var err error
+	if r.entries, err = d.loadTasks(d.configDir, r.resulting); err != nil {
+		return reloadRead{}, err
+	}
+	r.entryVersions = make([]string, len(r.entries))
+	for i, e := range r.entries {
+		r.entryVersions[i] = d.fileVersion(e)
+	}
+	return r, nil
+}
+
+// applyReadLocked makes r the daemon's tasks and, when config.yaml
+// changed, its config, all under one hold of d.mu: nobody sees the new
+// config with the old tasks or the other way round. Every setting applies
+// at once, except a target with active runs whose host, shell or
+// herdr_path changed, or that is gone from config.yaml: it keeps its old
+// settings (only max_parallel follows) and is named in the result.
+//
+// applied is false, and nothing has changed, when r is out of date: a
+// task or the config changed in the daemon after the read began (tasksGen
+// moved), or the runner would no longer defer the targets r was validated
+// for. The caller reads again. It reads no config or task file; the caller
+// holds d.mu.
+func (d *daemon) applyReadLocked(ctx context.Context, r reloadRead) (res any, applied bool, err error) {
+	if d.tasksGen != r.gen {
+		return nil, false, nil
+	}
+	if r.replace {
+		// The last check, and the one step that can still refuse: after it
+		// the runner has the new targets and the rest must follow.
+		if _, ok := d.runner.ReconfigureIf(r.next, d.newTarget, r.deferred); !ok {
+			return nil, false, nil
+		}
+		d.installConfig(r.cur, r.resulting)
+	}
+	old := d.versions
+	d.tasks = r.entries
+	d.versions = make(map[string]string, len(r.entries))
+	d.tasksGen++
+	d.rescheduleLocked(ctx)
+	out := api.ReloadResult{
+		Tasks:           make([]api.TaskSummary, 0, len(r.entries)),
+		RestartRequired: len(r.deferred) > 0, DeferredTargets: r.deferred,
+	}
+	// Every version first: publishTaskLocked sends the task's.
+	for i, e := range r.entries {
+		d.versions[e.ID] = r.entryVersions[i]
+	}
+	for i, e := range r.entries {
+		if prev, ok := old[e.ID]; !ok || prev != r.entryVersions[i] {
+			logTask(d.log, e)
+			d.publishTaskLocked(ctx, i)
+		}
+		s, err := d.summary(ctx, e)
+		if err != nil {
+			return nil, true, err
+		}
+		out.Tasks = append(out.Tasks, s)
+	}
+	for id := range old {
+		if _, ok := d.versions[id]; !ok {
+			d.publishDeleted(id)
+		}
+	}
+	d.log.Info("reloaded", "tasks", len(r.entries), "restart_required", out.RestartRequired, "deferred_targets", r.deferred)
+	if r.cfgErr != nil {
+		d.log.Error("config.yaml not applied", "err", r.cfgErr)
+		return nil, true, &api.Error{Code: api.CodeInternalError, Message: "config.yaml: " + r.cfgErr.Error()}
+	}
+	return out, true, nil
 }
 
 // overlayConfig is next with each deferred target put back as cur had it,
@@ -124,7 +199,7 @@ func overlayConfig(cur, next config.Config, deferred []string) config.Config {
 }
 
 // installConfig publishes running to the daemon's collaborators. The runner
-// already has it (ReconfigureAfter). The caller holds d.mu.
+// already has it (ReconfigureIf). The caller holds d.mu.
 func (d *daemon) installConfig(cur, running config.Config) {
 	d.cfgMu.Lock()
 	d.cfg = running

@@ -38,6 +38,9 @@ type Options struct {
 	// Targets, if set, replaces the real targets by name; tests use it to
 	// run without herdr.
 	Targets map[string]target.Target
+	// LoadTasks, if set, reads the task files in place of config.LoadTasks;
+	// tests use it to stand in for a filesystem that stopped answering.
+	LoadTasks func(configDir string, cfg config.Config) ([]config.TaskEntry, error)
 }
 
 type daemon struct {
@@ -63,6 +66,9 @@ type daemon struct {
 	// newTarget builds the target of a config.yaml entry; nil leaves the
 	// target out.
 	newTarget func(name string, tc config.Target) target.Target
+	// loadTasks reads every task file: config.LoadTasks, or the stand-in
+	// of Options.LoadTasks.
+	loadTasks func(configDir string, cfg config.Config) ([]config.TaskEntry, error)
 
 	// mu guards tasks, versions, deleting and globalPause, and serialises
 	// task file writes. Lock order: mu, then the scheduler's lock. Never
@@ -74,6 +80,12 @@ type daemon struct {
 	// watcher event whose files still have it (the daemon's own write)
 	// changes nothing.
 	versions map[string]string
+	// tasksGen counts the changes to tasks and versions: every task
+	// written, reloaded or removed, and every "reload" applied. A reload
+	// reads the files without mu and applies its read only if tasksGen is
+	// still what it was when the read began (reload.go). versions cannot
+	// tell: a task changed and changed back has the version it had.
+	tasksGen uint64
 	// deleting holds tasks being deleted; the watcher leaves them alone.
 	deleting map[string]bool
 
@@ -122,7 +134,11 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 		log.Error("config invalid", "err", err)
 		return err
 	}
-	tasks, err := config.LoadTasks(p.ConfigDir, cfg)
+	loadTasks := opts.LoadTasks
+	if loadTasks == nil {
+		loadTasks = config.LoadTasks
+	}
+	tasks, err := loadTasks(p.ConfigDir, cfg)
 	if err != nil {
 		log.Error("cannot load tasks", "err", err)
 		return err
@@ -139,7 +155,7 @@ func Run(ctx context.Context, p paths.Paths, opts Options) error {
 	}
 	d := &daemon{
 		version: opts.Version, started: time.Now(), configDir: p.ConfigDir,
-		cfg: cfg, tasks: tasks, store: st, clk: clk, log: log,
+		cfg: cfg, tasks: tasks, store: st, clk: clk, log: log, loadTasks: loadTasks,
 		configFile: p.ConfigFile(), bus: newBus(log), sshControlDir: p.SSHControlDir(),
 		versions: map[string]string{}, deleting: map[string]bool{},
 		dirty: map[string]struct{}{}, dirtyWake: make(chan struct{}, 1),

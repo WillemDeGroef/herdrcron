@@ -264,37 +264,27 @@ func (r *Runner) Reconfigure(cfg config.Config, newTarget func(name string, tc c
 	return r.reconfigureLocked(cfg, newTarget)
 }
 
-// ReconfigureAfter is Reconfigure, but prepare runs once the deferred set
-// is known and before the runner changes. The daemon uses it to load task
-// files against the config it is about to publish: a non-nil error from
-// prepare leaves the runner unchanged. prepare may run again when a run
-// ends while it reads (the deferred set shrank). The caller must hold off
-// new runs for the duration — a run that starts and ends in between would
-// make prepare repeat without end. Passing a nil prepare is Reconfigure.
-func (r *Runner) ReconfigureAfter(cfg config.Config, newTarget func(name string, tc config.Target) target.Target, prepare func(deferred []string) error) (deferred []string, err error) {
-	if prepare == nil {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		return r.reconfigureLocked(cfg, newTarget), nil
+// WouldDefer is the deferred set Reconfigure would return for cfg right
+// now, without changing anything. The daemon reads the task files against
+// the config that set gives, then hands the set to ReconfigureIf.
+func (r *Runner) WouldDefer(cfg config.Config) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.wouldDeferLocked(cfg)
+}
+
+// ReconfigureIf is Reconfigure when the deferred set is still expect, the
+// answer WouldDefer gave earlier. A run that started or ended since can
+// have changed the set: then nothing changes, ok is false and current is
+// the set as it is now. The check and the change are one step under the
+// runner's lock, so what the caller prepared for expect is what applies.
+func (r *Runner) ReconfigureIf(cfg config.Config, newTarget func(name string, tc config.Target) target.Target, expect []string) (current []string, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if current = r.wouldDeferLocked(cfg); !slices.Equal(current, expect) {
+		return current, false
 	}
-	for {
-		r.mu.Lock()
-		deferred = r.wouldDeferLocked(cfg)
-		r.mu.Unlock()
-		if err = prepare(deferred); err != nil {
-			return nil, err
-		}
-		r.mu.Lock()
-		// A run can have ended during prepare. Starting one cannot: the
-		// caller is holding that off. The set only shrinks, so this ends.
-		if now := r.wouldDeferLocked(cfg); !slices.Equal(deferred, now) {
-			r.mu.Unlock()
-			continue
-		}
-		deferred = r.reconfigureLocked(cfg, newTarget)
-		r.mu.Unlock()
-		return deferred, nil
-	}
+	return r.reconfigureLocked(cfg, newTarget), true
 }
 
 // wouldDeferLocked is the deferred set Reconfigure would return for cfg.
