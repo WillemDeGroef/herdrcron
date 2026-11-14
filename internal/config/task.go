@@ -149,6 +149,80 @@ func LoadTasks(configDir string, cfg Config) ([]TaskEntry, error) {
 	return entries, nil
 }
 
+// SnapshotTasks is LoadTasks plus the version of the bytes each entry was
+// parsed from (the same hash as Version). The task file is read once and
+// the prompt once, and that is what the version covers: a write that lands
+// after the read changes Version but not this result, so a watcher can
+// still tell the file moved. versions[i] belongs to entries[i]. A missing
+// prompt counts as empty; a task file that cannot be read has version "".
+func SnapshotTasks(configDir string, cfg Config) ([]TaskEntry, []string, error) {
+	dir := filepath.Join(configDir, "tasks")
+	files, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("read tasks directory: %w", err)
+	}
+	pinned := make([]pinnedTask, 0, len(files))
+	for _, f := range files {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".yaml") {
+			continue
+		}
+		id := strings.TrimSuffix(f.Name(), ".yaml")
+		pinned = append(pinned, snapshotTask(configDir, id, filepath.Join(dir, f.Name()), cfg))
+	}
+	sort.Slice(pinned, func(i, j int) bool { return pinned[i].entry.ID < pinned[j].entry.ID })
+	entries := make([]TaskEntry, len(pinned))
+	versions := make([]string, len(pinned))
+	for i, p := range pinned {
+		entries[i] = p.entry
+		versions[i] = p.version
+	}
+	return entries, versions, nil
+}
+
+// pinnedTask is one task file and the version of the bytes it was read from.
+type pinnedTask struct {
+	entry   TaskEntry
+	version string
+}
+
+// snapshotTask reads path once and hashes those bytes with the prompt they
+// name. The entry matches LoadTask.
+func snapshotTask(configDir, id, path string, cfg Config) pinnedTask {
+	e := TaskEntry{ID: id, File: path}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		e.Err = fmt.Errorf("read task file: %w", err)
+		return pinnedTask{entry: e}
+	}
+	e.Task, e.Err = loadTaskBytes(data, id, configDir, cfg)
+	promptPath := versionPromptPath(e, data, configDir)
+	prompt, err := os.ReadFile(promptPath)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return pinnedTask{entry: e}
+	}
+	return pinnedTask{entry: e, version: hashVersion(data, prompt)}
+}
+
+// versionPromptPath is the prompt file Version would hash for e, decided
+// from taskBytes rather than by reading the task file again. A lenient
+// parse wins when the entry is invalid, as the daemon does for the version
+// it stores after its own writes.
+func versionPromptPath(e TaskEntry, taskBytes []byte, configDir string) string {
+	pf := e.Task.PromptFile
+	if e.Err != nil {
+		if t, err := readTaskBytes(taskBytes, e.ID, false); err == nil {
+			pf = t.PromptFile
+		}
+	}
+	if pf == "" {
+		pf = DefaultTask(e.ID).PromptFile
+	}
+	return PromptPath(pf, configDir)
+}
+
 // DefaultTask is a task with the spec's defaults for every optional field
 // and the default prompt file, prompts/<id>.md.
 func DefaultTask(id string) Task {
@@ -178,7 +252,15 @@ func NewTask(id string) Task {
 func defaultPromptFile(fileID string) string { return filepath.Join("prompts", fileID+".md") }
 
 func loadTask(path, fileID, configDir string, cfg Config) (Task, error) {
-	t, err := readTask(path, fileID, true)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Task{}, fmt.Errorf("read task file: %w", err)
+	}
+	return loadTaskBytes(data, fileID, configDir, cfg)
+}
+
+func loadTaskBytes(data []byte, fileID, configDir string, cfg Config) (Task, error) {
+	t, err := readTaskBytes(data, fileID, true)
 	if err != nil {
 		return Task{}, err
 	}
@@ -199,6 +281,10 @@ func readTask(path, fileID string, strict bool) (Task, error) {
 	if err != nil {
 		return Task{}, fmt.Errorf("read task file: %w", err)
 	}
+	return readTaskBytes(data, fileID, strict)
+}
+
+func readTaskBytes(data []byte, fileID string, strict bool) (Task, error) {
 	t := DefaultTask(fileID)
 	t.ID = "" // the id must come from the file
 	dec := yaml.NewDecoder(bytes.NewReader(data))
