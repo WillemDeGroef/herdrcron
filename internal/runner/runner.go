@@ -181,6 +181,11 @@ type activeRun struct {
 	task config.Task
 	log  *slog.Logger
 
+	// The prompt text for the launch, read when the start was decided, or
+	// why it could not be read. Immutable.
+	prompt    []byte
+	promptErr error
+
 	// Under Runner.mu.
 	stopping bool          // a stop sequence was started; polls skip the run
 	ended    bool          // the run's end was stored
@@ -417,7 +422,29 @@ func sameTarget(a, b config.Target) bool {
 // the agent in a new hc- tab, and returns the run as running. A run that
 // cannot start is stored as failed with the reason, and returned without
 // an error; the error is for a run that could not be stored at all.
+//
+// Start reads the prompt file itself, before anything else. A caller that
+// can read it together with the task definition uses StartWithPrompt, so an
+// edit that lands while the run starts cannot take the file away.
 func (r *Runner) Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
+	prompt, err := os.ReadFile(config.PromptPath(t.PromptFile, r.configDir))
+	if err != nil {
+		err = fmt.Errorf("read prompt file %s: %w", t.PromptFile, err)
+	}
+	return r.start(ctx, t, prompt, err, trigger, scheduledAt)
+}
+
+// StartWithPrompt is Start with the prompt text given: the content of the
+// task's prompt file as it was when the caller decided to start t. The run
+// does not read the prompt file again, so the file may change or go away
+// while the run starts.
+func (r *Runner) StartWithPrompt(ctx context.Context, t config.Task, prompt []byte, trigger string, scheduledAt time.Time) (store.Run, error) {
+	return r.start(ctx, t, prompt, nil, trigger, scheduledAt)
+}
+
+// start is Start with the prompt already read; a non-nil promptErr fails
+// the run once it is stored.
+func (r *Runner) start(ctx context.Context, t config.Task, prompt []byte, promptErr error, trigger string, scheduledAt time.Time) (store.Run, error) {
 	now := r.clock.Now()
 	run := store.Run{
 		ID: store.NewRunID(now), TaskID: t.ID, Target: t.Target, Trigger: trigger,
@@ -426,7 +453,7 @@ func (r *Runner) Start(ctx context.Context, t config.Task, trigger string, sched
 	if err := r.store.InsertRun(ctx, run); err != nil {
 		return store.Run{}, err
 	}
-	a := &activeRun{run: run, task: t, log: logging.ForRun(r.log, run.ID, t.ID, t.Target)}
+	a := &activeRun{run: run, task: t, prompt: prompt, promptErr: promptErr, log: logging.ForRun(r.log, run.ID, t.ID, t.Target)}
 	r.mu.Lock()
 	r.starting[run.ID] = a
 	r.mu.Unlock()
@@ -473,10 +500,10 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(config.PromptPath(t.PromptFile, r.configDir))
-	if err != nil {
-		return fmt.Errorf("read prompt file %s: %w", t.PromptFile, err)
+	if a.promptErr != nil {
+		return a.promptErr
 	}
+	data := a.prompt
 
 	label, err := r.tabLabel(t)
 	if err != nil {

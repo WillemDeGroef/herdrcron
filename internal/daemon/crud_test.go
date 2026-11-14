@@ -863,3 +863,50 @@ func TestTasksCreateAndUpdateRefuseAPromptAboveTheArgumentLimit(t *testing.T) {
 		t.Errorf("prompt file = %q, want the short replacement", got)
 	}
 }
+
+// An update that moves the task to another prompt file while a run is in
+// preflight removes the old file. The run uses the prompt as it was when
+// the fire was decided; it does not fail because the file is gone.
+func TestUpdateDuringPreflightKeepsTheRunsPrompt(t *testing.T) {
+	l := newLifecycle(t, noon, "timeout: 1h\n")
+	l.start()
+	release := l.herdr.holdExec()
+	defer release()
+	c2, err := api.Dial(l.p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c2.Close() }()
+	type result struct {
+		res api.RunNowResult
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		var r result
+		r.err = c2.Call(context.Background(), api.MethodTasksRunNow, api.RunNowParams{ID: "job"}, &r.res)
+		done <- r
+	}()
+	select {
+	case <-l.herdr.execHeldCh():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run did not reach preflight")
+	}
+
+	movePrompt(t, l.c, "job", "prompts/moved.md", "second prompt")
+	if _, err := os.Stat(filepath.Join(l.p.ConfigDir, "prompts", "job.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old prompt file still exists (%v): the update did not swap it under the run", err)
+	}
+	release()
+
+	r := <-done
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if r.res.Status != "running" {
+		t.Fatalf("run = %+v, want running", r.res)
+	}
+	if got := l.herdr.putContents(); !slices.Equal(got, []string{"do the job"}) {
+		t.Errorf("prompt files written = %q, want the prompt from when the run was started", got)
+	}
+}
