@@ -1,8 +1,9 @@
 // Package store keeps the herdrcron daemon state in SQLite: one row per run
 // in table runs, per task scheduling state in table task_state, the global
 // pauses in table global_pause, the fires that wait for a run to end or for a
-// free slot in table queued_fires, and the ended runs whose tab may still be
-// open on their target in table pending_cleanups.
+// free slot in table queued_fires, the ended runs whose tab may still be
+// open on their target in table pending_cleanups, and the tab creates that
+// got no answer in table lost_creates.
 package store
 
 import (
@@ -152,7 +153,7 @@ func migrate(db *sql.DB) error {
 	if version > schemaVersion {
 		return fmt.Errorf("database schema version %d is newer than this herdrcron (%d)", version, schemaVersion)
 	}
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(schema + lostCreatesSchema); err != nil {
 		return err
 	}
 	// Version 2 added runs.herdr_terminal. CREATE TABLE IF NOT EXISTS
