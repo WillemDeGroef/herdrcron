@@ -606,17 +606,24 @@ func (d *daemon) reloadOneLocked(ctx context.Context, id string) {
 // currentTask is the dispatcher's view of a task when a run starts: the
 // definition as it is now, so an edit applies to the next run, also to a
 // fire that was queued before the edit.
-func (d *daemon) currentTask(t config.Task) (config.Task, error) {
+//
+// The prompt is read here, under d.mu, so it belongs to that definition: an
+// update or delete that lands while the run starts may replace or remove
+// the prompt file, and the run still has its text. promptErr is why the
+// file could not be read; the task is still returned.
+func (d *daemon) currentTask(t config.Task) (cur config.Task, prompt []byte, promptErr, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	i := d.find(t.ID)
 	switch {
 	case i < 0 || d.deleting[t.ID]:
-		return config.Task{}, fmt.Errorf("task %s was deleted", t.ID)
+		return config.Task{}, nil, nil, fmt.Errorf("task %s was deleted", t.ID)
 	case d.tasks[i].Err != nil:
-		return config.Task{}, fmt.Errorf("task %s is invalid: %v", t.ID, d.tasks[i].Err)
+		return config.Task{}, nil, nil, fmt.Errorf("task %s is invalid: %v", t.ID, d.tasks[i].Err)
 	}
-	return d.tasks[i].Task, nil
+	cur = d.tasks[i].Task
+	prompt, promptErr = os.ReadFile(config.PromptPath(cur.PromptFile, d.configDir))
+	return cur, prompt, promptErr, nil
 }
 
 // taskDef is the API form of a task.

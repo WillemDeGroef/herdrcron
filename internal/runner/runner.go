@@ -186,6 +186,11 @@ type activeRun struct {
 	task config.Task
 	log  *slog.Logger
 
+	// The prompt text for the launch, read when the start was decided, or
+	// why it could not be read. Immutable.
+	prompt    []byte
+	promptErr error
+
 	// Under Runner.mu.
 	stopping bool          // a stop sequence was started; polls skip the run
 	ended    bool          // the run's end was stored
@@ -261,6 +266,8 @@ func (r *Runner) config() config.Config {
 // targets that keep their old settings for that reason are returned,
 // sorted; a later call applies them once their runs have ended.
 // max_parallel is not the runner's and never defers a target.
+// The pending stops on a target that is gone from cfg are dropped (see
+// cleanup).
 func (r *Runner) Reconfigure(cfg config.Config, newTarget func(name string, tc config.Target) target.Target) (deferred []string) {
 	// Under mu, so no run can start on a target between the check for
 	// active runs and its replacement: Start registers the run before it
@@ -410,6 +417,7 @@ func (r *Runner) reconfigureLocked(cfg config.Config, newTarget func(name string
 			delete(r.workers, name)
 		}
 	}
+	r.dropCleanupsOfRemovedTargetsLocked()
 	slices.Sort(deferred)
 	return deferred
 }
@@ -448,7 +456,29 @@ func targetRemovedReason(name string) string {
 // an error; the error is for a run that could not be stored at all. A
 // target Reconfigure has removed is stored as dropped, and nothing is
 // launched. A target the runner never had stays a failed run.
+//
+// Start reads the prompt file itself, before anything else. A caller that
+// can read it together with the task definition uses StartWithPrompt, so an
+// edit that lands while the run starts cannot take the file away.
 func (r *Runner) Start(ctx context.Context, t config.Task, trigger string, scheduledAt time.Time) (store.Run, error) {
+	prompt, err := os.ReadFile(config.PromptPath(t.PromptFile, r.configDir))
+	if err != nil {
+		err = fmt.Errorf("read prompt file %s: %w", t.PromptFile, err)
+	}
+	return r.start(ctx, t, prompt, err, trigger, scheduledAt)
+}
+
+// StartWithPrompt is Start with the prompt text given: the content of the
+// task's prompt file as it was when the caller decided to start t. The run
+// does not read the prompt file again, so the file may change or go away
+// while the run starts.
+func (r *Runner) StartWithPrompt(ctx context.Context, t config.Task, prompt []byte, trigger string, scheduledAt time.Time) (store.Run, error) {
+	return r.start(ctx, t, prompt, nil, trigger, scheduledAt)
+}
+
+// start is Start with the prompt already read; a non-nil promptErr fails
+// the run once it is stored.
+func (r *Runner) start(ctx context.Context, t config.Task, prompt []byte, promptErr error, trigger string, scheduledAt time.Time) (store.Run, error) {
 	if r.target(t.Target) == nil && r.targetWasRemoved(t.Target) {
 		return r.recordTargetRemoved(ctx, t, trigger, scheduledAt)
 	}
@@ -460,7 +490,7 @@ func (r *Runner) Start(ctx context.Context, t config.Task, trigger string, sched
 	if err := r.store.InsertRun(ctx, run); err != nil {
 		return store.Run{}, err
 	}
-	a := &activeRun{run: run, task: t, log: logging.ForRun(r.log, run.ID, t.ID, t.Target)}
+	a := &activeRun{run: run, task: t, prompt: prompt, promptErr: promptErr, log: logging.ForRun(r.log, run.ID, t.ID, t.Target)}
 	r.mu.Lock()
 	r.starting[run.ID] = a
 	r.mu.Unlock()
@@ -546,10 +576,10 @@ func (r *Runner) launch(ctx context.Context, a *activeRun) error {
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(config.PromptPath(t.PromptFile, r.configDir))
-	if err != nil {
-		return fmt.Errorf("read prompt file %s: %w", t.PromptFile, err)
+	if a.promptErr != nil {
+		return a.promptErr
 	}
+	data := a.prompt
 
 	label, err := r.tabLabel(t)
 	if err != nil {
@@ -1300,7 +1330,7 @@ func (r *Runner) stop(ctx context.Context, a *activeRun, status, reason string) 
 		return a.run, err
 	}
 	a.log.Info("stopping run", "status", status, "exit_reason", reason)
-	tail, _, err := r.stopOnTarget(ctx, ts, a.log, a.run)
+	tail, _, err := r.stopOnTarget(ctx, ts, a.log, a.run, nil)
 	unreachable := errors.Is(err, target.ErrUnreachable)
 	if err != nil && !unreachable {
 		a.log.Warn("stop interrupted; run left open", "err", err)
@@ -1346,6 +1376,9 @@ const (
 	reasonTabClosed    = "; tab closed after the target came back"
 	reasonTabGone      = "; tab was gone when the target came back"
 	reasonTabNotClosed = "; tab could not be closed after the target came back"
+	// The pending stop was dropped: nothing closes the tab any more.
+	reasonTargetRemoved = "; target removed from config, tab not closed"
+	reasonTargetExpired = "; target did not come back within history_days, tab not closed"
 )
 
 // stopOnTarget is the part of step 10 that runs on the target, as adapted
@@ -1360,7 +1393,11 @@ const (
 // still be open, and the target is marked unreachable. The tail is
 // returned with it if it was read before the target dropped. Any other error is
 // ctx's, during a wait. Other key, read and close errors are logged only.
-func (r *Runner) stopOnTarget(ctx context.Context, ts *targetState, log *slog.Logger, run store.Run) (tail, outcome string, err error) {
+//
+// beforeClose, if not nil, is called with the tail between the output read
+// and the tab close, and only if the read worked: the pane, and so the
+// tab, was still there.
+func (r *Runner) stopOnTarget(ctx context.Context, ts *targetState, log *slog.Logger, run store.Run, beforeClose func(ctx context.Context, tail string)) (tail, outcome string, err error) {
 	if err := r.knownUnreachable(ts, run.Target); err != nil {
 		return "", "", err
 	}
@@ -1399,8 +1436,15 @@ func (r *Runner) stopOnTarget(ctx context.Context, ts *targetState, log *slog.Lo
 		if err := unreachable(err); err != nil {
 			return "", "", err
 		}
+	} else if beforeClose != nil {
+		beforeClose(ctx, tail)
 	}
 	outcome, err = r.closeRunTab(ctx, ts, log, run)
+	if herdr.IsCode(err, herdr.CodeServerNotRunning) && beforeClose == nil {
+		// The run has to end. A pending stop passes beforeClose and
+		// keeps the error, so the close is tried again once herdr is up.
+		return tail, reasonTabGone, nil
+	}
 	if err != nil {
 		return tail, "", err // the tail was read; the caller keeps it
 	}
@@ -1422,7 +1466,9 @@ func (r *Runner) asUnreachable(name string, err error) error {
 // (reasonTabClosed, reasonTabGone or reasonTabNotClosed). An error
 // matching target.ErrUnreachable means the target did not answer; the
 // target is marked unreachable and the caller keeps the stop pending.
-// Other close errors are logged.
+// herdr.CodeServerNotRunning is returned as-is: the server may restore
+// the tab when it starts, so that is not "tab was gone". Other close
+// errors are logged.
 func (r *Runner) closeRunTab(ctx context.Context, ts *targetState, log *slog.Logger, run store.Run) (string, error) {
 	if run.HerdrTab == "" {
 		return reasonTabClosed, nil
@@ -1434,8 +1480,10 @@ func (r *Runner) closeRunTab(ctx context.Context, ts *targetState, log *slog.Log
 	case herdr.IsCode(err, herdr.CodeTabNotFound):
 		return reasonTabGone, nil
 	case herdr.IsCode(err, herdr.CodeServerNotRunning):
+		// Not "tab was gone": the server may restore the tab when it
+		// starts. A pending stop retries; an initial stop does not.
 		log.Warn("cannot close tab", "herdr_tab", run.HerdrTab, "err", err)
-		return reasonTabGone, nil
+		return "", err
 	default:
 		log.Warn("cannot close tab", "herdr_tab", run.HerdrTab, "err", err)
 		if err := r.asUnreachable(run.Target, err); err != nil {
@@ -1450,20 +1498,59 @@ func (r *Runner) closeRunTab(ctx context.Context, ts *targetState, log *slog.Log
 // the tab is still closed and the outcome records the replacement, so a
 // retry does not send keys either. Otherwise it is step 10. The tail is
 // empty when no keys were sent: the restored shell's text is not the run's.
-func (r *Runner) finishPendingStop(ctx context.Context, ts *targetState, log *slog.Logger, run store.Run) (tail, outcome string, err error) {
-	replaced, err := r.paneReplaced(ctx, ts, run)
-	if err != nil {
-		log.Warn("cannot check the pane terminal", "err", err)
+//
+// Just before the tab is closed, how far the stop got is stored with the
+// pending cleanup (see markClosing). An earlier try that got that far, in
+// this daemon or in one that died before it stored the outcome, is not
+// repeated: only the tab is closed, and a tab that is gone by now was
+// closed by that try. A herdr server that is not running is not a missing
+// tab: the stop stays pending.
+func (r *Runner) finishPendingStop(ctx context.Context, ts *targetState, c *pendingCleanup, run store.Run) (tail, outcome string, err error) {
+	r.mu.Lock()
+	closing, replaced, tail := c.closing, c.replaced, c.tail
+	r.mu.Unlock()
+	if closing {
+		c.log.Info("an earlier try was closing the tab; closing it without sending keys again", "herdr_tab", run.HerdrTab)
+	} else {
+		replaced, err = r.paneReplaced(ctx, ts, run)
+		if err != nil {
+			c.log.Warn("cannot check the pane terminal", "err", err)
+		}
+		if !replaced {
+			return r.stopOnTarget(ctx, ts, c.log, run, func(ctx context.Context, tail string) {
+				r.markClosing(ctx, c, false, tail)
+			})
+		}
+		c.log.Info("pane replaced since the stop; closing the tab without sending keys", "herdr_pane", run.HerdrPane)
+		r.markClosing(ctx, c, true, "")
 	}
-	if !replaced {
-		return r.stopOnTarget(ctx, ts, log, run)
-	}
-	log.Info("pane replaced since the stop; closing the tab without sending keys", "herdr_pane", run.HerdrPane)
-	outcome, err = r.closeRunTab(ctx, ts, log, run)
+	// Not cut short by a stopping daemon: a close that was cancelled would
+	// be recorded as a tab that could not be closed.
+	outcome, err = r.closeRunTab(context.WithoutCancel(ctx), ts, c.log, run)
 	if err != nil {
 		return "", "", err
 	}
-	return "", replacedTabOutcome(outcome), nil
+	if closing && outcome == reasonTabGone {
+		outcome = reasonTabClosed
+	}
+	if replaced {
+		outcome = replacedTabOutcome(outcome)
+	}
+	return tail, outcome, nil
+}
+
+// markClosing remembers, in the store too, that the cleanup is about to
+// close the run's tab: whether the pane was replaced (no keys were sent)
+// and the output tail that was read. The tab existed a moment ago.
+func (r *Runner) markClosing(ctx context.Context, c *pendingCleanup, replaced bool, tail string) {
+	r.mu.Lock()
+	c.closing, c.replaced, c.tail = true, replaced, tail
+	id := c.run.ID
+	r.mu.Unlock()
+	// The close is about to happen, even if the daemon is stopping.
+	if err := r.store.MarkCleanupClosing(context.WithoutCancel(ctx), id, replaced, tail); err != nil {
+		c.log.Warn("cannot store how far the stop got; a daemon that restarts now records the tab as gone", "err", err)
+	}
 }
 
 // replacedTabOutcome records that the pending stop found a new shell under
@@ -1474,12 +1561,14 @@ func replacedTabOutcome(outcome string) string {
 }
 
 // tabOutcomeSettled reports whether reason already ends with what became of
-// the tab, so a cleanup retry must not run step 10 again or append a second
+// the tab, or with why the stop was dropped, so a cleanup retry must not run step 10 again or append a second
 // phrase.
 func tabOutcomeSettled(reason string) bool {
 	return strings.HasSuffix(reason, reasonTabClosed) ||
 		strings.HasSuffix(reason, reasonTabGone) ||
-		strings.HasSuffix(reason, reasonTabNotClosed)
+		strings.HasSuffix(reason, reasonTabNotClosed) ||
+		strings.HasSuffix(reason, reasonTargetRemoved) ||
+		strings.HasSuffix(reason, reasonTargetExpired)
 }
 
 // withTabOutcome replaces the "tab may still be open" caveat with outcome.
@@ -1496,6 +1585,11 @@ type pendingCleanup struct {
 	// Under Runner.mu.
 	run     store.Run
 	running bool // a goroutine is finishing the stop
+	// closing: a try got as far as closing the tab (see markClosing).
+	// replaced and tail are what it found, and only mean something then.
+	closing  bool
+	replaced bool
+	tail     string
 }
 
 // closedChan is the ready of a cleanup taken over from the store.
@@ -1506,32 +1600,42 @@ var closedChan = func() chan struct{} {
 }()
 
 // recoverCleanups takes over the pending cleanups in the store and returns
-// their targets. One on a target that is no longer configured is dropped,
-// and so is one of a run that is still open: its stop never ended it, and
-// the run is tracked again.
+// their targets. One of a run that is still open is cleared: its stop
+// never ended it, and the run is tracked again. One on a target that is no
+// longer configured is dropped, and the run's row says so.
 func (r *Runner) recoverCleanups(ctx context.Context) ([]string, error) {
-	runs, err := r.store.ListPendingCleanups(ctx)
+	pending, err := r.store.ListPendingCleanups(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var targets []string
-	for _, run := range runs {
+	for _, p := range pending {
+		run := p.Run
 		log := logging.ForRun(r.log, run.ID, run.TaskID, run.Target)
-		gone := r.targets[run.Target] == nil
-		if gone {
-			log.Warn("target not configured; the tab of the stopped run may still be open there", "herdr_tab", run.HerdrTab)
-		}
-		if gone || run.EndedAt.IsZero() {
+		if run.EndedAt.IsZero() {
 			if err := r.store.SetPendingCleanup(ctx, run.ID, false); err != nil {
 				log.Error("cannot clear pending cleanup", "err", err)
 			}
 			continue
 		}
+		c := &pendingCleanup{
+			run: run, log: log, ready: closedChan,
+			closing: p.Closing, replaced: p.PaneReplaced, tail: p.Tail,
+		}
+		gone := r.target(run.Target) == nil
 		r.mu.Lock()
-		if _, ok := r.cleanups[run.ID]; !ok {
-			r.cleanups[run.ID] = &pendingCleanup{run: run, log: log, ready: closedChan}
+		_, known := r.cleanups[run.ID]
+		if !known {
+			r.cleanups[run.ID] = c
+			c.running = gone
 		}
 		r.mu.Unlock()
+		switch {
+		case known:
+		case gone:
+			r.cleanup(ctx, c) // drops it: store writes only
+			continue
+		}
 		if !slices.Contains(targets, run.Target) {
 			targets = append(targets, run.Target)
 		}
@@ -1539,39 +1643,83 @@ func (r *Runner) recoverCleanups(ctx context.Context) ([]string, error) {
 	return targets, nil
 }
 
+// cleanupCutoff is the end time before which a pending stop is too old to
+// keep: history_days ago, the retention of the run history.
+func (r *Runner) cleanupCutoff() time.Time {
+	days := r.config().HistoryDays
+	if days <= 0 {
+		days = config.DefaultHistoryDays
+	}
+	return r.clock.Now().AddDate(0, 0, -days)
+}
+
+// cleanupExpired reports whether the pending stop of run is too old to
+// keep waiting for its target.
+func (r *Runner) cleanupExpired(run store.Run) bool {
+	return !run.EndedAt.IsZero() && run.EndedAt.Before(r.cleanupCutoff())
+}
+
 // resumeCleanups finishes the pending stops on the target if it is
 // reachable, each in its own goroutine like a stop: it takes the same
-// 12 s.
+// 12 s. On a target that was tried and does not answer, the stops that are too old (see
+// cleanupCutoff) are dropped; on one that is no longer configured, all are.
 func (r *Runner) resumeCleanups(name string) {
-	if st, ok := r.TargetState(name); !ok || st.Reachability != ReachReachable {
-		return
-	}
+	st, configured := r.TargetState(name)
+	reachable := configured && st.Reachability == ReachReachable
+	// Not answering is not the same as not tried yet (unknown).
+	unreachable := configured && st.Reachability == ReachUnreachable
+	cutoff := r.cleanupCutoff()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed {
-		return
-	}
 	for _, c := range r.cleanups {
 		if c.running || c.run.Target != name {
 			continue
 		}
-		c.running = true
-		r.stops.Add(1)
-		go func() {
-			defer r.stops.Done()
-			r.cleanup(r.stopCtx, c)
-		}()
+		expired := unreachable && !c.run.EndedAt.IsZero() && c.run.EndedAt.Before(cutoff)
+		if configured && !reachable && !expired {
+			continue
+		}
+		r.startCleanupLocked(c)
 	}
+}
+
+// dropCleanupsOfRemovedTargetsLocked drops the pending stops on targets
+// that are no longer configured. The caller holds r.mu and r.targetsMu.
+func (r *Runner) dropCleanupsOfRemovedTargetsLocked() {
+	for _, c := range r.cleanups {
+		if !c.running && r.targets[c.run.Target] == nil {
+			r.startCleanupLocked(c)
+		}
+	}
+}
+
+// startCleanupLocked runs cleanup for c in its own goroutine, unless the
+// runner is closed. The caller holds r.mu.
+func (r *Runner) startCleanupLocked(c *pendingCleanup) {
+	if r.closed {
+		return
+	}
+	c.running = true
+	r.stops.Add(1)
+	go func() {
+		defer r.stops.Done()
+		r.cleanup(r.stopCtx, c)
+	}()
 }
 
 // cleanup finishes the stop of an ended run now that its target answers:
 // the stop keys, the output tail, the tab and the prompt file. The row then
 // says what became of the tab. A store write that fails leaves the cleanup
 // pending, and the next try amends the row without repeating a stop that
-// already reached the target. If the target drops again, or the daemon
-// stops, the cleanup stays pending. A pane herdr restored under the same
-// id is a new shell: no keys are sent, the tab is still closed, and the
-// reason says the pane was replaced.
+// already reached the target. A drop whose write failed is decided again,
+// so a target that answers in between is still stopped. If the target
+// drops again, or the daemon stops, the cleanup stays pending. A pane
+// herdr restored under the same id is a new shell: no keys are sent, the
+// tab is still closed, and the reason says the pane was replaced.
+//
+// A stop that can no longer be finished is dropped instead: its target
+// was removed from the config, or has not answered for history_days since
+// the run ended. The row then says that the tab was not closed.
 func (r *Runner) cleanup(ctx context.Context, c *pendingCleanup) {
 	<-c.ready // closed as soon as the store has answered
 	r.mu.Lock()
@@ -1584,38 +1732,56 @@ func (r *Runner) cleanup(ctx context.Context, c *pendingCleanup) {
 	}
 
 	if !tabOutcomeSettled(run.ExitReason) {
-		ts := r.targets[run.Target]
-		if ts == nil {
-			c.log.Warn("target not configured; the stop stays pending", "herdr_tab", run.HerdrTab)
-			stay()
-			return
-		}
-		c.log.Info("target reachable again; finishing the stop", "herdr_tab", run.HerdrTab)
-		tail, outcome, err := r.finishPendingStop(ctx, ts, c.log, run)
-		if err != nil {
-			c.log.Warn("cannot finish the stop; it stays pending", "err", err)
-			stay()
-			return
-		}
-		// From here the stop reached the target and must be stored.
-		ctx = context.WithoutCancel(ctx)
-		if run.HerdrPane != "" {
-			if err := ts.t.RemoveFile(ctx, promptPath(run.ID)); err != nil {
-				c.log.Warn("cannot delete prompt file", "err", err)
+		var tail, outcome string
+		ts := r.target(run.Target)
+		st, _ := r.TargetState(run.Target)
+		if ts != nil && st.Reachability == ReachReachable {
+			c.log.Info("target reachable again; finishing the stop", "herdr_tab", run.HerdrTab)
+			var err error
+			tail, outcome, err = r.finishPendingStop(ctx, ts, c, run)
+			switch {
+			case err != nil:
+				c.log.Warn("cannot finish the stop; it stays pending", "err", err)
+				outcome = ""
+			case run.HerdrPane != "":
+				// The stop reached the target and must be stored.
+				if err := ts.t.RemoveFile(context.WithoutCancel(ctx), promptPath(run.ID)); err != nil {
+					c.log.Warn("cannot delete prompt file", "err", err)
+				}
 			}
+		}
+		if outcome == "" {
+			switch {
+			case ctx.Err() != nil:
+				// The daemon is stopping; the next one decides.
+			case r.target(run.Target) == nil:
+				c.log.Warn("target removed from config; the stop is dropped and the tab may still be open there", "herdr_tab", run.HerdrTab)
+				outcome = reasonTargetRemoved
+			case st.Reachability == ReachUnreachable && r.cleanupExpired(run):
+				c.log.Warn("target did not come back within history_days; the stop is dropped and the tab may still be open there", "herdr_tab", run.HerdrTab)
+				outcome = reasonTargetExpired
+			}
+		}
+		if outcome == "" {
+			stay()
+			return
 		}
 		run.ExitReason = withTabOutcome(run.ExitReason, outcome)
 		if tail != "" {
 			run.OutputTail = tail
 		}
-		// Remember the outcome before the store write, so a failed amend
-		// retries the write and not step 10 (the tab is already closed).
-		r.mu.Lock()
-		c.run = run
-		r.mu.Unlock()
-	} else {
-		ctx = context.WithoutCancel(ctx)
+		// Remember a stop that reached the tab before the store write, so
+		// a failed amend retries the write and not step 10. A drop has not
+		// closed the tab: leave it unremembered until the write succeeds,
+		// so a target that answers first is still stopped.
+		if outcome != reasonTargetRemoved && outcome != reasonTargetExpired {
+			r.mu.Lock()
+			c.run = run
+			r.mu.Unlock()
+		}
 	}
+	// From here the outcome is known and must be stored.
+	ctx = context.WithoutCancel(ctx)
 
 	stored, err := r.store.GetRun(ctx, run.ID)
 	if err != nil {
@@ -1633,6 +1799,11 @@ func (r *Runner) cleanup(ctx context.Context, c *pendingCleanup) {
 			r.onAmend(run)
 		}
 	}
+	// The outcome is in the store, or was already there. Remember it so a
+	// failed clear of the pending row does not run the stop again.
+	r.mu.Lock()
+	c.run = run
+	r.mu.Unlock()
 	if err := r.store.SetPendingCleanup(ctx, run.ID, false); err != nil {
 		c.log.Error("cannot clear pending cleanup", "err", err)
 		stay()
