@@ -750,8 +750,8 @@ PRAGMA user_version = 0;`)
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
-		t.Errorf("user_version = %d, want 2", version)
+	if version != 3 {
+		t.Errorf("user_version = %d, want 3", version)
 	}
 }
 
@@ -880,5 +880,171 @@ INSERT INTO queued_fires (task_id, target, trigger, pending) VALUES ('backup', '
 				t.Errorf("GetRun = terminal %q, err %v; want term_1", got.HerdrTerminal, err)
 			}
 		})
+	}
+}
+
+// A cleanup's progress is stored before its tab is closed, so a daemon
+// that dies before amending the run still knows what it had done.
+func TestPendingCleanupClosing(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	day := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	plain, closing := newRun("a", day), newRun("a", day.Add(time.Hour))
+	for _, r := range []store.Run{plain, closing} {
+		r.EndedAt = r.StartedAt.Add(time.Minute)
+		r.Status = store.StatusStopped
+		if err := s.InsertRun(ctx, r); err != nil {
+			t.Fatalf("InsertRun: %v", err)
+		}
+		if err := s.SetPendingCleanup(ctx, r.ID, true); err != nil {
+			t.Fatalf("SetPendingCleanup: %v", err)
+		}
+	}
+	if err := s.MarkCleanupClosing(ctx, closing.ID, true, "last lines"); err != nil {
+		t.Fatalf("MarkCleanupClosing: %v", err)
+	}
+	// Marking a run without a pending cleanup stores nothing.
+	if err := s.MarkCleanupClosing(ctx, "no-such-run", false, "x"); err != nil {
+		t.Fatalf("MarkCleanupClosing of a run that is not pending: %v", err)
+	}
+	list, err := s.ListPendingCleanups(ctx)
+	if err != nil || len(list) != 2 {
+		t.Fatalf("ListPendingCleanups = %d cleanups, %v; want 2", len(list), err)
+	}
+	if got := list[0]; got.ID != plain.ID || got.Closing || got.PaneReplaced || got.Tail != "" {
+		t.Errorf("unmarked cleanup = %+v, want no progress", got)
+	}
+	if got := list[1]; got.ID != closing.ID || !got.Closing || !got.PaneReplaced || got.Tail != "last lines" {
+		t.Errorf("marked cleanup = %+v, want closing, pane replaced and the tail", got)
+	}
+
+	// Recording the cleanup again keeps its progress.
+	if err := s.SetPendingCleanup(ctx, closing.ID, true); err != nil {
+		t.Fatalf("SetPendingCleanup: %v", err)
+	}
+	if list, _ := s.ListPendingCleanups(ctx); len(list) != 2 || !list[1].Closing {
+		t.Errorf("cleanups after recording one again = %+v, want its progress kept", list)
+	}
+}
+
+// A database written by schema version 2 has a pending_cleanups table with
+// only the run id: Open adds the progress columns and keeps the rows.
+func TestOpenUpgradesSchemaVersion2(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	run := newRun("a", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+	run.EndedAt = run.StartedAt.Add(time.Minute)
+	run.Status = store.StatusStopped
+	if err := s.InsertRun(ctx, run); err != nil {
+		t.Fatalf("InsertRun: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+DROP TABLE pending_cleanups;
+CREATE TABLE pending_cleanups (run_id TEXT PRIMARY KEY);
+INSERT INTO pending_cleanups (run_id) VALUES ('` + run.ID + `');
+PRAGMA user_version = 2;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 2 { // the second Open finds the columns already there
+		s, err := store.Open(path)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		list, err := s.ListPendingCleanups(ctx)
+		if err != nil || len(list) != 1 || list[0].ID != run.ID || list[0].Closing {
+			t.Fatalf("ListPendingCleanups = %+v, %v; want the old cleanup without progress", list, err)
+		}
+		if err := s.MarkCleanupClosing(ctx, run.ID, false, "tail"); err != nil {
+			t.Fatalf("MarkCleanupClosing: %v", err)
+		}
+		if list, _ := s.ListPendingCleanups(ctx); len(list) != 1 || !list[0].Closing || list[0].Tail != "tail" {
+			t.Errorf("cleanup after marking = %+v, want closing with the tail", list)
+		}
+		// Back to an unmarked cleanup for the second round.
+		if err := s.SetPendingCleanup(ctx, run.ID, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetPendingCleanup(ctx, run.ID, true); err != nil {
+			t.Fatal(err)
+		}
+		// A daemon that died after adding the columns, before storing the
+		// new version, left version 2 with the columns.
+		if err := s.SetUserVersionForTest(2); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Opening a database that is already at schema version 3 changes nothing:
+// the progress columns stay, and a second open does too.
+func TestOpenAtSchemaVersion3IsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	run := newRun("a", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+	run.EndedAt = run.StartedAt.Add(time.Minute)
+	run.Status = store.StatusStopped
+	if err := s.InsertRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPendingCleanup(ctx, run.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkCleanupClosing(ctx, run.ID, true, "kept tail"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		s, err := store.Open(path)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		list, err := s.ListPendingCleanups(ctx)
+		if err != nil || len(list) != 1 || !list[0].Closing || !list[0].PaneReplaced || list[0].Tail != "kept tail" {
+			t.Fatalf("ListPendingCleanups = %+v, %v; want the stored progress", list, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Errorf("user_version = %d, want 3", version)
 	}
 }
