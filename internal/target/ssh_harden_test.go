@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/WillemDeGroef/herdrcron/internal/shellquote"
 	"github.com/WillemDeGroef/herdrcron/internal/target"
 )
 
@@ -40,11 +41,12 @@ func remoteScript(t *testing.T, line string) string {
 	return b.String()
 }
 
-// newGraceSSH is newTestSSH with a one second wait between SIGTERM and
-// SIGKILL.
+// newGraceSSH is newTestSSH with a short wait between SIGTERM and
+// SIGKILL. The remote sleep accepts a fraction, so the suite does not
+// sit on the production 5s default.
 func newGraceSSH(t *testing.T) *target.SSH {
 	t.Helper()
-	return newSSHWithGrace(t, time.Second)
+	return newSSHWithGrace(t, 400*time.Millisecond)
 }
 
 func newSSHWithGrace(t *testing.T, grace time.Duration) *target.SSH {
@@ -57,7 +59,7 @@ func newSSHWithGrace(t *testing.T, grace time.Duration) *target.SSH {
 }
 
 // poorRemote makes the fake remote machine one without setsid and with a
-// ps that knows no options, as a small BusyBox has.
+// BusyBox ps: it can list pid, ppid and pgid, and it rejects -p.
 func poorRemote(t *testing.T) {
 	t.Helper()
 	bin := t.TempDir()
@@ -70,11 +72,45 @@ func poorRemote(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ps := "#!/bin/sh\necho \"ps: invalid option -- 'o'\" >&2\nexit 1\n"
+	// BusyBox ps: `ps -A -o pid= -o ppid= -o pgid=` works, `-p` does not.
+	// A wrapper that still passes -p gets no process list from this fake.
+	real, err := exec.LookPath("ps")
+	if err != nil {
+		t.Skipf("no ps: %v", err)
+	}
+	script := "#!/bin/sh\n" +
+		"for a in \"$@\"; do\n" +
+		"\tcase $a in\n" +
+		"\t-p*) echo \"ps: invalid option -- p\" >&2; exit 1;;\n" +
+		"\tesac\n" +
+		"done\n" +
+		"exec " + real + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "ps"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_SSH_REMOTE_PATH", bin)
+}
+
+// blindRemote is a machine with no setsid and a ps that ignores its options
+// and prints a default header. That listing must not be parsed as processes.
+func blindRemote(t *testing.T) {
+	t.Helper()
+	bin := t.TempDir()
+	for _, tool := range []string{"sh", "sleep", "cat", "rm", "mv", "mkdir", "mktemp"} {
+		p, err := exec.LookPath(tool)
+		if err != nil {
+			t.Skipf("no %s: %v", tool, err)
+		}
+		if err := os.Symlink(p, filepath.Join(bin, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ps := "#!/bin/sh\necho 'ps: invalid option' >&2\necho '  PID TTY          TIME CMD'\nexit 0\n"
 	if err := os.WriteFile(filepath.Join(bin, "ps"), []byte(ps), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("FAKE_SSH_REMOTE_PATH", bin)
+	t.Setenv("FAKE_SSH_NO_PROC", "1")
 }
 
 // noSetsidRemote makes the fake remote machine one without setsid.
@@ -113,12 +149,14 @@ var remotes = []struct {
 		t.Setenv("FAKE_SSH_REMOTE", "session")
 		t.Setenv("FAKE_SSH_NO_PROC", "1")
 	}},
-	{"own session, BusyBox ps", func(t *testing.T) {
+	{"own session, BusyBox ps, no /proc", func(t *testing.T) {
 		t.Setenv("FAKE_SSH_REMOTE", "session")
+		t.Setenv("FAKE_SSH_NO_PROC", "1")
 		poorRemote(t)
 	}},
-	{"shared group, BusyBox ps, no setsid", func(t *testing.T) {
+	{"shared group, BusyBox ps, no setsid, no /proc", func(t *testing.T) {
 		t.Setenv("FAKE_SSH_REMOTE", "child")
+		t.Setenv("FAKE_SSH_NO_PROC", "1")
 		poorRemote(t)
 	}},
 }
@@ -179,7 +217,7 @@ func TestSSHCancelKillsACommandThatIgnoresSIGTERM(t *testing.T) {
 		t.Run(r.name, func(t *testing.T) {
 			fakeSSH(t)
 			r.setup(t)
-			s := newSSHWithGrace(t, 2*time.Second)
+			s := newSSHWithGrace(t, 600*time.Millisecond)
 			dir := t.TempDir()
 			script := writePid + `trap "" TERM; sleep 300 & pidfile "$1/child" $!; pidfile "$1/cmd" $$; wait`
 			cancel, done := startExec(t, s, []string{"sh", "-c", script, "sh", dir}, nil)
@@ -187,7 +225,7 @@ func TestSSHCancelKillsACommandThatIgnoresSIGTERM(t *testing.T) {
 			child := remotePid(t, filepath.Join(dir, "child"))
 
 			cancel()
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(150 * time.Millisecond)
 			if !processRuns(cmd) || !processRuns(child) {
 				t.Error("the command was killed before the grace period ended")
 			}
@@ -201,7 +239,7 @@ func TestSSHCancelKillsACommandThatIgnoresSIGTERM(t *testing.T) {
 // SIGTERM comes first: a command that handles it gets to clean up.
 func TestSSHCancelSendsSIGTERMBeforeSIGKILL(t *testing.T) {
 	needSetsid(t)
-	for _, r := range remotes[:4] {
+	for _, r := range remotes {
 		t.Run(r.name, func(t *testing.T) {
 			fakeSSH(t)
 			r.setup(t)
@@ -301,6 +339,45 @@ func TestSSHCancelWithoutSetsidDoesNotSignalTheGroupsOtherJob(t *testing.T) {
 				t.Errorf("a job of the parent process group (pid %d) was signalled", bystander)
 			}
 		})
+	}
+}
+
+// A ps that cannot list pid, ppid and pgid, and no /proc, is reported.
+// Cancel still SIGKILLs the command itself and does not guess at other pids.
+func TestSSHCancelReportsWhenPsCannotListProcesses(t *testing.T) {
+	fakeSSH(t)
+	t.Setenv("FAKE_SSH_REMOTE", "child")
+	blindRemote(t)
+	s := newGraceSSH(t)
+
+	_, err := s.Exec(context.Background(), []string{"sh", "-c", "echo boom >&2; exit 3"}, nil)
+	var ee *target.ExitError
+	if !errors.As(err, &ee) || ee.Code != 3 || !strings.Contains(string(ee.Stderr), "will not see processes the command started") {
+		t.Fatalf("Exec err = %v", err)
+	}
+	if !strings.Contains(string(ee.Stderr), "boom") {
+		t.Errorf("stderr = %q, want the command's own stderr as well", ee.Stderr)
+	}
+
+	dir := t.TempDir()
+	// The process that ignores SIGTERM has to be the wrapper's direct child
+	// (the target shell command). A nested sh -c is a grandchild, and this
+	// remote cannot list grandchildren.
+	body := writePid + `trap "" TERM; sh -c 'trap "" HUP; exec sleep 300' & pidfile "$1/child" $!; pidfile "$1/cmd" $$; wait`
+	s2 := target.NewSSH(target.SSHConfig{
+		Name: "vps", Host: "vps-alias",
+		Shell:      "sh -c " + shellquote.Quote(body) + " sh",
+		ControlDir: filepath.Join(t.TempDir(), "ssh"),
+		KillGrace:  400 * time.Millisecond,
+	})
+	cancel, done := startExec(t, s2, []string{dir}, nil)
+	cmd := remotePid(t, filepath.Join(dir, "cmd"))
+	child := remotePid(t, filepath.Join(dir, "child"))
+	cancel()
+	wantCancelled(t, done)
+	wantGone(t, "the remote command", cmd)
+	if !processRuns(child) {
+		t.Error("a child was signalled even though the process list was unusable")
 	}
 }
 

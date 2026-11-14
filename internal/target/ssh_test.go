@@ -166,7 +166,7 @@ func TestSSHExecArgvUsesTheSpecOptionsAndTheTargetShell(t *testing.T) {
 		t.Fatalf("argv =\n%q\nwant\n%q and the remote command line", got, want)
 	}
 	line := got[len(got)-1]
-	if !strings.HasPrefix(line, neutralPrefix) || !strings.Contains(remoteScript(t, line), `/bin/sh -c 'bash -lc '\''herdr pane list'\'''`) {
+	if !strings.HasPrefix(line, neutralPrefix) || !strings.Contains(remoteScript(t, line), `/bin/sh -c 'exec bash -lc '\''herdr pane list'\'''`) {
 		t.Errorf("remote command line = %q, want the target shell command inside the /bin/sh wrapper", line)
 	}
 	fi, err := os.Stat(control)

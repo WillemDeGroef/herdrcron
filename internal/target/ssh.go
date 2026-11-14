@@ -62,7 +62,10 @@ type SSHConfig struct {
 	// ($XDG_STATE_HOME/herdrcron/ssh).
 	ControlDir string
 	// KillGrace is how long a cancelled remote command gets to end on
-	// SIGTERM before SIGKILL, rounded up to whole seconds. Zero means 5s.
+	// SIGTERM before SIGKILL. Zero means 5s. A value below 100ms is raised
+	// to 100ms. Whole seconds are passed to sleep as an integer; any other
+	// value is seconds with millisecond precision, and a remote sleep that
+	// rejects that falls back to one second.
 	KillGrace time.Duration
 }
 
@@ -297,8 +300,12 @@ const defaultKillGrace = 5 * time.Second
 //
 // Process data (i gives the parent and group of a live process, all the
 // three of every process) comes from /proc where there is one, else from
-// ps: a BusyBox ps may have neither -o nor -p. With none of setsid, /proc and
-// ps, only the command itself is signalled, not what it started.
+// `ps -A -o pid= -o ppid= -o pgid=`. That form has no -p: a BusyBox ps has
+// -o and not -p, and a ps that cannot print those three numbers is not
+// parsed (its default listing is not a process table). With none of
+// setsid, /proc and that ps, the script says so on stderr and a cancel
+// signals only the command itself, which this shell has not waited for,
+// so that pid cannot have been reused.
 //
 // The watcher holds neither stdout nor stderr, and the script lets go of
 // both before it waits for the grace period, so neither delays the end of
@@ -308,7 +315,6 @@ func watchedScript(line string, hasStdin bool, grace time.Duration) string {
 	if grace <= 0 {
 		grace = defaultKillGrace
 	}
-	seconds := int((grace + time.Second - 1) / time.Second)
 	in := "exec 4</dev/null"
 	if hasStdin {
 		in = `f=$(mktemp "${TMPDIR:-/tmp}/herdrcron.XXXXXX") || exit 1
@@ -324,22 +330,47 @@ f3() {
 	echo "$2 $3"
 }
 f4() { echo "$1 $3 $4"; }
+# P is proc, ps, or empty. ps is listed without -p: BusyBox has -o and not -p.
+# A listing that is not three numbers is ignored, so a ps that prints its
+# default table is not taken for a process list.
+P=
+if [ -r /proc/$$/stat ]; then
+	P=proc
+else
+	line=$(ps -A -o pid= -o ppid= -o pgid= 2>/dev/null | while IFS= read -r x; do
+		[ -n "$x" ] || continue
+		printf '%s\n' "$x"
+		break
+	done)
+	set -f
+	n=0
+	ok=1
+	for w in $line; do
+		n=$((n+1))
+		case $w in *[!0-9]*) ok=;; esac
+	done
+	set +f
+	[ "$n" = 3 ] && [ "$ok" = 1 ] && P=ps
+fi
 i() {
-	if [ -r /proc/$$/stat ]; then
+	if [ "$P" = proc ]; then
 		[ -r "/proc/$1/stat" ] && read -r a <"/proc/$1/stat" && f3 ${a##*) }
-	else
-		f3 $(ps -o stat= -o ppid= -o pgid= -p "$1" 2>/dev/null)
+		return
 	fi
+	[ "$P" = ps ] || return 1
+	ps -A -o pid= -o ppid= -o pgid= 2>/dev/null | while read -r p pp g _; do
+		[ "$p" = "$1" ] && echo "$pp $g" && exit 0
+	done
 }
 all() {
-	if [ -r /proc/$$/stat ]; then
+	if [ "$P" = proc ]; then
 		for q in /proc/[0-9]*/stat; do read -r a <"$q" && f4 "${a%% *}" ${a##*) }; done 2>/dev/null
-	else
+	elif [ "$P" = ps ]; then
 		ps -A -o pid= -o ppid= -o pgid= 2>/dev/null
 	fi
 }
 k() {
-	[ "$(i "$1")" = "$2" ] && kill -STOP "$1" 2>/dev/null || return 0
+	[ -n "$2" ] && [ "$(i "$1")" = "$2" ] && kill -STOP "$1" 2>/dev/null || return 0
 	L="$L $1:${2#* }"
 	for p in $(all | while read -r a b _; do [ "$b" = "$1" ] && echo "$a"; done); do
 		j=$(i "$p")
@@ -354,13 +385,21 @@ x() {
 	s) kill -$1 -$c 2>/dev/null;;
 	*) false;;
 	esac && return
-	if [ $1 = TERM ]; then
+	if [ "$1" = TERM ]; then
 		kill -0 $c 2>/dev/null || return 0
 		L=
-		k $c "$(i $c)"
+		id=$(i "$c")
+		if [ -n "$id" ]; then
+			k "$c" "$id"
+		else
+			# Direct child, not yet waited for: its pid cannot have been reused.
+			kill -TERM $c 2>/dev/null
+		fi
+	elif [ -z "$L" ]; then
+		kill -KILL $c 2>/dev/null
 	else
 		for e in $L; do
-			case $(i "${e%%:*}") in *" ${e#*:}"|"${e#*:}") kill -KILL "${e%%:*}" 2>/dev/null;; esac
+			case $(i "${e%%:*}") in *" ${e#*:}") kill -KILL "${e%%:*}" 2>/dev/null;; esac
 		done
 	fi
 }
@@ -378,7 +417,7 @@ stop() {
 	trap '' TERM USR1
 	exec >/dev/null 2>&1 3<&-
 	x TERM
-	( sleep ` + strconv.Itoa(seconds) + `; x KILL ) &
+	( sleep ` + killGraceArg(grace) + ` || sleep 1; x KILL ) &
 	t=$!
 	wait $c
 	while left && kill -0 $t 2>/dev/null; do sleep 0.1 || sleep 1; done
@@ -394,8 +433,11 @@ else
 	g=$(i $$)
 	case ${g#* } in $$) m=g;; esac
 fi
+if [ "$m" = t ] && [ -z "$P" ]; then
+	echo 'herdrcron: no /proc and ps cannot list pid and ppid; a cancel will not see processes the command started' >&2
+fi
 trap stop USR1
-$S /bin/sh -c ` + shellquote.Quote(line) + ` <&4 3<&- 4<&- &
+$S /bin/sh -c ` + shellquote.Quote("exec "+line) + ` <&4 3<&- 4<&- &
 c=$!
 exec 4<&-
 { read -r _ <&3; kill -USR1 $$; } >/dev/null 2>&1 &
@@ -405,6 +447,23 @@ r=$?
 trap '' USR1
 kill $w 2>/dev/null
 exit $r`
+}
+
+// killGraceArg is the sleep(1) argument for grace. Whole seconds stay
+// integers so a POSIX sleep accepts them. Anything else is milliseconds
+// ("0.400"); the script falls back to one second if sleep rejects it.
+func killGraceArg(grace time.Duration) string {
+	if grace <= 0 {
+		grace = defaultKillGrace
+	}
+	if grace < 100*time.Millisecond {
+		grace = 100 * time.Millisecond
+	}
+	if grace%time.Second == 0 {
+		return strconv.Itoa(int(grace / time.Second))
+	}
+	ms := int(grace.Milliseconds())
+	return fmt.Sprintf("%d.%03d", ms/1000, ms%1000)
 }
 
 // neutralLine is the command line ssh sends for the /bin/sh script script.

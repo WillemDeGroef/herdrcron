@@ -109,7 +109,7 @@ A target other than `local` is reached with `ssh` from the always-on host (conne
 - the agent CLI installed and logged in (for example `claude` after `claude login`);
 - the repos cloned at the tasks' `cwd`;
 - SSH key access from the always-on host without a password prompt (an alias in `~/.ssh/config` works as `host`);
-- `/bin/sh` with `printf` and `mktemp`, and one of `setsid`, `/proc` or `ps` (any Linux, macOS or BSD has them; a BusyBox `ps` without options is fine).
+- `/bin/sh` with `printf` and `mktemp`, and one of `setsid`, `/proc`, or a `ps` that can list pid, ppid and pgid (`ps -A -o pid= -o ppid= -o pgid=`; a BusyBox `ps` has `-o` and not `-p`, which is enough). If none of those is there, the command still runs and herdrcron says so on stderr: a cancel then stops only that command, not processes it started.
 
 The remote user's login shell can be anything (bash, zsh, fish, tcsh): it only starts `/bin/sh`, which runs the command through the target's `shell`. When herdrcron gives up on a remote command (a timeout, a shutdown), the command is stopped on the remote machine too: SIGTERM first, SIGKILL five seconds later for what is still running.
 
