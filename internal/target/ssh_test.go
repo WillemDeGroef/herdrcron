@@ -24,11 +24,19 @@ import (
 // process. Unset, it replaces it. "session" runs it as sshd does: in a new
 // session and process group that outlives a killed ssh and only sees its
 // stdin close. "child" also outlives ssh but shares its process group, as
-// behind an sshd that does not start a session. "login" is a session leader
-// with another job beside the command. The leader execs the remote line, as
-// a login shell does with a simple command, so it stays the parent and the
-// group leader. That job ignores SIGHUP so the session ending does not look
-// like a kill.
+// behind a login shell that does not exec its command. "login" is a session
+// leader with another job beside the command. The leader execs the remote
+// line, as a login shell does with a simple command, so it stays the parent
+// and the group leader. That job ignores SIGHUP so the session ending does
+// not look like a kill.
+//
+// The remote machine can be made poorer: FAKE_SSH_REMOTE_PATH is the PATH
+// of the remote command line, FAKE_SSH_SH the shell that stands in for
+// /bin/sh, and FAKE_SSH_NO_PROC set hides /proc from the wrapper script.
+// FAKE_SSH_STDIN_CUT=n drops the connection after n bytes of stdin: the
+// remote side reads those and then sees stdin close. FAKE_SSH_STDIN_STALL=n
+// is a connection that stalls after n bytes: the remote side reads those
+// and then nothing, until the caller closes stdin.
 const fakeSSHScript = `#!/bin/sh
 dir=$(dirname "$0")
 : > "$dir/argv"
@@ -46,12 +54,30 @@ if [ -n "$FAKE_SSH_EXIT" ]; then
 	printf '%s' "$FAKE_SSH_STDERR" >&2
 	exit "$FAKE_SSH_EXIT"
 fi
+if [ -n "$FAKE_SSH_SH" ]; then
+	last="$FAKE_SSH_SH${last#/bin/sh}"
+fi
+if [ -n "$FAKE_SSH_NO_PROC" ]; then
+	last=$(printf '%s' "$last" | sed 's|/proc/|/no-proc/|g')
+fi
+if [ -n "$FAKE_SSH_STDIN_CUT" ]; then
+	head -c "$FAKE_SSH_STDIN_CUT" > "$dir/stdin"
+	exec < "$dir/stdin"
+fi
+if [ -n "$FAKE_SSH_STDIN_STALL" ]; then
+	mkfifo "$dir/in"
+	exec 5<&0
+	{ head -c "$FAKE_SSH_STDIN_STALL" <&5; cat <&5 >/dev/null; } > "$dir/in" &
+	exec < "$dir/in" 5<&-
+fi
+env=$(command -v env)
+rp=${FAKE_SSH_REMOTE_PATH:-$PATH}
 case "$FAKE_SSH_REMOTE" in
-session) setsid -w sh -c "$last"; exit $? ;;
-child) sh -c "$last"; exit $? ;;
-login) setsid -w sh -c 'trap "" HUP; sleep 300 & echo $! > "$1/bystander"; exec sh -c "$2"' sh "$dir" "$last"; exit $? ;;
+session) setsid -w "$env" "PATH=$rp" sh -c "$last"; exit $? ;;
+child) "$env" "PATH=$rp" sh -c "$last"; exit $? ;;
+login) setsid -w sh -c 'trap "" HUP; sleep 300 & echo $! > "$1/bystander"; PATH=$3; exec sh -c "$2"' sh "$dir" "$last" "$rp"; exit $? ;;
 esac
-exec sh -c "$last"
+exec "$env" "PATH=$rp" sh -c "$last"
 `
 
 // fakeSSH puts a fake ssh first on PATH and returns a function that reads
@@ -66,6 +92,11 @@ func fakeSSH(t *testing.T) (argv func() []string, dir string) {
 	t.Setenv("FAKE_SSH_EXIT", "")
 	t.Setenv("FAKE_SSH_HANG", "")
 	t.Setenv("FAKE_SSH_REMOTE", "")
+	t.Setenv("FAKE_SSH_REMOTE_PATH", "")
+	t.Setenv("FAKE_SSH_SH", "")
+	t.Setenv("FAKE_SSH_NO_PROC", "")
+	t.Setenv("FAKE_SSH_STDIN_CUT", "")
+	t.Setenv("FAKE_SSH_STDIN_STALL", "")
 	return func() []string {
 		t.Helper()
 		data, err := os.ReadFile(filepath.Join(dir, "argv"))
@@ -135,7 +166,7 @@ func TestSSHExecArgvUsesTheSpecOptionsAndTheTargetShell(t *testing.T) {
 		t.Fatalf("argv =\n%q\nwant\n%q and the remote command line", got, want)
 	}
 	line := got[len(got)-1]
-	if !strings.HasPrefix(line, neutralPrefix) || !strings.Contains(line, `bash -lc \0047herdr pane list\0047`) {
+	if !strings.HasPrefix(line, neutralPrefix) || !strings.Contains(remoteScript(t, line), `/bin/sh -c 'bash -lc '\''herdr pane list'\'''`) {
 		t.Errorf("remote command line = %q, want the target shell command inside the /bin/sh wrapper", line)
 	}
 	fi, err := os.Stat(control)

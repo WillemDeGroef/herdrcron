@@ -13,7 +13,9 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/shellquote"
@@ -59,6 +61,9 @@ type SSHConfig struct {
 	// ControlDir holds the ControlMaster sockets
 	// ($XDG_STATE_HOME/herdrcron/ssh).
 	ControlDir string
+	// KillGrace is how long a cancelled remote command gets to end on
+	// SIGTERM before SIGKILL, rounded up to whole seconds. Zero means 5s.
+	KillGrace time.Duration
 }
 
 // SSH is a Target on a remote machine, reached with the system ssh binary
@@ -67,8 +72,9 @@ type SSHConfig struct {
 //
 // The remote user's login shell need not be a POSIX shell: it only starts
 // /bin/sh (see neutralLine). A call that is cancelled or passes its
-// deadline also stops its command on the remote machine (see
-// watchedScript); that needs /bin/sh, and head for calls with stdin data.
+// deadline also stops its command on the remote machine, with SIGTERM and
+// then SIGKILL (see watchedScript); that needs /bin/sh, and mktemp for
+// calls with stdin data.
 type SSH struct {
 	cfg SSHConfig
 }
@@ -87,29 +93,27 @@ func NewSSH(cfg SSHConfig) *SSH {
 func (s *SSH) Name() string { return s.cfg.Name }
 
 // Exec runs argv on the remote machine through the target shell, feeding
-// it stdin if non-nil, and returns its stdout. stdin is read to its end
-// before ssh starts. ssh exiting 255 gives an
-// *UnreachableError; any other non-zero exit an *ExitError with the
-// remote argv and stderr.
+// it stdin if non-nil, and returns its stdout. stdin is streamed to the
+// remote machine as it is read, and the command starts when stdin ends. A
+// cancelled call returns without waiting for a stdin.Read that blocks. ssh
+// exiting 255 gives an *UnreachableError; any other non-zero exit an
+// *ExitError with the remote argv and stderr.
 func (s *SSH) Exec(ctx context.Context, argv []string, stdin io.Reader) ([]byte, error) {
 	if len(argv) == 0 {
 		return nil, errors.New("ssh exec: empty argv")
 	}
-	return s.run(ctx, argv, shellquote.Join(argv...), stdin)
+	script := watchedScript(s.commandLine(shellquote.Join(argv...)), stdin != nil, s.cfg.KillGrace)
+	return s.run(ctx, argv, script, stdin)
 }
 
 // PutFile writes data to path on the remote machine with mode 0600,
 // creating parent directories, from ssh's stdin so the content is never in
-// an argv. It writes a temp file next to path and renames it into place. A
-// leading "~/" means the remote user's home directory.
+// an argv. The data goes to a temp file next to path that is renamed into
+// place once it is complete; a call that is cancelled or loses its
+// connection removes the temp file and leaves path as it was. A leading
+// "~/" means the remote user's home directory.
 func (s *SSH) PutFile(ctx context.Context, p string, data []byte) error {
-	dst := remotePath(p)
-	tmp := remotePath(p + ".tmp")
-	dir := remotePath(path.Dir(p))
-	// On cat failure, remove the temp so we do not leave a truncated file; we
-	// avoid trap because odd paths can contain quotes that break trap parsing.
-	script := "umask 077 && mkdir -p " + dir + " && cat > " + tmp + " || { rm -f " + tmp + "; exit 1; } && mv -f " + tmp + " " + dst
-	if _, err := s.run(ctx, []string{"put-file", p}, script, bytes.NewReader(data)); err != nil {
+	if _, err := s.run(ctx, []string{"put-file", p}, putFileScript(p), bytes.NewReader(data)); err != nil {
 		return fmt.Errorf("put file: %w", err)
 	}
 	return nil
@@ -118,7 +122,8 @@ func (s *SSH) PutFile(ctx context.Context, p string, data []byte) error {
 // RemoveFile removes path on the remote machine; a missing file is not an
 // error. A leading "~/" means the remote user's home directory.
 func (s *SSH) RemoveFile(ctx context.Context, p string) error {
-	if _, err := s.run(ctx, []string{"rm", p}, "rm -f "+remotePath(p), nil); err != nil {
+	script := watchedScript(s.commandLine("rm -f "+remotePath(p)), false, s.cfg.KillGrace)
+	if _, err := s.run(ctx, []string{"rm", p}, script, nil); err != nil {
 		return fmt.Errorf("remove file: %w", err)
 	}
 	return nil
@@ -135,26 +140,19 @@ func (s *SSH) InteractiveArgv(remoteArgv []string) []string {
 	return append(argv, "--", s.cfg.Host, neutralLine(s.commandLine(shellquote.Join(remoteArgv...))))
 }
 
-// run runs the shell command line cmd on the remote machine. name is the
-// argv reported in an *ExitError; keep prompt text and env values out of
-// its first three elements.
+// run runs the /bin/sh script on the remote machine. name is the argv
+// reported in an *ExitError; keep prompt text and env values out of its
+// first three elements.
 //
-// ssh's stdin stays open until the call ends, after any data from stdin:
-// its closing is what tells the remote side that the call was cancelled
-// (see watchedScript).
-func (s *SSH) run(ctx context.Context, name []string, cmd string, stdin io.Reader) ([]byte, error) {
+// A non-nil stdin is sent encoded (see feedStdin) for the script to decode
+// with receiveStdin. ssh's stdin then stays open until the call ends: its
+// closing is what tells the remote side that the call was cancelled.
+func (s *SSH) run(ctx context.Context, name []string, script string, stdin io.Reader) ([]byte, error) {
 	if err := s.ensureControlDir(); err != nil {
 		return nil, fmt.Errorf("ssh %s: %w", s.cfg.Name, err)
 	}
-	var data []byte
-	if stdin != nil {
-		var err error
-		if data, err = io.ReadAll(stdin); err != nil {
-			return nil, fmt.Errorf("ssh %s: read stdin: %w", s.cfg.Name, err)
-		}
-	}
 	argv := append([]string{"-o", "BatchMode=yes"}, s.options()...)
-	argv = append(argv, "--", s.cfg.Host, neutralLine(watchedScript(s.commandLine(cmd), len(data))))
+	argv = append(argv, "--", s.cfg.Host, neutralLine(script))
 	c := exec.CommandContext(ctx, "ssh", argv...)
 	c.Env = environ()
 	c.WaitDelay = sshWaitDelay
@@ -172,13 +170,95 @@ func (s *SSH) run(ctx context.Context, name []string, cmd string, stdin io.Reade
 	if err := c.Start(); err != nil {
 		return sshCallResult(ctx, s.cfg.Name, name, nil, err, &stdout, &stderr)
 	}
-	if len(data) > 0 {
-		// Wait closes the pipe when ssh exits, which ends a blocked Write.
-		go func() { _, _ = in.Write(data) }()
+	var readErr atomic.Pointer[error]
+	if stdin != nil {
+		// Not waited for: a Read that blocks must not hold up a cancelled
+		// call. Wait closes the pipe when ssh exits, which ends a blocked
+		// Write.
+		go func() {
+			if err := feedStdin(in, stdin); err != nil {
+				// Stored before the close that makes the remote side give
+				// up, so it is there when Wait returns.
+				readErr.Store(&err)
+				_ = in.Close()
+			}
+		}()
 	}
 	err = c.Wait()
+	if e := readErr.Load(); e != nil {
+		return nil, fmt.Errorf("ssh %s: read stdin: %w", s.cfg.Name, *e)
+	}
 	return sshCallResult(ctx, s.cfg.Name, name, c.ProcessState, err, &stdout, &stderr)
 }
+
+// stdinEnd is the line that ends the encoded stdin data. No data line
+// starts with it, so a stream cut before it never looks complete.
+const stdinEnd = `\.`
+
+// feedStdin copies r to w in the encoding receiveStdin decodes: lines of
+// printable ASCII with every other byte, and the backslash, as a printf %b
+// octal escape (\0ooo), then the stdinEnd line. The length of r need not be
+// known, any byte can be sent, and the remote side needs only sh builtins
+// to tell the end of the data from a closed connection. It returns r's
+// error; a failed write means ssh is gone, which its exit reports.
+func feedStdin(w io.Writer, r io.Reader) error {
+	const lineBytes = 256
+	buf := make([]byte, 32*1024)
+	var out bytes.Buffer
+	for {
+		n, err := r.Read(buf)
+		out.Reset()
+		for i, c := range buf[:n] {
+			if i > 0 && i%lineBytes == 0 {
+				out.WriteByte('\n')
+			}
+			if c < ' ' || c > '~' || c == '\\' {
+				fmt.Fprintf(&out, `\0%03o`, c)
+			} else {
+				out.WriteByte(c)
+			}
+		}
+		if n > 0 {
+			out.WriteByte('\n')
+		}
+		if err == io.EOF {
+			out.WriteString(stdinEnd + "\n")
+		} else if err != nil {
+			return err
+		}
+		if _, werr := w.Write(out.Bytes()); werr != nil || err == io.EOF {
+			return nil
+		}
+	}
+}
+
+// receiveStdin is the /bin/sh fragment that decodes the stdin data sent by
+// feedStdin from fd into the file "$f". It leaves the stdinEnd line in $l
+// only when all the data arrived and was written.
+func receiveStdin(fd string) string {
+	return `l=
+while IFS= read -r l <&` + fd + ` && [ "$l" != '` + stdinEnd + `' ]; do printf %b "$l" || { l=; break; }; done >"$f"`
+}
+
+// putFileScript is the /bin/sh script behind PutFile. It runs no command
+// of the target shell, so it needs no watcher: a cancelled call closes
+// stdin before the stdinEnd line, and the script then removes its temp
+// file. mktemp gives the file mode 0600.
+func putFileScript(p string) string {
+	tmp := remotePath(path.Join(path.Dir(p), "."+path.Base(p)+".XXXXXX"))
+	return `umask 077
+mkdir -p ` + remotePath(path.Dir(p)) + ` || exit 1
+f=$(mktemp ` + tmp + `) || exit 1
+` + receiveStdin("0") + `
+[ "$l" = '` + stdinEnd + `' ] && mv -f "$f" ` + remotePath(p) + ` && exit 0
+rm -f "$f"
+echo 'herdrcron: upload did not complete' >&2
+exit 1`
+}
+
+// defaultKillGrace is how long a cancelled remote command gets to end on
+// SIGTERM before SIGKILL.
+const defaultKillGrace = 5 * time.Second
 
 // watchedScript is the /bin/sh script that runs the remote command line
 // line and stops it when the call is cancelled. Killing the local ssh
@@ -186,33 +266,145 @@ func (s *SSH) run(ctx context.Context, name []string, cmd string, stdin io.Reade
 // alter stdin and stdout); the remote side only sees ssh's stdin close. So
 // the local side keeps stdin open for the whole call, and the script:
 //
-//   - feeds the command the stdinLen bytes of stdin data (head -c), or an
-//     empty stdin when there are none;
-//   - leaves a watcher reading the rest of stdin, which is nothing until
-//     it closes: either ssh is gone, or the command finished and sshd
-//     closed the session. The watcher then signals the script (USR1),
-//     which has exited in the second case;
-//   - on USR1 sends TERM to its whole process group only when this script
-//     leads that group (it replaced the login shell sshd started with
-//     setsid). A parent that leads the group is not enough: that parent
-//     may be an interactive login shell, and the group then holds jobs
-//     this command did not start. Otherwise it sends TERM to the command
-//     and its descendants, found with ps, and to nothing else.
+//   - with hasStdin, first decodes the stdin data into a temp file, which
+//     it opens for the command and removes at once. A file, not a pipe: the
+//     script reads all the data whatever the command does with it, so no
+//     amount of unread data hides a closed connection. Stdin closing
+//     before the end of the data ends the script without running the
+//     command;
+//   - runs the command with a watcher beside it that reads the rest of
+//     stdin, which is nothing until it closes: either ssh is gone, or the
+//     command finished and sshd closed the session. The watcher then
+//     signals the script (USR1), which has exited in the second case;
+//   - on USR1 sends TERM, and KILL after the grace period to what is
+//     left, to a process group that holds the command and what it started
+//     and nothing else. With setsid on the remote machine that is a group
+//     the command gets for itself. Without it, it is the script's own
+//     group, but only when the script leads that group (it replaced the
+//     login shell sshd started with setsid). A parent that leads the group
+//     is not enough: that parent may be an interactive login shell, and
+//     the group then holds jobs this command did not start;
+//   - with neither, signals the command and its descendants one by one
+//     and nothing else. It stops each process (STOP) before it lists that
+//     process's children, so the children can neither be replaced nor
+//     waited for, and their PIDs not reused, until they have their TERM.
 //
-// The watcher holds neither stdout nor stderr, so it never delays the end
-// of the ssh call. It starts once the stdin data has gone to the command:
-// a command that does not read more than a pipe buffer of data is not
-// stopped by a cancel.
-func watchedScript(line string, stdinLen int) string {
-	feed := ""
-	if stdinLen > 0 {
-		feed = fmt.Sprintf("head -c %d <&3; ", stdinLen)
+// A group signal cannot hit a reused PID while the group's leader has not
+// been waited for or the group still has a member. That leaves one case:
+// the command ended on TERM, a process it started did not, and that one
+// ends by itself in the last moments of the grace period. The one-by-one
+// path checks a PID's group again before its KILL.
+//
+// Process data (i gives the parent and group of a live process, all the
+// three of every process) comes from /proc where there is one, else from
+// ps: a BusyBox ps may have neither -o nor -p. With none of setsid, /proc and
+// ps, only the command itself is signalled, not what it started.
+//
+// The watcher holds neither stdout nor stderr, and the script lets go of
+// both before it waits for the grace period, so neither delays the end of
+// the ssh call. The script ends as soon as nothing is left; when it
+// signals its own group it cannot tell and stays for the grace period.
+func watchedScript(line string, hasStdin bool, grace time.Duration) string {
+	if grace <= 0 {
+		grace = defaultKillGrace
+	}
+	seconds := int((grace + time.Second - 1) / time.Second)
+	in := "exec 4</dev/null"
+	if hasStdin {
+		in = `f=$(mktemp "${TMPDIR:-/tmp}/herdrcron.XXXXXX") || exit 1
+` + receiveStdin("3") + `
+[ "$l" = '` + stdinEnd + `' ] || { rm -f "$f"; echo 'herdrcron: stdin ended early' >&2; exit 1; }
+exec 4<"$f"
+rm -f "$f"`
 	}
 	return `exec 3<&0
-k() { for p in $(printf '%s\n' "$s" | while read -r a b; do [ "$b" = "$1" ] && echo "$a"; done); do k "$p"; done; kill -TERM "$1" 2>/dev/null; }
-trap 'trap "" TERM; g=$(ps -o pgid= -p $$ 2>/dev/null); case " $(echo $g) " in " $$ ") kill -TERM 0;; *) s=$(ps -A -o pid= -o ppid= 2>/dev/null); k $!;; esac; exit 143' USR1
-{ ` + feed + `{ read -r _ <&3; kill -USR1 $$; } >/dev/null 2>&1 & } | ` + line + ` 3<&- &
-wait $!`
+` + in + `
+f3() {
+	case $1 in Z*|"") return 1;; esac
+	echo "$2 $3"
+}
+f4() { echo "$1 $3 $4"; }
+i() {
+	if [ -r /proc/$$/stat ]; then
+		[ -r "/proc/$1/stat" ] && read -r a <"/proc/$1/stat" && f3 ${a##*) }
+	else
+		f3 $(ps -o stat= -o ppid= -o pgid= -p "$1" 2>/dev/null)
+	fi
+}
+all() {
+	if [ -r /proc/$$/stat ]; then
+		for q in /proc/[0-9]*/stat; do read -r a <"$q" && f4 "${a%% *}" ${a##*) }; done 2>/dev/null
+	else
+		ps -A -o pid= -o ppid= -o pgid= 2>/dev/null
+	fi
+}
+k() {
+	[ "$(i "$1")" = "$2" ] && kill -STOP "$1" 2>/dev/null || return 0
+	L="$L $1:${2#* }"
+	for p in $(all | while read -r a b _; do [ "$b" = "$1" ] && echo "$a"; done); do
+		j=$(i "$p")
+		case $j in "$1 "*) k "$p" "$j";; esac
+	done
+	kill -TERM "$1" 2>/dev/null
+	kill -CONT "$1" 2>/dev/null
+}
+x() {
+	case $m in
+	g) kill -$1 0;;
+	s) kill -$1 -$c 2>/dev/null;;
+	*) false;;
+	esac && return
+	if [ $1 = TERM ]; then
+		kill -0 $c 2>/dev/null || return 0
+		L=
+		k $c "$(i $c)"
+	else
+		for e in $L; do
+			case $(i "${e%%:*}") in *" ${e#*:}"|"${e#*:}") kill -KILL "${e%%:*}" 2>/dev/null;; esac
+		done
+	fi
+}
+left() {
+	case $m in
+	g) return 0;;
+	s) kill -0 -$c 2>/dev/null && return 0;;
+	esac
+	for e in $L; do
+		case $(i "${e%%:*}") in *" ${e#*:}") return 0;; esac
+	done
+	return 1
+}
+stop() {
+	trap '' TERM USR1
+	exec >/dev/null 2>&1 3<&-
+	x TERM
+	( sleep ` + strconv.Itoa(seconds) + `; x KILL ) &
+	t=$!
+	wait $c
+	while left && kill -0 $t 2>/dev/null; do sleep 0.1 || sleep 1; done
+	kill -KILL $t 2>/dev/null
+	exit 143
+}
+m=t
+S=
+if command -v setsid >/dev/null 2>&1; then
+	m=s
+	S=setsid
+else
+	g=$(i $$)
+	case ${g#* } in $$) m=g;; esac
+fi
+trap stop USR1
+$S /bin/sh -c ` + shellquote.Quote(line) + ` <&4 3<&- 4<&- &
+c=$!
+exec 4<&-
+{ read -r _ <&3; kill -USR1 $$; } >/dev/null 2>&1 &
+w=$!
+wait $c
+r=$?
+trap '' USR1
+kill $w 2>/dev/null
+exit $r`
 }
 
 // neutralLine is the command line ssh sends for the /bin/sh script script.
