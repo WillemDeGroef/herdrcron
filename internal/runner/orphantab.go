@@ -70,6 +70,24 @@ func (r *Runner) createLost(ctx context.Context, ts *targetState, a *activeRun, 
 	}
 }
 
+// pinOrphanClose reports whether the lost create of runID was sent to ts
+// and ts is still that target. It then holds ts.changeMu until the caller
+// unlocks it, so Reconfigure cannot replace ts until the close returns.
+// The caller must not call it with r.mu held: the lock order is r.mu, then
+// changeMu.
+func (r *Runner) pinOrphanClose(ts *targetState, name, runID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lc := r.lostCreates[runID]
+	if lc == nil || lc.gen != ts.gen || r.target(name) != ts {
+		return false
+	}
+	// Held across the unlock of r.mu. Reconfigure takes r.mu first and then
+	// this mutex, so it cannot swap ts until the caller unlocks it.
+	ts.changeMu.Lock()
+	return true
+}
+
 // tabOfLiveRun reports whether a run that is starting or active has the tab.
 func (r *Runner) tabOfLiveRun(tab string) bool {
 	r.mu.Lock()
@@ -100,9 +118,16 @@ func (r *Runner) lostCreatesOf(ts *targetState, name string) []store.LostCreate 
 
 // closeOrphanTabs settles the lost creates on the target: the tab each one
 // left behind is closed, and the create is forgotten. The caller holds
-// ts.openMu, so no launch opens a tab meanwhile. An error means the target
-// could not be asked, or its herdr server is not running: that create and
-// the ones after it stay recorded.
+// ts.openMu, so no launch on this target opens a tab meanwhile. An error
+// means the target could not be asked, or its herdr server is not running:
+// that create and the ones after it stay recorded.
+//
+// Reconfigure can replace the target while the tabs are being listed. The
+// close then runs only if this target is still the one the create was sent
+// to, and it holds the target's changeMu so the replacement waits until the
+// close returns. A tab found after the replacement is left open: it can
+// belong to a launch on the new target, which shares the herdr server when
+// only the shell or herdr_path changed.
 func (r *Runner) closeOrphanTabs(ctx context.Context, ts *targetState, name string) error {
 	for _, c := range r.lostCreatesOf(ts, name) {
 		log := logging.ForRun(r.log, c.RunID, c.TaskID, c.Target)
@@ -112,9 +137,16 @@ func (r *Runner) closeOrphanTabs(ctx context.Context, ts *targetState, name stri
 			log.Warn("the new tab with the label of a lost create belongs to a run; leaving it open", "herdr_tab", tab)
 			tab = ""
 		}
+		// changeMu is held across the close only. Nothing in that window may
+		// take r.mu: Reconfigure holds r.mu while it waits for changeMu.
 		if err == nil && tab != "" {
+			if !r.pinOrphanClose(ts, name, c.RunID) {
+				log.Info("target replaced while a lost create was being settled; leaving its tab", "herdr_tab", tab)
+				continue
+			}
 			log.Info("closing the tab of a create whose reply was lost", "herdr_tab", tab, "label", c.Label)
 			err = ts.herdr.TabClose(ctx, tab)
+			ts.changeMu.Unlock()
 		}
 		switch {
 		case err == nil, herdr.IsCode(err, herdr.CodeTabNotFound), herdr.IsCode(err, herdr.CodeWorkspaceNotFound):

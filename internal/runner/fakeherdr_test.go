@@ -99,8 +99,14 @@ type fakeHerdr struct {
 	// create"): herdr runs it, then the target drops before the reply
 	// arrives and stays unreachable.
 	loseCreateReply string
-	failPut         bool   // PutFile fails
-	version         string // `herdr --version` prints "herdr <version>"; "" = 0.9.1
+	// tabListGate pauses the next `tab list` before it reads the tabs.
+	// tabCreateGate pauses the next `tab create` after the tab exists and
+	// before the reply. Both are one shot: the call sends, then waits for
+	// a send back, and the fake does not hold its lock while it waits.
+	tabListGate   chan struct{}
+	tabCreateGate chan struct{}
+	failPut       bool   // PutFile fails
+	version       string // `herdr --version` prints "herdr <version>"; "" = 0.9.1
 	// hostEnv, when set, makes the shell-script calls (preflight and
 	// target check) run for real in a local sh with this environment
 	// (a temp HOME and PATH), instead of the canned answers above.
@@ -194,6 +200,20 @@ func (f *fakeHerdr) addTab(ws, label string) string {
 	return tab
 }
 
+// waitGate pauses on *slot, if it is set, without holding f.mu. The call
+// sends on the channel and waits for a send back. One shot.
+func (f *fakeHerdr) waitGate(slot *chan struct{}) {
+	ch := *slot
+	if ch == nil {
+		return
+	}
+	*slot = nil
+	f.mu.Unlock()
+	ch <- struct{}{}
+	<-ch
+	f.mu.Lock()
+}
+
 func herdrErr(code string) error {
 	b, _ := json.Marshal(herdr.ErrorResponse{Error: herdr.ErrorBody{Code: code, Message: code}, ID: "cli"})
 	return &target.ExitError{Code: 1, Stderr: b}
@@ -270,6 +290,7 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 		}
 		label := flag(argv, "--label")
 		tab, pane := f.newTab(ws, label)
+		f.waitGate(&f.tabCreateGate)
 		if f.loseCreateReply == cmd {
 			f.loseCreateReply, f.unreachable = "", true
 			return nil, &target.UnreachableError{Target: f.name, Stderr: []byte("ssh: connection reset\n")}
@@ -278,6 +299,7 @@ func (f *fakeHerdr) Exec(_ context.Context, argv []string, _ io.Reader) ([]byte,
 			Type: "tab_created", Tab: herdr.TabInfo{TabID: tab, WorkspaceID: ws, Label: label}, RootPane: pane,
 		})
 	case "tab list":
+		f.waitGate(&f.tabListGate)
 		ws := flag(argv, "--workspace")
 		list := []herdr.TabInfo{}
 		for id, w := range f.tabs {

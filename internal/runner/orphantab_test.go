@@ -231,6 +231,98 @@ func TestLostCreateIsDroppedWhenItsTargetIsReplaced(t *testing.T) {
 	}
 }
 
+// The target is replaced while the orphan close is listing tabs. The lost
+// create never reached herdr. A launch on the replacement (same herdr, the
+// shell changed) has created the only new tab with that label, and has not
+// stored the id yet. That tab stays open.
+func TestReplacedTargetDoesNotCloseATabOfALaterLaunch(t *testing.T) {
+	e := newEnv(t)
+	e.herdr.script(working, idle, idle)
+	first := e.start(deps())
+	e.statuses(first.ID, 3)
+	e.herdr.mu.Lock()
+	e.herdr.unreachableFor = "tab create"
+	e.herdr.mu.Unlock()
+	run, err := e.runner.Start(e.ctx, deps(), store.TriggerSchedule, e.clock.Now())
+	if err != nil || run.Status != store.StatusHostUnreachable {
+		t.Fatalf("Start = %+v, %v, want host_unreachable", run, err)
+	}
+	e.herdr.mu.Lock()
+	e.herdr.unreachableFor = ""
+	e.herdr.mu.Unlock()
+
+	list := make(chan struct{})
+	created := make(chan struct{})
+	e.herdr.mu.Lock()
+	e.herdr.tabListGate = list
+	e.herdr.tabCreateGate = created
+	e.herdr.mu.Unlock()
+
+	polled := make(chan struct{})
+	go func() {
+		defer close(polled)
+		e.runner.PollTarget(e.ctx, "local")
+	}()
+	select {
+	case <-list:
+	case <-time.After(5 * time.Second):
+		t.Fatal("orphan close did not list tabs")
+	}
+
+	deferred := e.runner.Reconfigure(envConfig(map[string]config.Target{"local": {Shell: "zsh -lc"}}),
+		func(string, config.Target) target.Target { return e.herdr })
+	if len(deferred) != 0 {
+		t.Fatalf("deferred = %q, want none", deferred)
+	}
+
+	e.herdr.script(working)
+	started := make(chan store.Run, 1)
+	startErr := make(chan error, 1)
+	go func() {
+		next, err := e.runner.Start(e.ctx, deps(), store.TriggerSchedule, e.clock.Now())
+		if err != nil {
+			startErr <- err
+			return
+		}
+		started <- next
+	}()
+	select {
+	case <-created:
+	case err := <-startErr:
+		t.Fatalf("Start: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the new launch did not create its tab")
+	}
+
+	list <- struct{}{}
+	select {
+	case <-polled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("orphan close did not finish")
+	}
+	if n := e.herdr.count("herdr", "tab", "close"); n != 0 {
+		t.Errorf("%d tab closes while the new tab's id was not stored yet, want none", n)
+	}
+
+	created <- struct{}{}
+	var next store.Run
+	select {
+	case next = <-started:
+	case err := <-startErr:
+		t.Fatalf("Start: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the new launch did not finish")
+	}
+	if next.Status != store.StatusRunning || next.HerdrTab == "" {
+		t.Fatalf("run after the target was replaced = %+v, want running", next)
+	}
+	want := []string{first.HerdrTab, next.HerdrTab}
+	slices.Sort(want)
+	if got := e.herdr.openTabs(); !slices.Equal(got, want) {
+		t.Errorf("open tabs = %q, want %q", got, want)
+	}
+}
+
 // While the herdr server is down its tabs cannot be listed, and it restores
 // them when it starts: the lost create is kept until the server answers.
 func TestLostCreateIsKeptWhileTheHerdrServerIsDown(t *testing.T) {
