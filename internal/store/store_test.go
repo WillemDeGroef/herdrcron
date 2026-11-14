@@ -993,3 +993,58 @@ PRAGMA user_version = 2;`)
 		}
 	}
 }
+
+// Opening a database that is already at schema version 3 changes nothing:
+// the progress columns stay, and a second open does too.
+func TestOpenAtSchemaVersion3IsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	run := newRun("a", time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+	run.EndedAt = run.StartedAt.Add(time.Minute)
+	run.Status = store.StatusStopped
+	if err := s.InsertRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPendingCleanup(ctx, run.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkCleanupClosing(ctx, run.ID, true, "kept tail"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		s, err := store.Open(path)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		list, err := s.ListPendingCleanups(ctx)
+		if err != nil || len(list) != 1 || !list[0].Closing || !list[0].PaneReplaced || list[0].Tail != "kept tail" {
+			t.Fatalf("ListPendingCleanups = %+v, %v; want the stored progress", list, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Errorf("user_version = %d, want 3", version)
+	}
+}

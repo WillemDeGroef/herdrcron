@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/WillemDeGroef/herdrcron/internal/config"
+	"github.com/WillemDeGroef/herdrcron/internal/runner"
 	"github.com/WillemDeGroef/herdrcron/internal/store"
 	"github.com/WillemDeGroef/herdrcron/internal/target"
 )
@@ -291,4 +292,123 @@ func TestPendingStopOfATabThatIsGoneStaysGoneAfterACrash(t *testing.T) {
 	e.driveStop()
 	e.waitReason(run.ID, "stopped by user; tab was gone when the target came back")
 	e.noPendingCleanups()
+}
+
+// A drop that could not be stored is not final: the same daemon still
+// closes the tab when the target answers, instead of writing the drop.
+func TestFailedDropDoesNotStickWhenTheTargetReturns(t *testing.T) {
+	e := newEnv(t)
+	run := e.stopUnreachable()
+	restore := e.failAmend(run.ID)
+	e.clock.Advance(100 * 24 * time.Hour)
+	e.runner.PollTarget(e.ctx, "local")
+	e.waitFor("the amend to fail", func() bool {
+		return len(e.logLines("cannot store the finished stop")) >= 1
+	})
+	if got := e.get(run.ID); got.ExitReason != reasonTabMayBeOpen {
+		t.Fatalf("exit reason stored = %q, want unchanged", got.ExitReason)
+	}
+	restore()
+	e.setUnreachable(false)
+	// The failed cleanup clears its running flag as it returns. Poll until
+	// the retry is in the stop's clock wait.
+	e.waitFor("the stop to be retried", func() bool {
+		e.runner.PollTarget(e.ctx, "local")
+		return e.clock.Waiters() > 0
+	})
+	e.driveStop()
+	e.waitReason(run.ID, reasonTabClosed)
+	if e.herdr.tabOpen(run.HerdrTab) {
+		t.Fatal("tab left open")
+	}
+}
+
+// history_days has passed, but the target has not been probed yet. The
+// pending stop stays: an answer would still finish it.
+func TestExpiredPendingStopIsKeptWhileTheTargetIsUnknown(t *testing.T) {
+	e := newEnv(t)
+	started := e.clock.Now().Add(-100 * 24 * time.Hour)
+	old := store.Run{
+		ID: store.NewRunID(started), TaskID: "deps", Target: "local", Trigger: store.TriggerManual,
+		StartedAt: started, EndedAt: started.Add(time.Minute), Status: store.StatusStopped,
+		HerdrTab: "w1:t-old", HerdrPane: "w1:p-old", ExitReason: reasonTabMayBeOpen,
+	}
+	e.insertRun(old)
+	if err := e.store.SetPendingCleanup(e.ctx, old.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	// An open run already past its timeout makes the first poll return
+	// before it probes, so reachability is still unknown when cleanups resume.
+	openAt := e.clock.Now().Add(-2 * time.Hour)
+	open := store.Run{
+		ID: store.NewRunID(openAt), TaskID: "deps", Target: "local", Trigger: store.TriggerManual,
+		StartedAt: openAt, Status: store.StatusRunning,
+		HerdrTab: "w1:t-open", HerdrPane: "w1:p-open",
+	}
+	e.insertRun(open)
+	e.restart(deps())
+	if st := e.targetState(); st.Reachability != runner.ReachUnknown {
+		t.Fatalf("target = %s, want unknown: the poll ended the run before probing", st.Reachability)
+	}
+	if got := e.get(old.ID); got.ExitReason != reasonTabMayBeOpen {
+		t.Fatalf("exit reason = %q, want the stop kept while reachability is unknown", got.ExitReason)
+	}
+	e.driveStop()
+	if got := e.waitEnded(open.ID); got.Status != store.StatusTimeout {
+		t.Fatalf("open run = %s %q, want timeout", got.Status, got.ExitReason)
+	}
+	if got := e.get(old.ID); got.ExitReason != reasonTabMayBeOpen {
+		t.Fatalf("exit reason after the timeout = %q, want the old stop kept", got.ExitReason)
+	}
+	pending, err := e.store.ListPendingCleanups(e.ctx)
+	if err != nil || len(pending) != 1 || pending[0].ID != old.ID {
+		t.Fatalf("pending cleanups = %+v, %v; want only the old stop", pending, err)
+	}
+	if len(e.logLines("target did not come back within history_days; the stop is dropped and the tab may still be open there")) != 0 {
+		t.Fatal("expired stop was dropped before the target was probed")
+	}
+}
+
+// The progress mark was stored, then the daemon died before the close. A
+// restart while herdr is down must not record the tab as closed: the close
+// has not happened, and is finished once herdr answers.
+func TestPendingStopStaysPendingWhileHerdrIsDown(t *testing.T) {
+	e := newEnv(t)
+	run := e.stopUnreachable()
+	if err := e.store.MarkCleanupClosing(e.ctx, run.ID, false, "saved tail\n"); err != nil {
+		t.Fatal(err)
+	}
+	e.herdr.mu.Lock()
+	e.herdr.serverDown = true
+	e.herdr.mu.Unlock()
+	e.setUnreachable(false)
+	e.restart(deps())
+	e.waitFor("the close to fail because herdr is down", func() bool {
+		return len(e.logLines("cannot finish the stop; it stays pending")) >= 1
+	})
+	if got := e.get(run.ID); got.ExitReason != reasonTabMayBeOpen {
+		t.Fatalf("exit reason = %q, want the stop still pending", got.ExitReason)
+	}
+	pending, err := e.store.ListPendingCleanups(e.ctx)
+	if err != nil || len(pending) != 1 || !pending[0].Closing || pending[0].Tail != "saved tail\n" {
+		t.Fatalf("pending = %+v, %v; want the closing cleanup and its tail", pending, err)
+	}
+	if !e.herdr.tabOpen(run.HerdrTab) {
+		t.Fatal("tab closed while herdr was down")
+	}
+	e.herdr.mu.Lock()
+	e.herdr.serverDown = false
+	e.herdr.mu.Unlock()
+	e.runner.PollTarget(e.ctx, "local")
+	got := e.waitReason(run.ID, reasonTabClosed)
+	if got.OutputTail != "saved tail\n" {
+		t.Errorf("output tail = %q, want the stored one", got.OutputTail)
+	}
+	e.noPendingCleanups()
+	if e.herdr.tabOpen(run.HerdrTab) {
+		t.Error("tab left open after herdr came back")
+	}
+	if got, want := e.stopSteps(), []string{"keys esc", "tab close", "tab close"}; !slices.Equal(got, want) {
+		t.Errorf("stop calls = %q, want %q: no keys on the retries", got, want)
+	}
 }

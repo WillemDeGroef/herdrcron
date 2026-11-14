@@ -1335,6 +1335,11 @@ func (r *Runner) stopOnTarget(ctx context.Context, ts *targetState, log *slog.Lo
 		beforeClose(ctx, tail)
 	}
 	outcome, err = r.closeRunTab(ctx, ts, log, run)
+	if herdr.IsCode(err, herdr.CodeServerNotRunning) && beforeClose == nil {
+		// The run has to end. A pending stop passes beforeClose and
+		// keeps the error, so the close is tried again once herdr is up.
+		return tail, reasonTabGone, nil
+	}
 	if err != nil {
 		return tail, "", err // the tail was read; the caller keeps it
 	}
@@ -1356,7 +1361,9 @@ func (r *Runner) asUnreachable(name string, err error) error {
 // (reasonTabClosed, reasonTabGone or reasonTabNotClosed). An error
 // matching target.ErrUnreachable means the target did not answer; the
 // target is marked unreachable and the caller keeps the stop pending.
-// Other close errors are logged.
+// herdr.CodeServerNotRunning is returned as-is: the server may restore
+// the tab when it starts, so that is not "tab was gone". Other close
+// errors are logged.
 func (r *Runner) closeRunTab(ctx context.Context, ts *targetState, log *slog.Logger, run store.Run) (string, error) {
 	if run.HerdrTab == "" {
 		return reasonTabClosed, nil
@@ -1368,8 +1375,10 @@ func (r *Runner) closeRunTab(ctx context.Context, ts *targetState, log *slog.Log
 	case herdr.IsCode(err, herdr.CodeTabNotFound):
 		return reasonTabGone, nil
 	case herdr.IsCode(err, herdr.CodeServerNotRunning):
+		// Not "tab was gone": the server may restore the tab when it
+		// starts. A pending stop retries; an initial stop does not.
 		log.Warn("cannot close tab", "herdr_tab", run.HerdrTab, "err", err)
-		return reasonTabGone, nil
+		return "", err
 	default:
 		log.Warn("cannot close tab", "herdr_tab", run.HerdrTab, "err", err)
 		if err := r.asUnreachable(run.Target, err); err != nil {
@@ -1389,7 +1398,8 @@ func (r *Runner) closeRunTab(ctx context.Context, ts *targetState, log *slog.Log
 // pending cleanup (see markClosing). An earlier try that got that far, in
 // this daemon or in one that died before it stored the outcome, is not
 // repeated: only the tab is closed, and a tab that is gone by now was
-// closed by that try.
+// closed by that try. A herdr server that is not running is not a missing
+// tab: the stop stays pending.
 func (r *Runner) finishPendingStop(ctx context.Context, ts *targetState, c *pendingCleanup, run store.Run) (tail, outcome string, err error) {
 	r.mu.Lock()
 	closing, replaced, tail := c.closing, c.replaced, c.tail
@@ -1596,10 +1606,11 @@ func (r *Runner) startCleanupLocked(c *pendingCleanup) {
 // the stop keys, the output tail, the tab and the prompt file. The row then
 // says what became of the tab. A store write that fails leaves the cleanup
 // pending, and the next try amends the row without repeating a stop that
-// already reached the target. If the target drops again, or the daemon
-// stops, the cleanup stays pending. A pane herdr restored under the same
-// id is a new shell: no keys are sent, the tab is still closed, and the
-// reason says the pane was replaced.
+// already reached the target. A drop whose write failed is decided again,
+// so a target that answers in between is still stopped. If the target
+// drops again, or the daemon stops, the cleanup stays pending. A pane
+// herdr restored under the same id is a new shell: no keys are sent, the
+// tab is still closed, and the reason says the pane was replaced.
 //
 // A stop that can no longer be finished is dropped instead: its target
 // was removed from the config, or has not answered for history_days since
@@ -1654,11 +1665,15 @@ func (r *Runner) cleanup(ctx context.Context, c *pendingCleanup) {
 		if tail != "" {
 			run.OutputTail = tail
 		}
-		// Remember the outcome before the store write, so a failed amend
-		// retries the write and not step 10 (the tab is already closed).
-		r.mu.Lock()
-		c.run = run
-		r.mu.Unlock()
+		// Remember a stop that reached the tab before the store write, so
+		// a failed amend retries the write and not step 10. A drop has not
+		// closed the tab: leave it unremembered until the write succeeds,
+		// so a target that answers first is still stopped.
+		if outcome != reasonTargetRemoved && outcome != reasonTargetExpired {
+			r.mu.Lock()
+			c.run = run
+			r.mu.Unlock()
+		}
 	}
 	// From here the outcome is known and must be stored.
 	ctx = context.WithoutCancel(ctx)
@@ -1679,6 +1694,11 @@ func (r *Runner) cleanup(ctx context.Context, c *pendingCleanup) {
 			r.onAmend(run)
 		}
 	}
+	// The outcome is in the store, or was already there. Remember it so a
+	// failed clear of the pending row does not run the stop again.
+	r.mu.Lock()
+	c.run = run
+	r.mu.Unlock()
 	if err := r.store.SetPendingCleanup(ctx, run.ID, false); err != nil {
 		c.log.Error("cannot clear pending cleanup", "err", err)
 		stay()
