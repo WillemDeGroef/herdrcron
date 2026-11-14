@@ -66,7 +66,7 @@ Rules for the tracker:
 
 Verified: a command string with double and single quotes, `$HOME` and backticks inside a single-quoted part reached the shell unchanged, and `claude "$(cat <prompt-path>)"` delivered a prompt with `"a" 'b' $HOME` and backticks unchanged to Claude Code.
 
-The command text is typed into the user's interactive shell (here bash). The spec's form `cd <cwd> && env K=V <command> <args…> "$(cat <prompt-path>)"` needs a POSIX-like shell (bash, zsh; fish 3.x also accepts `&&` and `$(…)`). Both `cd` and `env` can move to `tab create --cwd <cwd> --env K=V`, which leaves only `<command> <args…> "$(cat <prompt-path>)"` in the typed text. Every element is still quoted with the POSIX quoter.
+The command text is typed into the user's interactive shell (here bash). The spec's form `cd <cwd> && env K=V <command> <args…> "$(cat <prompt-path>)"` needs a POSIX-like shell (bash, zsh; fish 3.x also accepts `&&` and `$(…)`). Both `cd` and `env` can move to `tab create --cwd <cwd> --env K=V`, which leaves only `<command> <args…> "$(cat <prompt-path>)"` in the typed text. Every element is still quoted with the POSIX quoter. herdrcron types that shorter line, so the pane's shell must be POSIX-like: csh/tcsh, nushell and PowerShell do not read `"$(cat "$HOME"/…)"` or `'\''` as written, and fish reads a backslash inside single quotes as an escape. herdr picks the pane's shell (`default_shell` under `[terminal]` in its `config.toml`; empty means `$SHELL`, then `/bin/sh`, per `herdr --default-config`), not the target's `shell` setting. Only `/bin/sh` is tested (`TestPromptReachesAgentUnchanged`).
 
 `herdr agent start <name> --kind claude --pane <id> -- <args>` is an alternative that waits until the agent is ready, but it only knows built-in agent kinds (not a custom `command`) and would put the prompt in herdr's own argv. We do not use it.
 
@@ -157,3 +157,4 @@ Not verified against a real sshd (SSH is tested with fakes only): the fake `ssh`
 - The watcher holds neither stdout nor stderr, so a finished command ends the ssh call at once, and the script lets go of both before it waits for the grace period. The script kills the watcher when the command finishes.
 - `setsid herdr server … &` (see "herdr server") is in its own session and survives both kills.
 - The interactive attach (`ssh -t`) has no watcher: the TTY's hangup ends the remote command.
+- Every other call has no TTY and sets `BatchMode=yes`: `ssh` fails instead of asking for a password, a passphrase or a host key (exit 255, classified as unreachable). Stdout and stderr are pipes. An `Exec` with no stdin, which is every production caller, gives the remote command `/dev/null`. `PutFile` reads ssh's stdin, as above. The attach leaves out `BatchMode`.
